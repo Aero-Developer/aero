@@ -1,0 +1,2 @@
+// Windows executable icon (shown in Explorer / taskbar for aero_gui.exe).
+IDI_ICON1 ICON "assets/images/appicons/appicon.ico"

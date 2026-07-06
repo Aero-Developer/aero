@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: BSD-3-Clause
+#include "TorManager.h"
+
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
+#include <QProcess>
+#include <QRegularExpression>
+#include <QTcpSocket>
+#include <QTimer>
+
+TorManager::TorManager(QObject *parent) : QObject(parent) {}
+
+TorManager::~TorManager() {
+    if (m_proc) {
+        m_proc->disconnect(this);
+        m_proc->terminate();
+        if (!m_proc->waitForFinished(3000))
+            m_proc->kill();
+    }
+}
+
+bool TorManager::socksPortOpen() const {
+    QTcpSocket probe;
+    probe.connectToHost(QStringLiteral("127.0.0.1"), m_socksPort);
+    return probe.waitForConnected(400);
+}
+
+void TorManager::start() {
+    // Reuse our own bundled Tor if it's still listening on the dedicated port from a previous run;
+    // otherwise launch a fresh one. We never look at the common 9050 to avoid routing through some
+    // unrelated SOCKS service.
+    if (socksPortOpen()) {
+        m_ready = true;
+        emit statusChanged(tr("Connected to Tor"));
+        emit ready();
+        return;
+    }
+    launchBundled();
+}
+
+void TorManager::launchBundled() {
+    const QString base = QCoreApplication::applicationDirPath();
+    const QString torExe = QDir(base).filePath(QStringLiteral("tor/tor.exe"));
+    if (!QFileInfo::exists(torExe)) {
+        emit failed(tr("Bundled Tor not found at %1").arg(QDir::toNativeSeparators(torExe)));
+        return;
+    }
+
+    const QString torDir = QDir(base).filePath(QStringLiteral("tor"));
+    const QString dataDir = QDir(torDir).filePath(QStringLiteral("data"));
+    QDir().mkpath(dataDir);
+
+    QStringList args;
+    args << QStringLiteral("--SocksPort") << QString::number(m_socksPort)
+         << QStringLiteral("--DataDirectory") << dataDir
+         << QStringLiteral("--GeoIPFile") << QDir(torDir).filePath(QStringLiteral("geoip"))
+         << QStringLiteral("--GeoIPv6File") << QDir(torDir).filePath(QStringLiteral("geoip6"))
+         << QStringLiteral("--ClientOnly") << QStringLiteral("1")
+         << QStringLiteral("--AvoidDiskWrites") << QStringLiteral("1")
+         << QStringLiteral("--Log") << QStringLiteral("notice stdout");
+
+    m_proc = new QProcess(this);
+    m_proc->setWorkingDirectory(torDir);
+    m_proc->setProcessChannelMode(QProcess::MergedChannels);
+
+    connect(m_proc, &QProcess::readyReadStandardOutput, this, [this]() {
+        const QString out = QString::fromUtf8(m_proc->readAllStandardOutput());
+        const QStringList lines = out.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        for (const QString &line : lines)
+            handleLine(line.trimmed());
+    });
+    connect(m_proc, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+        if (!m_ready)
+            emit failed(tr("Failed to launch Tor: %1").arg(m_proc->errorString()));
+    });
+    connect(m_proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+            [this](int code, QProcess::ExitStatus) {
+                if (!m_ready)
+                    emit failed(tr("Tor exited unexpectedly (code %1)").arg(code));
+            });
+
+    // Give Tor up to 90s to bootstrap before giving up (no clearnet fallback).
+    m_timeout = new QTimer(this);
+    m_timeout->setSingleShot(true);
+    m_timeout->setInterval(90000);
+    connect(m_timeout, &QTimer::timeout, this, [this]() {
+        if (!m_ready)
+            emit failed(tr("Tor did not finish bootstrapping in time"));
+    });
+    m_timeout->start();
+
+    emit statusChanged(tr("Starting Tor…"));
+    m_proc->start(torExe, args);
+}
+
+void TorManager::handleLine(const QString &line) {
+    static const QRegularExpression re(QStringLiteral("Bootstrapped (\\d+)%"));
+    const QRegularExpressionMatch m = re.match(line);
+    if (!m.hasMatch())
+        return;
+    const int pct = m.captured(1).toInt();
+    emit statusChanged(tr("Starting Tor… %1%").arg(pct));
+    if (pct >= 100 && !m_ready) {
+        m_ready = true;
+        if (m_timeout)
+            m_timeout->stop();
+        emit statusChanged(tr("Connected to Tor"));
+        emit ready();
+    }
+}

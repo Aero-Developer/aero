@@ -1,0 +1,20 @@
+# Rust
+/core/target/
+**/*.rs.bk
+Cargo.lock
+
+# Build output (any CMake build dir at any depth)
+build/
+
+# Portable/packaged builds (binaries, bundled Tor, dev screenshots) — ship via GitHub Releases,
+# not in the source tree.
+/dist/
+
+# Wallet files (never commit secrets)
+*.aero
+*.plume
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
