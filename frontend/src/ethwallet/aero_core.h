@@ -170,6 +170,19 @@ int aero_wallet_remove_token(AeroWallet *w,
 char *aero_wallet_tokens(AeroWallet *w);
 
 /**
+ * Per-wallet metadata JSON blob (labels/contacts/notes/funded). "" if none. Caller frees. This is
+ * stored encrypted inside the wallet file, not in plaintext settings.
+ */
+char *aero_wallet_metadata(AeroWallet *w);
+
+/**
+ * Replace the per-wallet metadata JSON blob. Persisted (encrypted) on the next `aero_wallet_save`.
+ * Returns 0 on success, -1 on error.
+ */
+int aero_wallet_set_metadata(AeroWallet *w,
+                             const char *json);
+
+/**
  * Configure the Tor-routed RPC provider.
  * `endpoints_json` is a JSON array of RPC URLs; `socks_proxy` may be NULL to disable Tor.
  * With no proxy, remote endpoints are refused unless `allow_clearnet` is true (a deliberate,
@@ -187,6 +200,15 @@ int aero_wallet_set_provider(AeroWallet *w,
  */
 char *aero_wallet_eth_balance(AeroWallet *w,
                               uint32_t index);
+
+/**
+ * Native + tracked-token balances for accounts `0..num_accounts` in one batched request.
+ * Returns JSON `{ native_symbol, accounts: [ { index, native_raw, native_formatted,
+ * native_symbol, tokens: [ { address, symbol, decimals, raw, formatted } ] } ] }`.
+ * Caller frees the string.
+ */
+char *aero_wallet_all_balances(AeroWallet *w,
+                               uint32_t num_accounts);
 
 /**
  * ERC20 balance as JSON `BalanceInfo`. Caller frees the string.

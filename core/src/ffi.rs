@@ -483,6 +483,33 @@ pub extern "C" fn aero_wallet_tokens(w: *mut Wallet) -> *mut c_char {
     }
 }
 
+/// Per-wallet metadata JSON blob (labels/contacts/notes/funded). "" if none. Caller frees. This is
+/// stored encrypted inside the wallet file, not in plaintext settings.
+#[no_mangle]
+pub extern "C" fn aero_wallet_metadata(w: *mut Wallet) -> *mut c_char {
+    match unsafe { w.as_ref() } {
+        Some(w) => to_cstr(w.metadata()),
+        None => ptr::null_mut(),
+    }
+}
+
+/// Replace the per-wallet metadata JSON blob. Persisted (encrypted) on the next `aero_wallet_save`.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn aero_wallet_set_metadata(w: *mut Wallet, json: *const c_char) -> c_int {
+    clear_error();
+    let Some(w) = (unsafe { w.as_mut() }) else {
+        set_error("null wallet");
+        return -1;
+    };
+    let Some(json) = from_cstr(json) else {
+        set_error("null metadata");
+        return -1;
+    };
+    w.set_metadata(&json);
+    0
+}
+
 // ---------------- networking ----------------
 
 /// Configure the Tor-routed RPC provider.
@@ -534,6 +561,15 @@ pub extern "C" fn aero_wallet_set_provider(
 #[no_mangle]
 pub extern "C" fn aero_wallet_eth_balance(w: *mut Wallet, index: u32) -> *mut c_char {
     block_json(w, |w| RUNTIME.block_on(w.eth_balance(index)))
+}
+
+/// Native + tracked-token balances for accounts `0..num_accounts` in one batched request.
+/// Returns JSON `{ native_symbol, accounts: [ { index, native_raw, native_formatted,
+/// native_symbol, tokens: [ { address, symbol, decimals, raw, formatted } ] } ] }`.
+/// Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_all_balances(w: *mut Wallet, num_accounts: u32) -> *mut c_char {
+    block_json(w, |w| RUNTIME.block_on(w.all_balances(num_accounts)))
 }
 
 /// ERC20 balance as JSON `BalanceInfo`. Caller frees the string.

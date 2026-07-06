@@ -129,6 +129,12 @@ public:
     // Async: fetch the balance of `index` for `token` ("" = ETH); emits availableBalance().
     void fetchAvailable(quint32 index, const QString &token);
 
+    // Async: fetch native + tracked-token balances for accounts [0, numAccounts) in ONE batched
+    // RPC request. Emits accountBalanceUpdated() + availableBalance() per account/token (reusing
+    // the same handlers as the single-balance path) and allBalancesRefreshed() when done. This
+    // replaces per-account/per-token fan-out so everything loads together in one Tor round-trip.
+    void refreshAllBalances(quint32 numAccounts);
+
     // Async: emits balanceUpdated() / refreshed() when done.
     void refresh(quint32 accountIndex);
 
@@ -167,6 +173,11 @@ public:
 
     // Async: poll the chain head; emits blockNumberUpdated() so the UI can refresh on new blocks.
     void refreshBlockNumber();
+
+    // ##### Per-wallet metadata (labels/contacts/notes/funded) — encrypted inside the wallet file #####
+    // Opaque JSON blob owned by the UI. Read once on open; setMetadata()+save() persists it.
+    QString metadata() const;
+    void setMetadata(const QString &json);
 
     // ##### Tokens (Assets panel) #####
     void addToken(const TokenInfo &t);
@@ -214,6 +225,8 @@ signals:
     void providerConnected(int mode, const QString &message); // 2=Tor, 1=Direct, 0=Offline
     void availableBalance(quint32 index, const QString &token, const QString &formatted,
                           const QString &symbol);
+    // Emitted once after a batched refreshAllBalances() has dispatched all per-account signals.
+    void allBalancesRefreshed();
 
 private:
     QString takeLastError() const;

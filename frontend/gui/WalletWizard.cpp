@@ -16,6 +16,7 @@
 #include <QPlainTextEdit>
 #include <QPointer>
 #include <QPushButton>
+#include <QTimer>
 #include <QtConcurrent/QtConcurrent>
 #include <QRadioButton>
 #include <QSettings>
@@ -46,15 +47,26 @@ const QString kLockIcon = ":/assets/images/lock.svg";
 const QString kInfoIcon = ":/assets/images/info2.svg";
 const QString kWarnIcon = ":/assets/images/warning.png";
 
-// Like Feather: pick the first wallet name in `dir` that doesn't already exist, so creating a new
-// wallet never silently overwrites an existing one ("wallet", then "wallet_2", "wallet_3", ...).
-QString uniqueWalletName(const QString &dir, const QString &base = QStringLiteral("wallet")) {
-    QDir d(dir);
-    if (!QFileInfo::exists(d.filePath(base + QStringLiteral(".aero"))))
+// Feather-style wallet root: <Documents>/Aero/wallets. Each wallet lives in its own subfolder as
+// <name>/<name>.keys, so a wallet's files are grouped together.
+QString walletsRoot() {
+    const QString docs = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    return QDir(docs).filePath(QStringLiteral("Aero/wallets"));
+}
+
+// Full path of a wallet's key file for a given name: <root>/<name>/<name>.keys.
+QString walletKeyPath(const QString &root, const QString &name) {
+    return QDir(root).filePath(QStringLiteral("%1/%1.keys").arg(name));
+}
+
+// Like Feather: pick the first wallet name whose subfolder/key file doesn't already exist, so
+// creating a new wallet never silently overwrites an existing one ("wallet", "wallet_2", ...).
+QString uniqueWalletName(const QString &root, const QString &base = QStringLiteral("wallet")) {
+    if (!QFileInfo::exists(walletKeyPath(root, base)))
         return base;
     for (int i = 2; i < 100000; ++i) {
         const QString candidate = QStringLiteral("%1_%2").arg(base).arg(i);
-        if (!QFileInfo::exists(d.filePath(candidate + QStringLiteral(".aero"))))
+        if (!QFileInfo::exists(walletKeyPath(root, candidate)))
             return candidate;
     }
     return base; // unreachable in practice
@@ -64,7 +76,8 @@ QString uniqueWalletName(const QString &dir, const QString &base = QStringLitera
 // ================= WalletWizard =================
 
 WalletWizard::WalletWizard(QWidget *parent) : QWizard(parent) {
-    walletDir = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    walletDir = walletsRoot();
+    QDir().mkpath(walletDir);
 
     setWindowTitle(tr("Welcome to Aero"));
     setWindowIcon(QIcon(":/assets/images/appicons/64x64.png"));
@@ -170,7 +183,8 @@ FilePage::FilePage(WalletWizard *w) : m_w(w), ui(new Ui::PageWalletFile) {
     setTitle(tr("Wallet name and location"));
 
     ui->frame_wallet->setInfo(QIcon(kInfoIcon),
-                              tr("Your wallet is stored as a single encrypted .aero file. "
+                              tr("Your wallet is stored in its own folder as an encrypted "
+                                 ".keys file (Documents/Aero/wallets/<name>/<name>.keys). "
                                  "Choose a name and where to keep it."));
     ui->line_walletName->setText(m_w->walletName);
     ui->line_walletDir->setText(m_w->walletDir);
@@ -201,7 +215,7 @@ bool FilePage::validatePage() {
     }
     const QString dir = ui->line_walletDir->text();
     // Never overwrite an existing wallet file (data loss / key-loss risk).
-    if (QFileInfo::exists(QDir(dir).filePath(name + QStringLiteral(".aero")))) {
+    if (QFileInfo::exists(walletKeyPath(dir, name))) {
         QMessageBox::warning(
             this, tr("Wallet already exists"),
             tr("A wallet named \"%1\" already exists in this folder.\n\n"
@@ -240,7 +254,17 @@ SeedPage::SeedPage(WalletWizard *w) : m_w(w), ui(new Ui::PageWalletSeed) {
 
     connect(ui->btnRoulette, &QPushButton::clicked, this, [this]() { regenerate(); });
     connect(ui->btnCopy, &QPushButton::clicked, this, [this]() {
-        if (m_w->wallet) QApplication::clipboard()->setText(m_w->wallet->getSeed());
+        if (!m_w->wallet) return;
+        const QString seed = m_w->wallet->getSeed();
+        QApplication::clipboard()->setText(seed);
+        // Auto-clear the seed from the clipboard after the configured timeout so it doesn't linger.
+        const int secs = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
+                             .value(QStringLiteral("security/clipboardClearSecs"), 30).toInt();
+        if (secs > 0)
+            QTimer::singleShot(secs * 1000, qApp, [seed]() {
+                if (QApplication::clipboard()->text() == seed)
+                    QApplication::clipboard()->clear();
+            });
     });
 
     // Optional BIP39 passphrase ("extension word" / "25th word"). It is NOT part of the seed words
@@ -484,9 +508,10 @@ bool PasswordPage::validatePage() {
         QMessageBox::warning(this, tr("Error"), tr("No wallet to save."));
         return false;
     }
-    QDir dir(m_w->walletDir);
+    // Feather-style: each wallet gets its own subfolder <walletDir>/<name>/, holding <name>.keys.
+    QDir dir(QDir(m_w->walletDir).filePath(m_w->walletName));
     if (!dir.exists()) dir.mkpath(".");
-    const QString path = dir.filePath(m_w->walletName + ".aero");
+    const QString path = dir.filePath(m_w->walletName + QStringLiteral(".keys"));
     if (!m_w->wallet->store(path, ui->widget_password->password())) {
         QMessageBox::warning(this, tr("Error"), m_w->wallet->errorString());
         return false;
@@ -635,9 +660,11 @@ OpenPage::OpenPage(WalletWizard *w) : m_w(w), ui(new Ui::PageOpenWallet) {
             [this](const QModelIndex &, const QModelIndex &) { updatePath(); });
     connect(ui->walletTable, &QTreeView::doubleClicked, this, [this]() { finishNow(); });
     connect(ui->btnBrowse, &QPushButton::clicked, this, [this]() {
-        const QString dir = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
-        const QString f = QFileDialog::getOpenFileName(this, tr("Select your wallet file"), dir,
-                                                       tr("Aero wallet (*.aero *.plume)"));
+        const QString start = QDir(walletsRoot()).exists()
+                                  ? walletsRoot()
+                                  : QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+        const QString f = QFileDialog::getOpenFileName(this, tr("Select your wallet file"), start,
+                                                       tr("Aero wallet (*.keys *.aero *.plume)"));
         if (f.isEmpty()) return;
         m_walletFile = f;
         finishNow();
@@ -656,11 +683,17 @@ void OpenPage::initializePage() {
 
 void OpenPage::refreshList() {
     m_model->removeRows(0, m_model->rowCount());
-    const QString dir = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
-    QDir d(dir);
-    // List new .aero wallets and legacy .plume wallets (openable for backward compatibility).
-    const auto files = d.entryInfoList({QStringLiteral("*.aero"), QStringLiteral("*.plume")},
-                                       QDir::Files, QDir::Time);
+    QFileInfoList files;
+    // New layout: <Documents>/Aero/wallets/<name>/<name>.keys (each wallet in its own subfolder).
+    const QString root = walletsRoot();
+    for (const QFileInfo &sub : QDir(root).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Time)) {
+        files += QDir(sub.absoluteFilePath())
+                     .entryInfoList({QStringLiteral("*.keys")}, QDir::Files, QDir::Time);
+    }
+    // Also list legacy flat wallets in Documents (openable for backward compatibility).
+    const QString docs = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    files += QDir(docs).entryInfoList({QStringLiteral("*.aero"), QStringLiteral("*.plume")},
+                                      QDir::Files, QDir::Time);
     for (const QFileInfo &fi : files) {
         auto *name = new QStandardItem(fi.completeBaseName());
         name->setEditable(false);

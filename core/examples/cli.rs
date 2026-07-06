@@ -51,6 +51,27 @@ fn main() {
             let bal = rt.block_on(w.eth_balance(index)).unwrap();
             println!("{} {}", bal.formatted, bal.symbol);
         }
+        "allbalances" => {
+            let mnemonic = &args[1];
+            let num: u32 = args[2].parse().unwrap();
+            let chain_id: u64 = args[3].parse().unwrap();
+            let rpc = args[4].clone();
+            let socks = args.get(5).cloned();
+            let mut w = Wallet::restore(mnemonic).unwrap();
+            for _ in 1..num {
+                let _ = w.add_account();
+            }
+            w.set_provider(ProviderConfig {
+                chain_id,
+                endpoints: vec![rpc],
+                socks_proxy: socks,
+                allow_clearnet: false,
+                timeout_secs: 60,
+            })
+            .unwrap();
+            let v = rt.block_on(w.all_balances(num)).unwrap();
+            println!("{}", serde_json::to_string_pretty(&v).unwrap());
+        }
         "fees" => {
             let chain_id: u64 = args[1].parse().unwrap();
             let rpc = args[2].clone();

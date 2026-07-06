@@ -38,6 +38,9 @@
 #include <QFormLayout>
 #include <QFrame>
 #include <QGroupBox>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QImage>
@@ -380,12 +383,15 @@ void AeroMainWindow::setupTabs() {
                 const bool isEdit = roles.isEmpty() || roles.contains(Qt::EditRole);
                 if (!labelTouched || !isEdit)
                     return; // ignore balance / "used" (background) updates
-                QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
-                const QString grp = labelsGroup(m_wallet ? m_wallet->walletPath() : QString());
-                for (int r = tl.row(); r <= br.row(); ++r) {
-                    const quint32 acct = m_addressModel->accountAt(r);
-                    s.setValue(QStringLiteral("%1/%2").arg(grp).arg(acct),
-                               m_addressModel->labelAt(acct));
+                if (!m_metaLoading) {
+                    // Persist labels inside the encrypted wallet (not plaintext settings).
+                    QJsonObject labels = m_meta.value(QStringLiteral("labels")).toObject();
+                    for (int r = tl.row(); r <= br.row(); ++r) {
+                        const quint32 acct = m_addressModel->accountAt(r);
+                        labels[QString::number(acct)] = m_addressModel->labelAt(acct);
+                    }
+                    m_meta[QStringLiteral("labels")] = labels;
+                    saveMetadata();
                 }
                 if (m_fromCombo) {
                     QSignalBlocker block(m_fromCombo);
@@ -589,12 +595,12 @@ void AeroMainWindow::setupTabs() {
     setupNftTab();
     setupMenu();
 
-    // Notes tab: a persistent scratch pad (Feather's Notes are per-wallet; ours is a simple pad).
-    ui.notes->setPlainText(
-        QSettings(QStringLiteral("Aero"), QStringLiteral("Aero")).value(QStringLiteral("notes/text")).toString());
+    // Notes tab: a per-wallet scratch pad, stored encrypted inside the wallet (loaded in
+    // loadMetadata()). Persist edits into the wallet metadata.
     connect(ui.notes, &QPlainTextEdit::textChanged, this, [this]() {
-        QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
-            .setValue(QStringLiteral("notes/text"), ui.notes->toPlainText());
+        if (m_metaLoading) return;
+        m_meta[QStringLiteral("notes")] = ui.notes->toPlainText();
+        saveMetadata();
     });
 
     setupContactsTab();
@@ -902,26 +908,24 @@ void AeroMainWindow::setupContactsTab() {
     row->addStretch();
     ui.contactsWidgetLayout->addLayout(row);
 
+    // Persist contacts inside the encrypted wallet (per-wallet, like Feather) rather than in
+    // plaintext settings. Contents are (re)loaded per wallet in loadMetadata().
     auto persist = [this]() {
-        QStringList list;
+        if (m_metaLoading) return;
+        QJsonArray arr;
         for (int r = 0; r < m_contactsTable->rowCount(); ++r) {
             const QString name = m_contactsTable->item(r, 0) ? m_contactsTable->item(r, 0)->text() : QString();
             const QString addr = m_contactsTable->item(r, 1) ? m_contactsTable->item(r, 1)->text() : QString();
-            if (!addr.isEmpty())
-                list << (name + QLatin1Char('|') + addr);
+            if (!addr.isEmpty()) {
+                QJsonObject c;
+                c[QStringLiteral("name")] = name;
+                c[QStringLiteral("address")] = addr;
+                arr.append(c);
+            }
         }
-        QSettings(QStringLiteral("Aero"), QStringLiteral("Aero")).setValue(QStringLiteral("contacts"), list);
+        m_meta[QStringLiteral("contacts")] = arr;
+        saveMetadata();
     };
-    // Load persisted contacts.
-    for (const QString &e : QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
-                                .value(QStringLiteral("contacts")).toStringList()) {
-        const int sep = e.indexOf(QLatin1Char('|'));
-        if (sep < 0) continue;
-        const int r = m_contactsTable->rowCount();
-        m_contactsTable->insertRow(r);
-        m_contactsTable->setItem(r, 0, new QTableWidgetItem(e.left(sep)));
-        m_contactsTable->setItem(r, 1, new QTableWidgetItem(e.mid(sep + 1)));
-    }
 
     connect(addBtn, &QPushButton::clicked, this, [this, persist]() {
         QDialog dlg(this);
@@ -1303,13 +1307,13 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     // Show 5 receive addresses by default; "Create new address" derives more on demand.
     ensureMinAddresses(5);
     m_addressModel->setWallet(m_wallet);
-    loadLabels(); // restore saved address labels (persisted across restarts)
+    // Load per-wallet metadata (labels/funded/contacts/notes) from the encrypted wallet file
+    // (migrating any legacy plaintext settings on first open). Applies labels + funded set too.
+    loadMetadata();
 
-    // Restore the "show funded only" preference and any previously-discovered funded addresses so
-    // Receive shows the right set immediately (a scan runs on first connect if none are known yet).
+    // Restore the "show funded only" preference; the funded set itself came from loadMetadata().
     m_showFundedOnly = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
                            .value(QStringLiteral("receive/fundedOnly"), true).toBool();
-    loadFundedSet();
     applyFundedFilter();
     updateHistoryPricing(); // seed the History dust filter with the tracked-token symbols
     loadLiquidityCache();   // restore auto-trust (DEX liquidity) decisions
@@ -1459,19 +1463,60 @@ void AeroMainWindow::onBlockNumber(quint64 block) {
     if (firstSeen)
         return; // baseline; the connect handler already did the initial refresh
     // A new block landed — refresh balances + history so incoming/outgoing txs surface at once,
-    // and refresh the fee suggestion (base fee changes each block).
+    // and refresh the fee suggestion (base fee changes each block). Balances are one batched call.
     refreshAllBalances();
-    m_wallet->refresh(m_account);
     refreshHistoryView();
     m_wallet->refreshFees();
-    updateAvailable();
+}
+
+// RPC endpoints for `chainId`: a user-saved custom node (Settings -> Node) wins over the bundled
+// registry defaults.
+QStringList AeroMainWindow::endpointsFor(quint64 chainId) const {
+    QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+    const QString csv = s.value(QStringLiteral("node/%1/rpc").arg(chainId)).toString().trimmed();
+    if (!csv.isEmpty()) {
+        QStringList out;
+        for (const QString &e : csv.split(QLatin1Char(','), Qt::SkipEmptyParts))
+            out << e.trimmed();
+        if (!out.isEmpty()) return out;
+    }
+    return chainDefFor(chainId).rpcs;
+}
+
+// SOCKS proxy for `chainId`: if the user saved a custom node they may also have set (or blanked, to
+// go direct) a proxy for it. Otherwise everything routes over the running Tor proxy.
+QString AeroMainWindow::socksFor(quint64 chainId) const {
+    QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+    const QString key = QStringLiteral("node/%1/socks").arg(chainId);
+    if (s.contains(key)) return s.value(key).toString(); // may be "" => direct (own node)
+    return m_tor ? m_tor->socksProxy() : kDefaultSocks;
+}
+
+// (Re)connect the active chain using the resolved node settings. A custom node with a blank proxy
+// connects directly (for a local/own node); otherwise we go over Tor.
+void AeroMainWindow::connectCurrentChain() {
+    if (!m_wallet) return;
+    m_wallet->connectProvider(m_chainId, endpointsFor(m_chainId), socksFor(m_chainId));
 }
 
 void AeroMainWindow::autoConnect() {
     if (!m_wallet) return;
+
+    // If the user configured a custom node for this chain with Tor disabled (blank proxy), connect
+    // directly to their own node without waiting on/booting Tor.
+    {
+        QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+        const QString key = QStringLiteral("node/%1/socks").arg(m_chainId);
+        if (s.contains(key) && s.value(key).toString().trimmed().isEmpty()) {
+            setConnectionState(0, tr("Connecting to your node…"));
+            connectCurrentChain();
+            return;
+        }
+    }
+
     setConnectionState(0, tr("Starting Tor…"));
 
-    // Always route through Tor — start (or reuse) Tor first, then connect only once it has
+    // Otherwise always route through Tor — start (or reuse) Tor first, then connect only once it has
     // bootstrapped. There is no clearnet fallback, so the wallet never leaks the user's IP.
     if (!m_tor) {
         m_tor = new TorManager(this);
@@ -1479,16 +1524,14 @@ void AeroMainWindow::autoConnect() {
                 [this](const QString &msg) { setConnectionState(0, msg); });
         connect(m_tor, &TorManager::ready, this, [this]() {
             setConnectionState(0, tr("Connecting via Tor…"));
-            const ChainDef &c = chainDefFor(m_chainId);
-            m_wallet->connectProvider(m_chainId, c.rpcs, m_tor->socksProxy());
+            connectCurrentChain();
         });
         connect(m_tor, &TorManager::failed, this, [this](const QString &err) {
             setConnectionState(0, tr("Tor unavailable — %1").arg(err));
         });
     }
     if (m_tor->isReady()) {
-        const ChainDef &c = chainDefFor(m_chainId);
-        m_wallet->connectProvider(m_chainId, c.rpcs, m_tor->socksProxy());
+        connectCurrentChain();
     } else {
         m_tor->start();
     }
@@ -1523,12 +1566,18 @@ void AeroMainWindow::switchChain(quint64 chainId) {
     // Update the Home native ticker label + any native-symbol labels.
     relabelNative();
 
-    // Reconnect over the existing Tor transport to the new chain's endpoints.
+    // Reconnect to the new chain's endpoints (custom node if configured for it, else registry
+    // defaults over the existing Tor transport).
     setConnectionState(0, tr("Switching to %1…").arg(c.name));
-    if (m_tor && m_tor->isReady())
-        m_wallet->connectProvider(chainId, c.rpcs, m_tor->socksProxy());
-    else
-        autoConnect();
+    {
+        QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+        const QString key = QStringLiteral("node/%1/socks").arg(chainId);
+        const bool directNode = s.contains(key) && s.value(key).toString().trimmed().isEmpty();
+        if (directNode || (m_tor && m_tor->isReady()))
+            connectCurrentChain();
+        else
+            autoConnect();
+    }
 }
 
 // Update UI labels that name the native coin after a chain switch.
@@ -1541,12 +1590,13 @@ void AeroMainWindow::relabelNative() {
 void AeroMainWindow::onProviderConnected(int mode, const QString &message) {
     setConnectionState(mode, mode > 0 ? tr("%1 · %2").arg(message, chainDefFor(m_chainId).name) : message);
     if (mode > 0) {
-        // Only now that we can actually reach an RPC do we pull balances + prices.
-        refreshAllBalances();
-        onRefresh();
-        updateAvailable();
-        m_wallet->refreshMarketPrices();
-        m_wallet->refreshFees();
+        // Only now that we can actually reach an RPC do we pull balances + prices. Each of these is
+        // a single (or batched) request — no per-account fan-out and no duplicate refreshes.
+        refreshAllBalances();               // batched: native + tokens for every account
+        refreshHistoryView();               // full history (Blockscout over Tor)
+        m_wallet->refreshEthUsdPrice();     // native/USD (Chainlink or fallback)
+        m_wallet->refreshMarketPrices();    // XMR + native market prices for Home
+        m_wallet->refreshFees();            // gas suggestion
         if (m_fiatCurrency.compare(QStringLiteral("USD"), Qt::CaseInsensitive) != 0)
             m_wallet->refreshFiatRate(m_fiatCurrency); // USD->fiat rate for display
         refreshNfts();
@@ -1566,29 +1616,21 @@ void AeroMainWindow::applyFundedFilter() {
 }
 
 void AeroMainWindow::loadFundedSet() {
+    // The funded set now lives in the encrypted wallet metadata (loaded in loadMetadata()); this
+    // just reflects the already-parsed m_meta into m_fundedAccounts.
     m_fundedAccounts.clear();
-    QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
-    const QString grp = labelsGroup(m_wallet ? m_wallet->walletPath() : QString());
-    m_fundedScanned = s.value(QStringLiteral("%1/funded_done").arg(grp), false).toBool();
-    const QString csv = s.value(QStringLiteral("%1/funded").arg(grp)).toString();
-    for (const QString &part : csv.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
-        bool ok = false;
-        const quint32 i = part.toUInt(&ok);
-        if (ok)
-            m_fundedAccounts.insert(i);
-    }
-    // Funded/discovered accounts are persisted in the wallet file itself (account order), so they
-    // already exist after opening — no need to fabricate standard-path entries here.
+    m_fundedScanned = m_meta.value(QStringLiteral("funded_done")).toBool(false);
+    for (const QJsonValue &v : m_meta.value(QStringLiteral("funded")).toArray())
+        m_fundedAccounts.insert(static_cast<quint32>(v.toDouble()));
 }
 
 void AeroMainWindow::saveFundedSet() {
-    QStringList parts;
+    QJsonArray arr;
     for (quint32 i : m_fundedAccounts)
-        parts << QString::number(i);
-    QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
-    const QString grp = labelsGroup(m_wallet ? m_wallet->walletPath() : QString());
-    s.setValue(QStringLiteral("%1/funded").arg(grp), parts.join(QLatin1Char(',')));
-    s.setValue(QStringLiteral("%1/funded_done").arg(grp), true);
+        arr.append(static_cast<double>(i));
+    m_meta[QStringLiteral("funded")] = arr;
+    m_meta[QStringLiteral("funded_done")] = true;
+    saveMetadata();
 }
 
 void AeroMainWindow::onFundedScanned(const QList<quint32> &indices) {
@@ -1615,13 +1657,10 @@ void AeroMainWindow::onFundedScanned(const QList<quint32> &indices) {
 
 void AeroMainWindow::refreshAllBalances() {
     if (!m_wallet) return;
-    const quint32 n = m_wallet->numAccounts();
-    const QVector<TokenInfo> toks = m_wallet->tokens();
-    for (quint32 i = 0; i < n; ++i) {
-        m_wallet->refreshAccountBalance(i);                    // ETH per account
-        for (const TokenInfo &t : toks)                        // token balances per account
-            m_wallet->fetchAvailable(i, t.address);
-    }
+    // ONE batched request fetches native + all tracked-token balances for every account, instead of
+    // firing numAccounts × (1 + numTokens) independent Tor calls (which trickled in one-by-one and
+    // could overwhelm Tor so nothing loaded). Results arrive via the usual per-account signals.
+    m_wallet->refreshAllBalances(m_wallet->numAccounts());
 }
 
 void AeroMainWindow::updateUsed(quint32 index) {
@@ -1638,12 +1677,12 @@ void AeroMainWindow::updateUsed(quint32 index) {
 }
 
 void AeroMainWindow::loadLabels() {
+    // Apply address labels from the (already-parsed) encrypted wallet metadata.
     if (!m_wallet || !m_addressModel) return;
-    QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
-    const QString grp = labelsGroup(m_wallet->walletPath());
+    const QJsonObject labels = m_meta.value(QStringLiteral("labels")).toObject();
     const quint32 n = m_wallet->numAccounts();
     for (quint32 i = 0; i < n; ++i) {
-        const QString v = s.value(QStringLiteral("%1/%2").arg(grp).arg(i)).toString();
+        const QString v = labels.value(QString::number(i)).toString();
         if (!v.isEmpty())
             m_addressModel->setLabel(i, v);
     }
@@ -1651,6 +1690,108 @@ void AeroMainWindow::loadLabels() {
         QSignalBlocker block(m_fromCombo);
         for (int i = 0; i < m_fromCombo->count(); ++i)
             m_fromCombo->setItemText(i, accountLabel(static_cast<quint32>(i)));
+    }
+}
+
+void AeroMainWindow::copySensitive(const QString &text) {
+    QApplication::clipboard()->setText(text);
+    const int secs = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
+                         .value(QStringLiteral("security/clipboardClearSecs"), 30).toInt();
+    if (secs <= 0)
+        return; // 0 = never auto-clear
+    // Only clear if the clipboard still holds this secret (don't clobber later copies).
+    QTimer::singleShot(secs * 1000, this, [text]() {
+        QClipboard *cb = QApplication::clipboard();
+        if (cb->text() == text)
+            cb->clear();
+    });
+}
+
+void AeroMainWindow::saveMetadata() {
+    if (!m_wallet) return;
+    m_wallet->setMetadata(QString::fromUtf8(QJsonDocument(m_meta).toJson(QJsonDocument::Compact)));
+    m_wallet->save(); // re-encrypt with the retained password (atomic write)
+}
+
+void AeroMainWindow::loadMetadata() {
+    if (!m_wallet) return;
+    const QString json = m_wallet->metadata();
+    m_meta = json.isEmpty() ? QJsonObject()
+                            : QJsonDocument::fromJson(json.toUtf8()).object();
+    if (m_meta.isEmpty())
+        migrateLegacyMetadata(); // one-time import from the old plaintext QSettings (persists)
+
+    // Apply to the UI without re-persisting (guard re-entrant writes).
+    m_metaLoading = true;
+    loadLabels();
+    loadFundedSet();
+    if (m_contactsTable) {
+        m_contactsTable->setRowCount(0);
+        for (const QJsonValue &v : m_meta.value(QStringLiteral("contacts")).toArray()) {
+            const QJsonObject c = v.toObject();
+            const int r = m_contactsTable->rowCount();
+            m_contactsTable->insertRow(r);
+            m_contactsTable->setItem(r, 0, new QTableWidgetItem(c.value(QStringLiteral("name")).toString()));
+            m_contactsTable->setItem(r, 1, new QTableWidgetItem(c.value(QStringLiteral("address")).toString()));
+        }
+    }
+    ui.notes->setPlainText(m_meta.value(QStringLiteral("notes")).toString());
+    m_metaLoading = false;
+}
+
+void AeroMainWindow::migrateLegacyMetadata() {
+    // Import metadata that older builds stored in plaintext QSettings, fold it into the encrypted
+    // wallet, and remove the plaintext copies. Runs once (when a wallet has no embedded metadata).
+    if (!m_wallet) return;
+    QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+    const QString grp = labelsGroup(m_wallet->walletPath());
+    bool migrated = false;
+
+    QJsonObject labels;
+    const quint32 n = m_wallet->numAccounts();
+    for (quint32 i = 0; i < n; ++i) {
+        const QString v = s.value(QStringLiteral("%1/%2").arg(grp).arg(i)).toString();
+        if (!v.isEmpty()) labels[QString::number(i)] = v;
+    }
+    if (!labels.isEmpty()) { m_meta[QStringLiteral("labels")] = labels; migrated = true; }
+
+    if (s.contains(QStringLiteral("%1/funded").arg(grp))) {
+        QJsonArray funded;
+        for (const QString &part : s.value(QStringLiteral("%1/funded").arg(grp)).toString()
+                                       .split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+            bool ok = false; const quint32 i = part.toUInt(&ok);
+            if (ok) funded.append(static_cast<double>(i));
+        }
+        m_meta[QStringLiteral("funded")] = funded;
+        m_meta[QStringLiteral("funded_done")] =
+            s.value(QStringLiteral("%1/funded_done").arg(grp), false).toBool();
+        migrated = true;
+    }
+
+    const QStringList legacyContacts =
+        s.value(QStringLiteral("contacts")).toStringList(); // was global in old builds
+    if (!legacyContacts.isEmpty()) {
+        QJsonArray arr;
+        for (const QString &e : legacyContacts) {
+            const int sep = e.indexOf(QLatin1Char('|'));
+            if (sep < 0) continue;
+            QJsonObject c;
+            c[QStringLiteral("name")] = e.left(sep);
+            c[QStringLiteral("address")] = e.mid(sep + 1);
+            arr.append(c);
+        }
+        m_meta[QStringLiteral("contacts")] = arr;
+        migrated = true;
+    }
+    const QString legacyNotes = s.value(QStringLiteral("notes/text")).toString();
+    if (!legacyNotes.isEmpty()) { m_meta[QStringLiteral("notes")] = legacyNotes; migrated = true; }
+
+    if (migrated) {
+        saveMetadata(); // persist into the encrypted wallet
+        // Scrub the migrated plaintext copies.
+        s.remove(grp);                        // per-wallet labels/funded group
+        s.remove(QStringLiteral("contacts")); // formerly-global contacts
+        s.remove(QStringLiteral("notes/text"));
     }
 }
 
@@ -1699,8 +1840,10 @@ void AeroMainWindow::onAvailableBalance(quint32 index, const QString &token,
                    tr("+%1 %2 to Account #%3")
                        .arg(grouped(QString::number(newBal - oldBal, 'f', 6)), symbol)
                        .arg(index));
-        if (index == m_account)
-            updateReceive(); // refresh the token breakdown for the shown address
+        if (index == m_account) {
+            showCachedBalance(m_account); // token totals changed -> update the status balance too
+            updateReceive();              // refresh the token breakdown for the shown address
+        }
     }
 
     // Ignore results that no longer match the current From account + asset selection.
@@ -1789,8 +1932,10 @@ void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, c
         QSignalBlocker block(m_fromCombo);
         m_fromCombo->setItemText(static_cast<int>(index), accountLabel(index));
     }
-    if (index == m_account)
-        updateReceive(); // refresh the balance shown under the QR
+    if (index == m_account) {
+        showCachedBalance(m_account); // bottom-left status balance (native + tokens), from the batch
+        updateReceive();              // refresh the balance shown under the QR
+    }
 }
 
 void AeroMainWindow::updateReceive() {
@@ -1970,7 +2115,7 @@ void AeroMainWindow::onAddressContextMenu(const QPoint &pos) {
     lay->addWidget(keyEdit);
     auto *copyBtn = new QPushButton(tr("Copy to clipboard"), &dlg);
     connect(copyBtn, &QPushButton::clicked, &dlg,
-            [key]() { QApplication::clipboard()->setText(key); });
+            [this, key]() { copySensitive(key); });
     lay->addWidget(copyBtn);
     auto *box = new QDialogButtonBox(QDialogButtonBox::Close, &dlg);
     connect(box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -1990,11 +2135,17 @@ void AeroMainWindow::onSettings() {
     auto *nodeTab = new QWidget(&dlg);
     auto *nodeForm = new QFormLayout(nodeTab);
     auto *chainEdit = new QLineEdit(QString::number(m_chainId), nodeTab);
-    auto *rpcEdit = new QLineEdit(chainDefFor(m_chainId).rpcs.join(QStringLiteral(", ")), nodeTab);
-    auto *socksEdit = new QLineEdit(kDefaultSocks, nodeTab);
+    // Pre-fill with the node actually in use for this chain: a saved custom node if there is one,
+    // otherwise the bundled defaults over Tor. This is what makes "use your own node" stick.
+    auto *rpcEdit = new QLineEdit(endpointsFor(m_chainId).join(QStringLiteral(", ")), nodeTab);
+    auto *socksEdit = new QLineEdit(socksFor(m_chainId), nodeTab);
+    rpcEdit->setToolTip(tr("Leave equal to defaults to keep the bundled endpoints; enter your own\n"
+                           "node (e.g. http://127.0.0.1:8545) to use it for this network."));
+    socksEdit->setToolTip(tr("socks5h://127.0.0.1:9055 routes over Tor. Blank = connect directly\n"
+                             "(use this for a local/own node)."));
     nodeForm->addRow(tr("Chain ID"), chainEdit);
     nodeForm->addRow(tr("RPC endpoint(s), comma-separated"), rpcEdit);
-    nodeForm->addRow(tr("SOCKS proxy (blank/none to disable Tor)"), socksEdit);
+    nodeForm->addRow(tr("SOCKS proxy (blank to disable Tor)"), socksEdit);
     // Preferred block explorer for transaction/address links.
     auto *explorerEdit = new QLineEdit(nodeTab);
     explorerEdit->setText(QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
@@ -2022,6 +2173,13 @@ void AeroMainWindow::onSettings() {
     auto *lockMinChk = new QCheckBox(tr("Lock when minimized"), secTab);
     lockMinChk->setChecked(m_lockOnMinimize);
     secForm->addRow(lockMinChk);
+    auto *clipSpin = new QSpinBox(secTab);
+    clipSpin->setRange(0, 600);
+    clipSpin->setSuffix(tr(" sec"));
+    clipSpin->setSpecialValueText(tr("Never"));
+    clipSpin->setValue(QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
+                           .value(QStringLiteral("security/clipboardClearSecs"), 30).toInt());
+    secForm->addRow(tr("Clear clipboard after copying a seed/key"), clipSpin);
     tabs->addTab(secTab, tr("Security"));
 
     // --- Appearance tab ---
@@ -2159,6 +2317,7 @@ void AeroMainWindow::onSettings() {
         s.setValue(QStringLiteral("security/confirmSend"), m_confirmSend);
         s.setValue(QStringLiteral("security/lockOnMinimize"), m_lockOnMinimize);
         s.setValue(QStringLiteral("security/autoLockMinutes"), m_autoLockMinutes);
+        s.setValue(QStringLiteral("security/clipboardClearSecs"), clipSpin->value());
         QString base = explorerEdit->text().trimmed();
         while (base.endsWith(QLatin1Char('/'))) base.chop(1);
         if (!base.isEmpty())
@@ -2171,16 +2330,37 @@ void AeroMainWindow::onSettings() {
         }
     }
 
-    // Node / network.
+    // Node / network. Persist the custom node PER CHAIN so it survives reconnects/restarts, then
+    // reconnect using it. Leaving the RPC field equal to the defaults clears the override.
     if (m_wallet) {
         const quint64 chainId = chainEdit->text().toULongLong();
         QStringList endpoints;
-        for (const QString &e : rpcEdit->text().split(',', Qt::SkipEmptyParts))
+        for (const QString &e : rpcEdit->text().split(QLatin1Char(','), Qt::SkipEmptyParts))
             endpoints << e.trimmed();
         QString socks = socksEdit->text().trimmed();
         if (socks.compare(QStringLiteral("none"), Qt::CaseInsensitive) == 0) socks.clear();
-        setConnectionState(0, tr("Connecting…"));
-        m_wallet->connectProvider(chainId, endpoints, socks); // result via onProviderConnected()
+
+        QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+        const QString rpcKey = QStringLiteral("node/%1/rpc").arg(chainId);
+        const QString socksKey = QStringLiteral("node/%1/socks").arg(chainId);
+        // If the entered endpoints match the bundled defaults, treat it as "no custom node".
+        if (endpoints.isEmpty() || endpoints == chainDefFor(chainId).rpcs) {
+            s.remove(rpcKey);
+            s.remove(socksKey);
+        } else {
+            s.setValue(rpcKey, endpoints.join(QStringLiteral(", ")));
+            s.setValue(socksKey, socks); // may be "" => direct/own node
+        }
+        s.sync();
+
+        // Reflect the possibly-changed chain so downstream labels/explorer stay consistent.
+        if (chainId != m_chainId && chainDefFor(chainId).id == chainId) {
+            switchChain(chainId);
+        } else {
+            m_chainId = chainId;
+            setConnectionState(0, tr("Connecting…"));
+            m_wallet->connectProvider(chainId, endpoints, socks); // result via onProviderConnected()
+        }
     }
 }
 
@@ -2374,7 +2554,7 @@ void AeroMainWindow::onShowSeed() {
     v->addWidget(seedLabel);
     auto *copyBtn = new QPushButton(tr("Copy to clipboard"), &dlg);
     connect(copyBtn, &QPushButton::clicked, &dlg,
-            [seed]() { QApplication::clipboard()->setText(seed); });
+            [this, seed]() { copySensitive(seed); });
     v->addWidget(copyBtn);
     auto *box = new QDialogButtonBox(QDialogButtonBox::Close, &dlg);
     connect(box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -2385,12 +2565,12 @@ void AeroMainWindow::onShowSeed() {
 
 void AeroMainWindow::onRefresh() {
     if (!m_wallet) return;
-    m_wallet->refresh(m_account);
+    // Manual refresh: batched balances + history + prices + fees. No per-account fan-out.
+    refreshAllBalances();
     refreshHistoryView();
     m_wallet->refreshEthUsdPrice();
     m_wallet->refreshMarketPrices();
-    refreshAllBalances();
-    updateAvailable();
+    m_wallet->refreshFees();
 }
 
 static bool isStablecoin(const QString &symbol) {
@@ -2400,7 +2580,10 @@ static bool isStablecoin(const QString &symbol) {
 
 double AeroMainWindow::unitPriceUsd(const QString &symbol) const {
     const QString s = symbol.toUpper();
-    if (s == m_nativeSymbol.toUpper() || s == "WETH") return m_nativeUsd;
+    if (s == m_nativeSymbol.toUpper()) return m_nativeUsd;
+    // WETH tracks ETH — only equal to the native price on ETH-native chains (not e.g. Polygon/POL).
+    if (s == "WETH" && m_nativeSymbol.compare(QStringLiteral("ETH"), Qt::CaseInsensitive) == 0)
+        return m_nativeUsd;
     if (isStablecoin(s)) return 1.0; // stablecoins ~ $1
     return 0.0; // unknown -> no conversion
 }

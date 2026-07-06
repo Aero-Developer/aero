@@ -181,11 +181,18 @@ void Wallet::connectProvider(quint64 chainId, const QStringList &endpoints, cons
         if (!socksProxy.isEmpty() && tryMode(socksProxy)) {
             mode = 2;
             message = tr("Connected via Tor");
+        } else if (socksProxy.isEmpty() && tryMode(QString())) {
+            // The user explicitly disabled Tor (blank proxy) — typically to reach their own node
+            // (e.g. http://127.0.0.1:8545). Connect directly. We only do this when the proxy was
+            // deliberately left blank, never as a silent clearnet fallback for the default RPCs.
+            mode = 1;
+            message = tr("Connected (direct — own node)");
         } else {
             mode = 0;
             message = takeLastError();
             if (message.isEmpty())
-                message = tr("Offline — no RPC reachable over Tor");
+                message = socksProxy.isEmpty() ? tr("Offline — node unreachable")
+                                               : tr("Offline — no RPC reachable over Tor");
         }
 
         m_chainId = chainId;
@@ -208,6 +215,39 @@ void Wallet::fetchAvailable(quint32 index, const QString &token) {
             b = parseBalance(takeString(j));
         QMetaObject::invokeMethod(this, [this, index, token, b]() {
             emit availableBalance(index, token, b.formatted, b.symbol);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Wallet::refreshAllBalances(quint32 numAccounts) {
+    if (numAccounts == 0) numAccounts = 1;
+    QtConcurrent::run([this, numAccounts]() {
+        QString json;
+        {
+            QReadLocker lock(&m_coreLock);
+            char *j = aero_wallet_all_balances(m_core, numAccounts);
+            if (j) json = takeString(j);
+        }
+        QMetaObject::invokeMethod(this, [this, json]() {
+            const QJsonObject root = QJsonDocument::fromJson(json.toUtf8()).object();
+            const QJsonArray accts = root.value(QStringLiteral("accounts")).toArray();
+            for (const QJsonValue &av : accts) {
+                const QJsonObject a = av.toObject();
+                const quint32 idx = static_cast<quint32>(a.value(QStringLiteral("index")).toDouble());
+                const QString nativeSym = a.value(QStringLiteral("native_symbol")).toString();
+                const QString nativeFmt = a.value(QStringLiteral("native_formatted")).toString();
+                // Native balance: drives Home total, AddressModel, notifications, status bar...
+                emit accountBalanceUpdated(idx, nativeFmt, nativeSym);
+                // ...and the Send "available" label when the native asset is selected (token == "").
+                emit availableBalance(idx, QString(), nativeFmt, nativeSym);
+                for (const QJsonValue &tv : a.value(QStringLiteral("tokens")).toArray()) {
+                    const QJsonObject t = tv.toObject();
+                    emit availableBalance(idx, t.value(QStringLiteral("address")).toString(),
+                                          t.value(QStringLiteral("formatted")).toString(),
+                                          t.value(QStringLiteral("symbol")).toString());
+                }
+            }
+            emit allBalancesRefreshed();
         }, Qt::QueuedConnection);
     });
 }
@@ -457,6 +497,16 @@ void Wallet::refreshFiatRate(const QString &currency) {
         QMetaObject::invokeMethod(this, [this, currency, rate]() { emit fiatRate(currency, rate); },
                                   Qt::QueuedConnection);
     });
+}
+
+QString Wallet::metadata() const {
+    QReadLocker lock(&m_coreLock);
+    return takeString(aero_wallet_metadata(m_core));
+}
+
+void Wallet::setMetadata(const QString &json) {
+    QWriteLocker lock(&m_coreLock); // mutates the in-memory secrets (persisted on save())
+    aero_wallet_set_metadata(m_core, json.toUtf8().constData());
 }
 
 void Wallet::addToken(const TokenInfo &t) {

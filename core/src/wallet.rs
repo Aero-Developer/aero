@@ -127,6 +127,7 @@ impl Wallet {
             tokens,
             imported_keys: Vec::new(),
             hardware: None,
+            metadata: String::new(),
         };
         normalize_account_order(&mut secrets);
         Ok(Self {
@@ -152,6 +153,7 @@ impl Wallet {
             tokens: Vec::new(),
             imported_keys: Vec::new(),
             hardware: Some(HwDescriptor { kind: kind.as_str().to_string(), addresses }),
+            metadata: String::new(),
         };
         Ok(Self {
             secrets,
@@ -216,7 +218,7 @@ impl Wallet {
 
     pub fn save(&self, path: &str, password: &str) -> Result<()> {
         let blob = keystore::encrypt(&self.secrets, password)?;
-        std::fs::write(path, blob)?;
+        atomic_write(path, &blob)?;
         Ok(())
     }
 
@@ -336,6 +338,16 @@ impl Wallet {
 
     // ---------- tokens ----------
 
+    /// Frontend-owned per-wallet metadata JSON (labels/contacts/notes/funded), encrypted at rest.
+    pub fn metadata(&self) -> &str {
+        &self.secrets.metadata
+    }
+
+    /// Replace the per-wallet metadata blob. Persisted (encrypted) on the next `save`.
+    pub fn set_metadata(&mut self, json: &str) {
+        self.secrets.metadata = json.to_string();
+    }
+
     pub fn tokens(&self) -> &[TokenRef] {
         &self.secrets.tokens
     }
@@ -424,6 +436,96 @@ impl Wallet {
             .await?;
         let symbol = erc20::decode_string(&hex_bytes(&sym_ret)?).unwrap_or_else(|| "TOKEN".into());
         Ok((symbol, decimals))
+    }
+
+    /// Fetch native + tracked-token balances for accounts `0..num_accounts` in ONE batched
+    /// JSON-RPC request (chunked to stay under public-RPC batch caps). This replaces the old
+    /// per-account × per-token fan-out (which opened dozens of independent Tor circuits and made
+    /// balances trickle in), so everything lands together in a couple of round-trips.
+    ///
+    /// Returns `{ "native_symbol": "...", "accounts": [ { index, native_raw, native_formatted,
+    /// native_symbol, tokens: [ { address, symbol, decimals, raw, formatted } ] } ] }`.
+    pub async fn all_balances(&self, num_accounts: u32) -> Result<serde_json::Value> {
+        let provider = self.provider()?;
+        let native_symbol = chain_info(provider.chain_id()).native_symbol.to_string();
+        let n = num_accounts.max(1);
+
+        // Resolve every account address once (works for both software and hardware — the latter
+        // reads its cached device addresses, no device round-trip here).
+        let mut addrs: Vec<(u32, Address)> = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            if let Ok(a) = parse_address(&self.address(i)?) {
+                addrs.push((i, a));
+            }
+        }
+
+        // Tracked tokens with a valid address, keeping their cached symbol/decimals so we don't
+        // spend extra calls resolving metadata.
+        let tokens: Vec<(&TokenRef, Address)> = self
+            .secrets
+            .tokens
+            .iter()
+            .filter_map(|t| parse_address(&t.address).ok().map(|a| (t, a)))
+            .collect();
+        let per_addr = 1 + tokens.len();
+
+        // Chunk accounts so each batch stays comfortably under public-RPC limits (~40 calls).
+        let per_chunk = (40usize / per_addr).max(1);
+        let mut accounts_json: Vec<serde_json::Value> = Vec::with_capacity(addrs.len());
+
+        for group in addrs.chunks(per_chunk) {
+            let mut calls: Vec<(String, serde_json::Value)> =
+                Vec::with_capacity(group.len() * per_addr);
+            for (_, a) in group {
+                calls.push((
+                    "eth_getBalance".to_string(),
+                    serde_json::json!([a.to_string(), "latest"]),
+                ));
+                for (_, taddr) in &tokens {
+                    let data = format!("0x{}", hex::encode(erc20::encode_balance_of(*a)));
+                    calls.push((
+                        "eth_call".to_string(),
+                        serde_json::json!([{ "to": taddr.to_string(), "data": data }, "latest"]),
+                    ));
+                }
+            }
+            let results = provider.call_batch(&calls).await?;
+
+            for (p, (idx, _)) in group.iter().enumerate() {
+                let base = p * per_addr;
+                let wei = results
+                    .get(base)
+                    .and_then(|v| parse_hex_u256(v).ok())
+                    .unwrap_or(U256::ZERO);
+                let mut toks_json: Vec<serde_json::Value> = Vec::with_capacity(tokens.len());
+                for (j, (tref, _)) in tokens.iter().enumerate() {
+                    let bal = results
+                        .get(base + 1 + j)
+                        .and_then(|v| hex_bytes(v).ok())
+                        .and_then(|b| erc20::decode_u256(&b))
+                        .unwrap_or(U256::ZERO);
+                    toks_json.push(serde_json::json!({
+                        "address": tref.address,
+                        "symbol": tref.symbol,
+                        "decimals": tref.decimals,
+                        "raw": bal.to_string(),
+                        "formatted": format_units(bal, tref.decimals),
+                    }));
+                }
+                accounts_json.push(serde_json::json!({
+                    "index": idx,
+                    "native_raw": wei.to_string(),
+                    "native_formatted": format_units(wei, 18),
+                    "native_symbol": native_symbol,
+                    "tokens": toks_json,
+                }));
+            }
+        }
+
+        Ok(serde_json::json!({
+            "native_symbol": native_symbol,
+            "accounts": accounts_json,
+        }))
     }
 
     /// Scan HD-derived addresses (`m/44'/60'/0'/0/x`) and return the indices that hold a balance
@@ -1185,6 +1287,40 @@ impl Wallet {
 }
 
 // ---------- helpers ----------
+
+/// Write `bytes` to `path` durably and without ever leaving a truncated/half-written wallet: write
+/// to a sibling temp file, fsync it, then atomically rename over the target. On Unix the file is
+/// created with owner-only (0600) permissions so the encrypted wallet isn't world-readable.
+fn atomic_write(path: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let target = std::path::Path::new(path);
+    let dir = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    if !dir.as_os_str().is_empty() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = target.with_extension("tmp");
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        f.sync_all()?; // durability: ensure bytes hit disk before the rename
+    }
+    // Atomic replace. On Windows, rename fails if the destination exists, so remove it first.
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(target);
+    }
+    std::fs::rename(&tmp, target)?;
+    Ok(())
+}
 
 /// Ensure `secrets.account_order` is populated. Older wallet files (and freshly-built secrets) have
 /// no order; reconstruct the historical layout — HD accounts `0..account_count` followed by the

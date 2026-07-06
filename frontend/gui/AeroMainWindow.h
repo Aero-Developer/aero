@@ -8,6 +8,7 @@
 #include <QLabel>
 #include <QPixmap>
 #include <QHash>
+#include <QJsonObject>
 #include <QSet>
 #include <QList>
 
@@ -96,6 +97,10 @@ private:
     void notify(const QString &title, const QString &body);
     void updateUsed(quint32 index);   // mark an address red if it holds funds / has transacted
     void loadLabels();                // restore persisted address labels for the open wallet
+    // Per-wallet metadata (labels/contacts/notes/funded) lives encrypted inside the wallet file.
+    void loadMetadata();              // parse m_wallet->metadata() (+ migrate legacy) and apply to UI
+    void saveMetadata();              // serialize m_meta into the wallet and persist (encrypted)
+    void migrateLegacyMetadata();     // one-time import from the old plaintext QSettings
     void showCachedBalance(quint32 index); // instant status-bar balance from cache
     void showTransactionDialog(const HistoryItem &tx); // Feather-style tx details (txid + copy)
     void refreshHistoryView();             // fetch history per the History filter (All / account)
@@ -104,6 +109,9 @@ private:
     QString fiatStr(double usd) const;     // format a USD value in the user's chosen fiat
     QString explorerTxUrl(const QString &hash) const;   // preferred explorer tx link
     void lockWallet();                     // auto-lock: require the password to regain access
+    // Copy a secret (seed / private key) to the clipboard and auto-clear it after the configured
+    // timeout, so it doesn't linger in the OS clipboard (Feather-style).
+    void copySensitive(const QString &text);
     QSet<QString> verifiedTokenAddresses() const; // trusted-token allow-list (lower-case) for spam
     void applyVerifiedTokens();            // push the allow-list into the History model
     void checkUntrackedTokenLiquidity();   // query DexScreener for unknown tokens seen in history
@@ -144,6 +152,13 @@ private:
     quint32 m_account = 0;
 
     void setConnectionState(int mode, const QString &tip); // 2=Tor, 1=Direct, 0=Offline
+
+    // Custom-node support: return the RPC endpoints / SOCKS proxy to use for `chainId`. If the user
+    // saved a custom node for that chain (Settings -> Node) it wins; otherwise the bundled defaults
+    // (registry RPCs over the running Tor proxy) are used. socksFor("") == direct/own-node.
+    QStringList endpointsFor(quint64 chainId) const;
+    QString socksFor(quint64 chainId) const;
+    void connectCurrentChain(); // (re)connect the active chain using the resolved node settings
 
     QLabel *m_balanceLabel = nullptr;
     QLabel *m_availLabel = nullptr;    // Send: "Available: X SYM" for the selected From + currency
@@ -208,6 +223,8 @@ private:
     QWidget *m_nftTab = nullptr;               // NFTs tab
     QListWidget *m_nftList = nullptr;          // NFT collection grid
     QTableWidget *m_contactsTable = nullptr;   // Contacts address book
+    QJsonObject m_meta;                        // in-memory per-wallet metadata mirror (persisted encrypted)
+    bool m_metaLoading = false;                // guard so applying metadata to the UI doesn't re-persist
     QLabel *m_nftStatus = nullptr;             // NFT tab status line
     bool m_nftShowSpam = false;                // include reputation!=ok collections
     bool m_nftEnabled = false;                 // whether the NFTs tab is shown (Settings toggle)
