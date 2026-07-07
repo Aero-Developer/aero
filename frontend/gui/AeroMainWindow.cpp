@@ -459,6 +459,17 @@ void AeroMainWindow::setupTabs() {
                     onAccountChanged(static_cast<int>(m_addressModel->accountAt(current.row())));
             });
 
+    // Double-click an address row -> jump to Send with that account selected as "From". Double-
+    // clicking the Label column still edits the label (it's the editable one).
+    connect(recvUi.addresses, &QTreeView::doubleClicked, this, [this](const QModelIndex &idx) {
+        if (!idx.isValid() || idx.column() == AddressModel::Column_Label)
+            return;
+        const quint32 acct = m_addressModel->accountAt(idx.row());
+        if (m_fromCombo && static_cast<int>(acct) < m_fromCombo->count())
+            m_fromCombo->setCurrentIndex(static_cast<int>(acct)); // sets From + refreshes available
+        ui.tabWidget->setCurrentWidget(ui.tabSend);
+    });
+
     // Right-click an address for copy / export private key.
     recvUi.addresses->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(recvUi.addresses, &QWidget::customContextMenuRequested, this,
@@ -2062,11 +2073,16 @@ void AeroMainWindow::updateReceive() {
     };
     QString html = QStringLiteral("<div align='center'>%1<br><br><table align='center' cellspacing='2'>")
                        .arg(addr.toHtmlEscaped());
+    // Always show the native coin; only show a token if this address actually holds some of it, so
+    // the breakdown stays clean (ETH by default, other assets appear as they arrive).
     html += row(chainDefFor(m_chainId).icon, m_nativeSymbol,
                 m_ethRawByAccount.value(m_account, 0.0));
-    for (const TokenInfo &t : m_wallet->tokens())
-        html += row(QStringLiteral(":/assets/images/tokens/%1.png").arg(t.symbol), t.symbol,
-                    m_tokenRawByKey.value(QStringLiteral("%1|%2").arg(m_account).arg(t.address), 0.0));
+    for (const TokenInfo &t : m_wallet->tokens()) {
+        const double bal =
+            m_tokenRawByKey.value(QStringLiteral("%1|%2").arg(m_account).arg(t.address), 0.0);
+        if (bal > 0.0)
+            html += row(QStringLiteral(":/assets/images/tokens/%1.png").arg(t.symbol), t.symbol, bal);
+    }
     html += QStringLiteral("</table></div>");
 
     m_recvBalanceLabel->setTextFormat(Qt::RichText);
