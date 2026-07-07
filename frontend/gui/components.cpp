@@ -11,13 +11,22 @@
 #include <QStandardPaths>
 
 bool aeroIsPortable() {
-    // Computed once: launched with --portable, or a marker file sits next to the executable.
+    // Computed once. Portable when:
+    //   * launched with --portable (and never with --no-portable), or
+    //   * a `portable`/`portable.dat` marker file sits next to the executable, or
+    //   * a `wallets` or `config` folder already lives next to the executable (i.e. we've been
+    //     running portably from here before — keeps it sticky even if a marker gets deleted).
     static const bool portable = []() {
-        if (QCoreApplication::arguments().contains(QStringLiteral("--portable")))
+        const QStringList args = QCoreApplication::arguments();
+        if (args.contains(QStringLiteral("--no-portable")))
+            return false;
+        if (args.contains(QStringLiteral("--portable")))
             return true;
         const QDir dir(QCoreApplication::applicationDirPath());
         return QFileInfo::exists(dir.filePath(QStringLiteral("portable")))
-            || QFileInfo::exists(dir.filePath(QStringLiteral("portable.dat")));
+            || QFileInfo::exists(dir.filePath(QStringLiteral("portable.dat")))
+            || QFileInfo(dir.filePath(QStringLiteral("wallets"))).isDir()
+            || QFileInfo(dir.filePath(QStringLiteral("config"))).isDir();
     }();
     return portable;
 }

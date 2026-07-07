@@ -184,9 +184,12 @@ FilePage::FilePage(WalletWizard *w) : m_w(w), ui(new Ui::PageWalletFile) {
     setTitle(tr("Wallet name and location"));
 
     ui->frame_wallet->setInfo(QIcon(kInfoIcon),
-                              tr("Your wallet is stored in its own folder as an encrypted "
-                                 ".keys file (Documents/Aero/wallets/<name>/<name>.keys). "
-                                 "Choose a name and where to keep it."));
+                              aeroIsPortable()
+                                  ? tr("Portable mode: your wallet is stored next to the app as an "
+                                       "encrypted .keys file in the folder shown below. "
+                                       "Choose a name and where to keep it.")
+                                  : tr("Your wallet is stored in its own folder as an encrypted "
+                                       ".keys file. Choose a name and where to keep it."));
     ui->line_walletName->setText(m_w->walletName);
     ui->line_walletDir->setText(m_w->walletDir);
     ui->check_defaultWalletDirectory->setVisible(false);
@@ -683,7 +686,8 @@ void OpenPage::initializePage() {
 void OpenPage::refreshList() {
     m_model->removeRows(0, m_model->rowCount());
     QFileInfoList files;
-    // New layout: <Documents>/Aero/wallets/<name>/<name>.keys (each wallet in its own subfolder).
+    // Layout: <walletsRoot>/<name>/<name>.keys (each wallet in its own subfolder). walletsRoot() is
+    // next to the executable in portable mode, else <Documents>/Aero/wallets.
     const QString root = walletsRoot();
     for (const QFileInfo &sub : QDir(root).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Time)) {
         files += QDir(sub.absoluteFilePath())
