@@ -182,5 +182,4 @@ Feather's open-source (BSD-3-Clause) UI layouts and stylesheet under that licens
   (BSD-3-Clause), itself derived from the **Monero Project** (BSD-3-Clause).
 - Ethereum primitives, signing and hardware signers via **[alloy](https://github.com/alloy-rs)**.
 
-Licensed under **BSD-3-Clause**. See attribution notes in
-[`frontend/INTEGRATION.md`](frontend/INTEGRATION.md).
+Licensed under **BSD-3-Clause**. See [`LICENSE`](LICENSE) for the full text and attribution.

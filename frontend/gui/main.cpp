@@ -57,16 +57,12 @@ int main(int argc, char *argv[]) {
 
     applyTheme(app);
 
-    Wallet *wallet = nullptr;
-    // Demo shortcut: skip the setup wizard and show the main window with a throwaway wallet.
-    if (!qEnvironmentVariableIsEmpty("AERO_DEMO")) {
-        wallet = WalletManager::instance()->createWallet(12);
-    } else {
-        WalletWizard wizard;
-        if (wizard.exec() != QDialog::Accepted) return 0;
-        wallet = wizard.takeWallet();
-    }
-    if (!wallet) return 0;
+    WalletWizard wizard;
+    if (wizard.exec() != QDialog::Accepted)
+        return 0;
+    Wallet *wallet = wizard.takeWallet();
+    if (!wallet)
+        return 0;
 
     AeroMainWindow window;
     window.setWallet(wallet);

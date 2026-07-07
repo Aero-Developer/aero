@@ -269,11 +269,6 @@ AeroMainWindow::AeroMainWindow(QWidget *parent) : QMainWindow(parent) {
     // Settings menu -> RPC/Tor editor (no Connect/Refresh toolbar anymore).
     connect(ui.actionSettings, &QAction::triggered, this, &AeroMainWindow::onSettings);
 
-    // Dev hook: open a specific tab on startup (0=History,1=Send,2=Receive,...).
-    const QByteArray tabEnv = qgetenv("AERO_TAB");
-    if (!tabEnv.isEmpty())
-        ui.tabWidget->setCurrentIndex(tabEnv.toInt());
-
     setWindowTitle(QStringLiteral("Aero"));
 }
 
@@ -1445,118 +1440,10 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     loadLiquidityCache();   // restore auto-trust (DEX liquidity) decisions
     applyVerifiedTokens();  // seed the History spam allow-list (curated top tokens + tracked)
 
-    // Dev hook: mark rows used (red) for screenshots, e.g. AERO_USED=0,2
-    if (!qEnvironmentVariableIsEmpty("AERO_USED"))
-        for (const QString &s : qEnvironmentVariable("AERO_USED").split(QLatin1Char(',')))
-            m_addressModel->setUsed(s.toUInt(), true);
-
     rebuildAccountCombos();
     populateSendCurrencies();
     selectAddressRow(0);
     updateReceive();
-
-    // Dev hook: preselect a send asset (e.g. AERO_SENDCUR=USDT) for screenshots/testing.
-    if (!qEnvironmentVariableIsEmpty("AERO_SENDCUR")) {
-        const QString want = qEnvironmentVariable("AERO_SENDCUR");
-        for (const TokenInfo &t : m_wallet->tokens())
-            if (t.symbol.compare(want, Qt::CaseInsensitive) == 0)
-                setSendAsset(t.symbol, t.address, t.decimals);
-    }
-    // Dev hooks for testing the Receive tab without pixel-clicking:
-    //   AERO_RECV_CREATE=N  -> click "Create new address" N times
-    //   AERO_RECV_ROW=k     -> select address row k
-    for (int i = 0, n = qEnvironmentVariable("AERO_RECV_CREATE").toInt(); i < n; ++i)
-        onCreateAddress();
-    if (!qEnvironmentVariableIsEmpty("AERO_RECV_ROW"))
-        selectAddressRow(qEnvironmentVariable("AERO_RECV_ROW").toUInt());
-    if (!qEnvironmentVariableIsEmpty("AERO_SENDAMT"))
-        sendUi.lineAmount->setText(qEnvironmentVariable("AERO_SENDAMT"));
-    if (!qEnvironmentVariableIsEmpty("AERO_FEEMODE")) {
-        const int i = sendUi.combo_feePriority->findText(qEnvironmentVariable("AERO_FEEMODE"));
-        if (i >= 0) sendUi.combo_feePriority->setCurrentIndex(i);
-    }
-    // Dev hook: show the confirm-transaction dialog with a sample tx for testing.
-    if (!qEnvironmentVariableIsEmpty("AERO_TEST_CONFIRM")) {
-        QTimer::singleShot(1200, this, [this] {
-            m_nativeUsd = 1800.0;
-            PendingEthTx t;
-            t.fromIndex = 0;
-            t.to = QStringLiteral("0x742d35Cc6634C0532925a3b844Bc454e4438f44e");
-            t.amountWei = QStringLiteral("250000000000000000"); // 0.25 ETH
-            t.fee.maxFee = QStringLiteral("150000000");         // 0.15 gwei
-            onTransactionCreated(t);
-        });
-    }
-    // Dev hook: inject sample history (incl. a poisoning + failed tx) for testing the History tab.
-    if (!qEnvironmentVariableIsEmpty("AERO_TEST_HISTORY")) {
-        m_nativeUsd = 1800.0;
-        QTimer::singleShot(2000, this, [this] {
-            m_nativeUsd = 1800.0; // demo has no provider; keep a price so the dust filter can value ETH
-            const quint64 now = static_cast<quint64>(QDateTime::currentSecsSinceEpoch());
-            auto mk = [](const QString &dir, const QString &cp, const QString &amt, const QString &sym,
-                         const QString &token, const QString &hash, quint64 block, quint64 ts,
-                         const QString &fee, bool failed) {
-                HistoryItem h;
-                h.direction = dir; h.counterparty = cp; h.formatted = amt;
-                h.amount = amt == QLatin1String("0") ? QStringLiteral("0") : QStringLiteral("1");
-                h.symbol = sym; h.token = token; h.txHash = hash; h.block = block; h.timestamp = ts;
-                h.fee = fee; h.failed = failed;
-                return h;
-            };
-            const QString USDT = QStringLiteral("0xdAC17F958D2ee523a2206206994597C13D831ec7");
-            QVector<HistoryItem> items;
-            items << mk("in", "0x742d35Cc6634C0532925a3b844Bc454e4438f44e", "1.5", "ETH", QString(),
-                        "0xaaa1111111111111111111111111111111111111111111111111111111111111", 25000000, now - 3600, "", false);
-            items << mk("out", "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "0.25", "ETH", QString(),
-                        "0xbbb2222222222222222222222222222222222222222222222222222222222222", 24999000, now - 7200, "315000000000000", false);
-            items << mk("in", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "100", "USDT", USDT,
-                        "0xccc3333333333333333333333333333333333333333333333333333333333333", 24990000, now - 86400, "", false);
-            // A top ERC-20 (MANA) — auto-trusted and should show its logo in History.
-            items << mk("in", "0x1111111111111111111111111111111111111111", "1500", "MANA",
-                        QStringLiteral("0x0F5D2fB29fb7d3CFeE444a200298f468908cC942"),
-                        "0x1112223334445556667778889990001112223334445556667778889990001112", 24985000, now - 90000, "", false);
-            // Scam ERC-20 impersonating native ETH: must show NO logo and be greyed out.
-            items << mk("in", "0x742d35Cc6634C0532925a3b844Bc454e0000f44e", "0.01", "ETH",
-                        "0x00000000000000000000000000000000deadbeef",
-                        "0xddd4444444444444444444444444444444444444444444444444444444444444", 24980000, now - 90000, "", false);
-            items << mk("out", "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", "0", "ETH", QString(),
-                        "0xeee5555555555555555555555555555555555555555555555555555555555555", 24970000, now - 100000, "120000000000000", true);
-            // Sub-threshold dust: 0.000002 ETH ~= $0.0036 (< $0.005 default) -> hidden by dust filter.
-            items << mk("in", "0x742d35Cc6634C0532925a3b844Bc454e4438f44e", "0.000002", "ETH", QString(),
-                        "0xfff6666666666666666666666666666666666666666666666666666666666666", 24960000, now - 110000, "", false);
-            // Address-poisoning spoof: a fake *outgoing* ERC-20 Transfer with a Cyrillic "ЕТН" symbol
-            // (homoglyph) from an untracked contract — the user never signed it. Must be hidden.
-            const QString cyrillicEth = QString(QChar(0x0415)) + QChar(0x0422) + QChar(0x041D); // ЕТН
-            items << mk("out", "0x742d35Cc6634C0532925a3b844Bc454e4438f44e", "2.5", cyrillicEth,
-                        "0x000000000000000000000000000000000000dEaD",
-                        "0x9999999999999999999999999999999999999999999999999999999999999999", 25000001, now - 1800, "", false);
-            applyVerifiedTokens(); // real allow-list (curated top tokens + tracked) incl. MANA
-            updateHistoryPricing(); // push ETH=$1800 so the dust filter can value the tiny receive
-            m_historyModel->onHistoryRefreshed(items);
-        });
-    }
-    // Dev hook: exercise the real received/sent notification code paths for testing.
-    if (!qEnvironmentVariableIsEmpty("AERO_TEST_NOTIFY")) {
-        qDebug() << "NOTIFYTEST trayAvailable=" << QSystemTrayIcon::isSystemTrayAvailable()
-                 << "supportsMessages=" << QSystemTrayIcon::supportsMessages();
-        const QString usdt = QStringLiteral("0xdAC17F958D2ee523a2206206994597C13D831ec7");
-        QTimer::singleShot(2000, this, [this] { m_ethRawByAccount.insert(0, 0.0); });
-        QTimer::singleShot(3000, this, [this] {
-            qDebug() << "NOTIFYTEST native-eth-received";
-            onAccountBalance(0, QStringLiteral("0.5"), QStringLiteral("ETH")); // simulated +0.5 ETH
-        });
-        QTimer::singleShot(5000, this, [this, usdt] {
-            m_tokenRawByKey.insert(QStringLiteral("0|%1").arg(usdt), 0.0);
-        });
-        QTimer::singleShot(6000, this, [this, usdt] {
-            qDebug() << "NOTIFYTEST erc20-received";
-            onAvailableBalance(0, usdt, QStringLiteral("100"), QStringLiteral("USDT")); // simulated +100 USDT
-        });
-        QTimer::singleShot(9000, this, [this] {
-            qDebug() << "NOTIFYTEST sent-confirmation";
-            notify(tr("Payment sent"), tr("0.25 ETH to 0x1234…abcd")); // simulated send confirmation
-        });
-    }
 
     autoConnect();
 

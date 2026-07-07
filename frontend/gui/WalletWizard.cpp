@@ -92,9 +92,6 @@ WalletWizard::WalletWizard(QWidget *parent) : QWizard(parent) {
     setPage(Page_Hardware, new HardwarePage(this));
     setPage(Page_Watch, new WatchPage(this));
     setStartId(Page_Menu);
-    if (!qEnvironmentVariableIsEmpty("AERO_OPEN")) setStartId(Page_Open); // dev hook
-    if (!qEnvironmentVariableIsEmpty("AERO_RESTORE")) setStartId(Page_RestoreSeed); // dev hook
-    if (!qEnvironmentVariableIsEmpty("AERO_FILE")) setStartId(Page_File); // dev hook
 
     // Mirror Feather's WalletWizard setup 1:1: ModernStyle with the banner as the full-height
     // left watermark (native, no scaling), and the Help / Settings button bar.
