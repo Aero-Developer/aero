@@ -859,6 +859,27 @@ pub extern "C" fn aero_wallet_send_erc20(
     })
 }
 
+/// "Pay to many": send to several recipients (one tx each, sequential nonces). `recipients_json` is
+/// a JSON array of `["0xto","amountBaseUnits"]` pairs; `token` empty = native, else ERC-20 address.
+/// Returns a JSON array of `{to, tx_hash}` / `{to, error}`. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_send_many(
+    w: *mut Wallet,
+    from_index: u32,
+    recipients_json: *const c_char,
+    token: *const c_char,
+    max_fee_wei: *const c_char,
+    max_priority_wei: *const c_char,
+) -> *mut c_char {
+    let (Some(rj), Some(token)) = (from_cstr(recipients_json), from_cstr(token)) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    let recipients: Vec<(String, String)> = serde_json::from_str(&rj).unwrap_or_default();
+    let fee = parse_fee_override(max_fee_wei, max_priority_wei);
+    block_json(w, |w| RUNTIME.block_on(w.send_many(from_index, &recipients, &token, fee)))
+}
+
 /// Broadcast an already-signed raw transaction (0x RLP hex) over the wallet's RPC/Tor. Returns JSON
 /// `SendResult`. Works for watch-only wallets too (no keys needed). Caller frees the string.
 #[no_mangle]

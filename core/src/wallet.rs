@@ -1073,6 +1073,40 @@ impl Wallet {
             .await
     }
 
+    /// "Pay to many": send to several recipients from one account. Ethereum is account-based, so
+    /// this broadcasts one transaction per recipient with sequential nonces (no batching contract
+    /// needed). `recipients` is (to, amount) where amount is base units (wei for native, token
+    /// units for ERC-20). Stops at the first failure (a nonce gap would strand later txs) and
+    /// returns a JSON array of `{to, tx_hash}` / `{to, error}` describing what happened.
+    pub async fn send_many(
+        &self,
+        from_index: u32,
+        recipients: &[(String, String)],
+        token: &str,
+        fee: Option<(u128, u128)>,
+    ) -> Result<serde_json::Value> {
+        let provider = self.provider()?;
+        let from = parse_address(&self.address(from_index)?)?;
+        let start = parse_hex_u64(&provider.get_transaction_count(&from.to_string()).await?)?;
+        let mut out: Vec<serde_json::Value> = Vec::with_capacity(recipients.len());
+        for (i, (to, amount)) in recipients.iter().enumerate() {
+            let nonce = start + i as u64;
+            let r = if token.is_empty() {
+                self.send_eth(from_index, to, amount, fee, Some(nonce)).await
+            } else {
+                self.send_erc20(from_index, token, to, amount, fee, Some(nonce)).await
+            };
+            match r {
+                Ok(res) => out.push(serde_json::json!({ "to": to, "tx_hash": res.tx_hash })),
+                Err(e) => {
+                    out.push(serde_json::json!({ "to": to, "error": e.to_string() }));
+                    break; // don't create a nonce gap that strands the remaining sends
+                }
+            }
+        }
+        Ok(serde_json::json!(out))
+    }
+
     /// Broadcast an already-signed raw transaction (0x-prefixed RLP). Works for any wallet type
     /// (no keys needed) — this is the "transaction pusher" used to relay an offline-signed tx over
     /// Tor. Returns the resulting tx hash.

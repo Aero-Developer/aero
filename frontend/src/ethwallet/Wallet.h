@@ -221,6 +221,13 @@ public:
     // Broadcast an already-signed raw tx (0x RLP hex) over Tor; emits transactionCommitted().
     void broadcastRaw(const QString &rawHex);
 
+    // "Pay to many": one tx per recipient (sequential nonces). `recipients` is (to, humanAmount);
+    // amounts are converted to base units with `decimals` (18 for native, token decimals for ERC-20).
+    // `token` empty = native. Emits manySent(resultJson).
+    void sendMany(quint32 fromIndex, const QVector<QPair<QString, QString>> &recipients,
+                  const QString &token, quint8 decimals, const QString &maxFeeWei,
+                  const QString &maxPriorityWei);
+
     // Air-gapped signing. buildUnsigned resolves nonce/gas/fees over the network and emits
     // unsignedTxReady(json). signUnsigned signs that JSON locally (offline) and returns 0x raw hex.
     void buildUnsigned(const PendingEthTx &tx);
@@ -243,6 +250,8 @@ signals:
     void transactionSent(const PendingEthTx &tx, const QString &txHash);
     // Emitted when buildUnsigned() finishes: `json` is the unsigned tx (empty on error).
     void unsignedTxReady(const QString &json, const QString &error);
+    // Emitted when sendMany() finishes: `resultJson` is an array of {to, tx_hash|error}.
+    void manySent(const QString &resultJson, const QString &error);
     void historyRefreshed(const QVector<HistoryItem> &items);
     void fundedScanned(const QList<quint32> &indices);
     void tokenLiquidity(const QString &tokenAddress, double usd);

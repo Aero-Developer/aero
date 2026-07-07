@@ -1162,6 +1162,8 @@ void AeroMainWindow::setupMenu() {
             &AeroMainWindow::onBroadcastRaw);
     connect(ui.menuTools->addAction(tr("Sign Unsigned Transaction…")), &QAction::triggered, this,
             &AeroMainWindow::onSignUnsigned);
+    connect(ui.menuTools->addAction(tr("Send to Many…")), &QAction::triggered, this,
+            &AeroMainWindow::onSendMany);
     ui.menuTools->addSeparator();
     m_speedUpAction = ui.menuTools->addAction(tr("Speed Up Last Transaction"));
     m_cancelTxAction = ui.menuTools->addAction(tr("Cancel Last Transaction"));
@@ -1411,6 +1413,7 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
         }
     }
     connect(m_wallet, &Wallet::unsignedTxReady, this, &AeroMainWindow::onUnsignedTxReady);
+    connect(m_wallet, &Wallet::manySent, this, &AeroMainWindow::onManySent);
     // Event-driven history: after a batched balance refresh, only re-pull the (heavy) history if a
     // balance actually changed. This keeps steady-state bandwidth to the cheap balance batch.
     connect(m_wallet, &Wallet::allBalancesRefreshed, this, [this]() {
@@ -2810,6 +2813,113 @@ void AeroMainWindow::onSignUnsigned() {
     });
     connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
     dlg.exec();
+}
+
+void AeroMainWindow::onSendMany() {
+    if (!m_wallet) return;
+    if (m_wallet->isWatchOnly()) {
+        QMessageBox::information(this, tr("Watch-only wallet"),
+                                 tr("This is a watch-only wallet — it can't send."));
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Send to Many"));
+    dlg.setMinimumWidth(560);
+    auto *v = new QVBoxLayout(&dlg);
+
+    auto *form = new QFormLayout();
+    auto *fromCombo = new QComboBox(&dlg);
+    const quint32 n = m_wallet->numAccounts();
+    for (quint32 i = 0; i < n; ++i)
+        fromCombo->addItem(accountLabel(i));
+    if (m_fromCombo && m_fromCombo->currentIndex() >= 0)
+        fromCombo->setCurrentIndex(m_fromCombo->currentIndex());
+    form->addRow(tr("From"), fromCombo);
+
+    auto *assetCombo = new QComboBox(&dlg);
+    assetCombo->addItem(m_nativeSymbol, QString()); // native: empty address
+    assetCombo->setItemData(0, 18, Qt::UserRole + 1);
+    for (const TokenInfo &t : m_wallet->tokens()) {
+        assetCombo->addItem(t.symbol, t.address);
+        assetCombo->setItemData(assetCombo->count() - 1, t.decimals, Qt::UserRole + 1);
+    }
+    form->addRow(tr("Asset"), assetCombo);
+    v->addLayout(form);
+
+    v->addWidget(new QLabel(tr("One recipient per line, as  address, amount"), &dlg));
+    auto *edit = new QPlainTextEdit(&dlg);
+    edit->setPlaceholderText(QStringLiteral("0xabc…, 0.1\n0xdef…, 0.25"));
+    edit->setMinimumHeight(140);
+    v->addWidget(edit);
+
+    auto *box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    box->button(QDialogButtonBox::Ok)->setText(tr("Send all"));
+    v->addWidget(box);
+    connect(box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    QVector<QPair<QString, QString>> recipients;
+    for (const QString &raw : edit->toPlainText().split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+        const QString line = raw.trimmed();
+        if (line.isEmpty()) continue;
+        const int comma = line.lastIndexOf(QLatin1Char(','));
+        if (comma < 0) {
+            QMessageBox::warning(this, tr("Send to Many"),
+                                 tr("Each line must be:  address, amount\n\nOffending line:\n%1").arg(line));
+            return;
+        }
+        const QString addr = line.left(comma).trimmed();
+        const QString amt = line.mid(comma + 1).trimmed();
+        bool ok = false;
+        if (!(addr.startsWith(QLatin1String("0x")) && addr.size() == 42) || amt.toDouble(&ok) <= 0 || !ok) {
+            QMessageBox::warning(this, tr("Send to Many"),
+                                 tr("Invalid address or amount:\n%1").arg(line));
+            return;
+        }
+        recipients.append({addr, amt});
+    }
+    if (recipients.isEmpty())
+        return;
+
+    const QString sym = assetCombo->currentText();
+    if (QMessageBox::question(
+            this, tr("Send to Many"),
+            tr("Send %1 separate %2 transactions (one per recipient)? This broadcasts %1 txs at "
+               "sequential nonces.").arg(recipients.size()).arg(sym),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+        return;
+
+    const QString tokenAddr = assetCombo->currentData().toString();
+    const quint8 dec = static_cast<quint8>(assetCombo->currentData(Qt::UserRole + 1).toUInt());
+    const QPair<QString, QString> fee = chosenFeeWei();
+    m_wallet->sendMany(static_cast<quint32>(qMax(0, fromCombo->currentIndex())), recipients,
+                       tokenAddr, dec, fee.first, fee.second);
+}
+
+void AeroMainWindow::onManySent(const QString &resultJson, const QString &error) {
+    if (!error.isEmpty()) {
+        QMessageBox::warning(this, tr("Send to Many"), error);
+        return;
+    }
+    const QJsonArray arr = QJsonDocument::fromJson(resultJson.toUtf8()).array();
+    int sent = 0;
+    QString detail, failed;
+    for (const QJsonValue &v : arr) {
+        const QJsonObject o = v.toObject();
+        const QString to = o.value(QStringLiteral("to")).toString();
+        if (o.contains(QStringLiteral("tx_hash"))) {
+            ++sent;
+            detail += tr("%1 → %2\n").arg(o.value(QStringLiteral("tx_hash")).toString().left(14), to);
+        } else {
+            failed = tr("\nStopped at %1: %2").arg(to, o.value(QStringLiteral("error")).toString());
+        }
+    }
+    QMessageBox::information(this, tr("Send to Many"),
+                             tr("Broadcast %1 transaction(s).\n\n%2%3").arg(sent).arg(detail, failed));
+    refreshAllBalances();
+    refreshHistoryView();
 }
 
 void AeroMainWindow::onTransactionSent(const PendingEthTx &tx, const QString &txHash) {

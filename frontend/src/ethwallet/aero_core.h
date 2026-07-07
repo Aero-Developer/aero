@@ -316,6 +316,18 @@ char *aero_wallet_send_erc20(AeroWallet *w,
                              uint64_t nonce);
 
 /**
+ * "Pay to many": send to several recipients (one tx each, sequential nonces). `recipients_json` is
+ * a JSON array of `["0xto","amountBaseUnits"]` pairs; `token` empty = native, else ERC-20 address.
+ * Returns a JSON array of `{to, tx_hash}` / `{to, error}`. Caller frees the string.
+ */
+char *aero_wallet_send_many(AeroWallet *w,
+                            uint32_t from_index,
+                            const char *recipients_json,
+                            const char *token,
+                            const char *max_fee_wei,
+                            const char *max_priority_wei);
+
+/**
  * Broadcast an already-signed raw transaction (0x RLP hex) over the wallet's RPC/Tor. Returns JSON
  * `SendResult`. Works for watch-only wallets too (no keys needed). Caller frees the string.
  */

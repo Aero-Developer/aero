@@ -59,6 +59,8 @@ private slots:
     void onSignVerifyMessage(); // Tools -> Sign / Verify Message (EIP-191 personal_sign)
     void onBroadcastRaw();      // Tools -> Broadcast Raw Transaction (push a signed raw tx)
     void onSignUnsigned();      // Tools -> Sign Unsigned Transaction (offline signing)
+    void onSendMany();          // Tools -> Send to Many (one tx per recipient)
+    void onManySent(const QString &resultJson, const QString &error); // pay-to-many summary
     void onUnsignedTxReady(const QString &json, const QString &error); // export-unsigned result
     void onTransactionSent(const PendingEthTx &tx, const QString &txHash); // remember for speed/cancel
     void onSpeedUpLast(); // rebroadcast the last tx at the same nonce with a higher fee

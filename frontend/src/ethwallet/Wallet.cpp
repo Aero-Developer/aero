@@ -709,6 +709,34 @@ void Wallet::broadcastRaw(const QString &rawHex) {
     });
 }
 
+void Wallet::sendMany(quint32 fromIndex, const QVector<QPair<QString, QString>> &recipients,
+                      const QString &token, quint8 decimals, const QString &maxFeeWei,
+                      const QString &maxPriorityWei) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, recipients, token, decimals, maxFeeWei,
+                                   maxPriorityWei]() {
+        QJsonArray arr;
+        for (const QPair<QString, QString> &r : recipients) {
+            QJsonArray pair;
+            pair.append(r.first);
+            pair.append(parseUnits(r.second, decimals)); // human -> base units
+            arr.append(pair);
+        }
+        const QByteArray rj = QJsonDocument(arr).toJson(QJsonDocument::Compact);
+        QReadLocker lock(&m_coreLock);
+        const QByteArray mf = maxFeeWei.toUtf8();
+        const QByteArray mp = maxPriorityWei.toUtf8();
+        char *res = aero_wallet_send_many(m_core, fromIndex, rj.constData(),
+                                          token.toUtf8().constData(), mf.constData(), mp.constData());
+        QString json, err;
+        if (res)
+            json = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, json, err]() { emit manySent(json, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
 void Wallet::buildUnsigned(const PendingEthTx &tx) {
     QtConcurrent::run(&m_netPool, [this, tx]() {
         QReadLocker lock(&m_coreLock);
