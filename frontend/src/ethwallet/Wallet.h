@@ -218,6 +218,9 @@ public:
     void cancelTransaction(quint32 fromIndex, quint64 nonce, const QString &maxFeeWei,
                            const QString &maxPriorityWei);
 
+    // Broadcast an already-signed raw tx (0x RLP hex) over Tor; emits transactionCommitted().
+    void broadcastRaw(const QString &rawHex);
+
     // Utility: convert human amount -> base units for `decimals`.
     static QString parseUnits(const QString &amount, quint8 decimals);
 

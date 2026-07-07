@@ -316,6 +316,13 @@ char *aero_wallet_send_erc20(AeroWallet *w,
                              uint64_t nonce);
 
 /**
+ * Broadcast an already-signed raw transaction (0x RLP hex) over the wallet's RPC/Tor. Returns JSON
+ * `SendResult`. Works for watch-only wallets too (no keys needed). Caller frees the string.
+ */
+char *aero_wallet_broadcast_raw(AeroWallet *w,
+                                const char *raw_hex);
+
+/**
  * Cancel a pending tx by broadcasting a 0-value self-send at `nonce` with a (bumped) fee. Returns
  * JSON `SendResult`. Caller frees the string.
  */

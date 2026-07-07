@@ -565,6 +565,56 @@ void AeroMainWindow::setupTabs() {
     });
     connect(sendUi.lineAmount, &QLineEdit::textChanged, this, &AeroMainWindow::onAmountConversion);
     connect(m_fromCombo, &QComboBox::currentIndexChanged, this, &AeroMainWindow::updateAvailable);
+    // Accept pasted EIP-681 payment URIs in Pay-to: "ethereum:0xADDR@chainId?value=<wei>" fills the
+    // recipient (and, for the simple value form, the amount). Other wallets/QR codes emit these.
+    connect(sendUi.lineAddress, &QPlainTextEdit::textChanged, this, [this]() {
+        if (m_parsingUri) return;
+        const QString raw = sendUi.lineAddress->toPlainText().trimmed();
+        if (!raw.startsWith(QLatin1String("ethereum:"), Qt::CaseInsensitive))
+            return;
+        QString rest = raw.mid(9); // drop "ethereum:"
+        if (rest.startsWith(QLatin1String("pay-"), Qt::CaseInsensitive))
+            rest = rest.mid(4);
+        QString query;
+        const int q = rest.indexOf(QLatin1Char('?'));
+        if (q >= 0) {
+            query = rest.mid(q + 1);
+            rest = rest.left(q);
+        }
+        QString addr = rest;
+        const int at = addr.indexOf(QLatin1Char('@')); // strip "@chainId"
+        if (at >= 0)
+            addr = addr.left(at);
+        QString fnPath;
+        const int slash = addr.indexOf(QLatin1Char('/')); // token "/transfer" form
+        if (slash >= 0) {
+            fnPath = addr.mid(slash + 1);
+            addr = addr.left(slash);
+        }
+        QString valueWei, toParam;
+        for (const QString &kv : query.split(QLatin1Char('&'), Qt::SkipEmptyParts)) {
+            const int eq = kv.indexOf(QLatin1Char('='));
+            if (eq < 0) continue;
+            const QString k = kv.left(eq);
+            const QString v = QUrl::fromPercentEncoding(kv.mid(eq + 1).toUtf8());
+            if (k == QLatin1String("value")) valueWei = v;
+            else if (k == QLatin1String("address")) toParam = v;
+        }
+        m_parsingUri = true;
+        if (fnPath.compare(QLatin1String("transfer"), Qt::CaseInsensitive) == 0 && !toParam.isEmpty()) {
+            sendUi.lineAddress->setPlainText(toParam); // ERC20 transfer: recipient is in ?address=
+        } else {
+            sendUi.lineAddress->setPlainText(addr);
+            bool ok = false;
+            const double wei = valueWei.toDouble(&ok); // may be scientific, e.g. 2.5e18
+            if (ok && wei > 0) {
+                if (m_amountUnit && m_amountUnit->isVisible())
+                    m_amountUnit->setCurrentIndex(0); // amount is the native coin, not USD
+                sendUi.lineAmount->setText(trimZeros(QString::number(wei / 1e18, 'f', 9)));
+            }
+        }
+        m_parsingUri = false;
+    });
     // Max fills the amount field with the full available balance (in the selected asset). For the
     // native coin we must reserve the gas cost (value + gasLimit*maxFee must fit the balance), or
     // the send fails; ERC-20 sends pay gas separately, so their Max is the full token balance.
@@ -1099,6 +1149,8 @@ void AeroMainWindow::setupMenu() {
     ui.menuTools->clear();
     connect(ui.menuTools->addAction(tr("Sign / Verify Message…")), &QAction::triggered, this,
             &AeroMainWindow::onSignVerifyMessage);
+    connect(ui.menuTools->addAction(tr("Broadcast Raw Transaction…")), &QAction::triggered, this,
+            &AeroMainWindow::onBroadcastRaw);
     ui.menuTools->addSeparator();
     m_speedUpAction = ui.menuTools->addAction(tr("Speed Up Last Transaction"));
     m_cancelTxAction = ui.menuTools->addAction(tr("Cancel Last Transaction"));
@@ -2689,6 +2741,33 @@ void AeroMainWindow::onSignVerifyMessage() {
     });
 
     dlg.exec();
+}
+
+void AeroMainWindow::onBroadcastRaw() {
+    if (!m_wallet) return;
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Broadcast Raw Transaction"));
+    dlg.setMinimumWidth(540);
+    auto *v = new QVBoxLayout(&dlg);
+    v->addWidget(new QLabel(
+        tr("Paste a signed raw transaction (0x…). It will be broadcast over Tor. Use this to relay "
+           "a transaction signed on an offline machine."),
+        &dlg));
+    auto *edit = new QPlainTextEdit(&dlg);
+    edit->setMinimumHeight(120);
+    edit->setPlaceholderText(QStringLiteral("0x02f8…"));
+    v->addWidget(edit);
+    auto *box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    box->button(QDialogButtonBox::Ok)->setText(tr("Broadcast"));
+    v->addWidget(box);
+    connect(box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+    const QString raw = edit->toPlainText().trimmed();
+    if (raw.isEmpty())
+        return;
+    m_wallet->broadcastRaw(raw); // result surfaces via onTransactionCommitted
 }
 
 void AeroMainWindow::onTransactionSent(const PendingEthTx &tx, const QString &txHash) {

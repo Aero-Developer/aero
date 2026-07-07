@@ -859,6 +859,17 @@ pub extern "C" fn aero_wallet_send_erc20(
     })
 }
 
+/// Broadcast an already-signed raw transaction (0x RLP hex) over the wallet's RPC/Tor. Returns JSON
+/// `SendResult`. Works for watch-only wallets too (no keys needed). Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_broadcast_raw(w: *mut Wallet, raw_hex: *const c_char) -> *mut c_char {
+    let Some(raw) = from_cstr(raw_hex) else {
+        set_error("null raw tx");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| RUNTIME.block_on(w.broadcast_raw(&raw)))
+}
+
 /// Cancel a pending tx by broadcasting a 0-value self-send at `nonce` with a (bumped) fee. Returns
 /// JSON `SendResult`. Caller frees the string.
 #[no_mangle]

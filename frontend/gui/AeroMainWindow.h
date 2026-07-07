@@ -57,6 +57,7 @@ private slots:
     void onChangePassword();
     void onShowSeed();
     void onSignVerifyMessage(); // Tools -> Sign / Verify Message (EIP-191 personal_sign)
+    void onBroadcastRaw();      // Tools -> Broadcast Raw Transaction (push a signed raw tx)
     void onTransactionSent(const PendingEthTx &tx, const QString &txHash); // remember for speed/cancel
     void onSpeedUpLast(); // rebroadcast the last tx at the same nonce with a higher fee
     void onCancelLast();  // replace the last pending tx with a 0-value self-send (higher fee)
@@ -192,6 +193,7 @@ private:
     QString m_nativeSymbol = QStringLiteral("ETH");
     QToolButton *m_networkButton = nullptr; // status-bar network selector
     QMessageBox *m_deviceDialog = nullptr;  // "confirm on your device" prompt during hardware signing
+    bool m_parsingUri = false; // guard against re-entrancy while rewriting the Pay-to field
     // Last broadcast tx this session, for Tools -> Speed Up / Cancel (replacement reuses its nonce).
     PendingEthTx m_lastSent;
     bool m_hasPending = false;

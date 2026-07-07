@@ -1073,6 +1073,25 @@ impl Wallet {
             .await
     }
 
+    /// Broadcast an already-signed raw transaction (0x-prefixed RLP). Works for any wallet type
+    /// (no keys needed) — this is the "transaction pusher" used to relay an offline-signed tx over
+    /// Tor. Returns the resulting tx hash.
+    pub async fn broadcast_raw(&self, raw_hex: &str) -> Result<SendResult> {
+        let provider = self.provider()?;
+        let t = raw_hex.trim();
+        let raw = if t.starts_with("0x") || t.starts_with("0X") {
+            t.to_string()
+        } else {
+            format!("0x{t}")
+        };
+        let result = provider.send_raw_transaction(&raw).await?;
+        let tx_hash = result
+            .as_str()
+            .ok_or_else(|| CoreError::rpc("broadcast returned no hash"))?
+            .to_string();
+        Ok(SendResult { tx_hash, nonce: 0 })
+    }
+
     /// Cancel a pending transaction by replacing it with a 0-value self-send at the same `nonce`.
     /// The replacement must pay more gas than the stuck tx (the caller supplies a bumped `fee`), so
     /// the network prefers it; once it mines, the original is dropped. Returns the replacement hash.

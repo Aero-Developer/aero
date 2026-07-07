@@ -692,6 +692,23 @@ void Wallet::cancelTransaction(quint32 fromIndex, quint64 nonce, const QString &
     });
 }
 
+void Wallet::broadcastRaw(const QString &rawHex) {
+    QtConcurrent::run(&m_netPool, [this, rawHex]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_broadcast_raw(m_core, rawHex.trimmed().toUtf8().constData());
+        bool success = res != nullptr;
+        QString txHash, err;
+        if (success)
+            txHash = QJsonDocument::fromJson(takeString(res).toUtf8()).object()
+                         .value("tx_hash").toString();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, success, txHash, err]() {
+            emit transactionCommitted(success, txHash, err);
+        }, Qt::QueuedConnection);
+    });
+}
+
 QString Wallet::parseUnits(const QString &amount, quint8 decimals) {
     return takeString(aero_parse_units(amount.toUtf8().constData(), decimals));
 }
