@@ -452,9 +452,10 @@ impl Wallet {
 
         // Resolve every account address once (works for both software and hardware — the latter
         // reads its cached device addresses, no device round-trip here).
+        // A single unresolvable account must not blank every balance — skip it rather than error.
         let mut addrs: Vec<(u32, Address)> = Vec::with_capacity(n as usize);
         for i in 0..n {
-            if let Ok(a) = parse_address(&self.address(i)?) {
+            if let Ok(a) = self.address(i).and_then(|s| parse_address(&s)) {
                 addrs.push((i, a));
             }
         }

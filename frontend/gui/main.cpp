@@ -14,9 +14,12 @@
 #include <QDialog>
 #include <QVBoxLayout>
 #include <QLabel>
+#include <QSettings>
+#include <QDir>
 
 #include "AeroMainWindow.h"
 #include "WalletWizard.h"
+#include "components.h"
 #include "ethwallet/WalletManager.h"
 
 static void applyTheme(QApplication &app) {
@@ -33,6 +36,17 @@ int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
     QApplication::setApplicationName("Aero");
     QApplication::setOrganizationName("Aero");
+
+    // Portable mode (Electrum-style): keep settings next to the executable instead of the Windows
+    // registry / user config dir, so an unzipped build is fully self-contained and leaves no trace.
+    // Wallets are likewise stored under <exe dir>/wallets (see aeroWalletsRoot()). Must run before
+    // any QSettings("Aero","Aero") is constructed.
+    if (aeroIsPortable()) {
+        QSettings::setDefaultFormat(QSettings::IniFormat);
+        const QString cfg = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("config"));
+        QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, cfg);
+        QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, cfg);
+    }
 
 #if defined(Q_OS_MAC)
     // Feather only bumps the font size on macOS; on Windows/Linux it uses the plain system font.

@@ -2,9 +2,42 @@
 // InfoFrame implementation, matching Feather's src/components.cpp.
 #include "components.h"
 
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
 #include <QHBoxLayout>
 #include <QPushButton>
 #include <QSpacerItem>
+#include <QStandardPaths>
+
+bool aeroIsPortable() {
+    // Computed once: launched with --portable, or a marker file sits next to the executable.
+    static const bool portable = []() {
+        if (QCoreApplication::arguments().contains(QStringLiteral("--portable")))
+            return true;
+        const QDir dir(QCoreApplication::applicationDirPath());
+        return QFileInfo::exists(dir.filePath(QStringLiteral("portable")))
+            || QFileInfo::exists(dir.filePath(QStringLiteral("portable.dat")));
+    }();
+    return portable;
+}
+
+QString aeroDataRoot() {
+    if (aeroIsPortable())
+        return QCoreApplication::applicationDirPath();
+    return QDir(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation))
+        .filePath(QStringLiteral("Aero"));
+}
+
+QString aeroWalletsRoot() {
+    return QDir(aeroDataRoot()).filePath(QStringLiteral("wallets"));
+}
+
+QString aeroLegacyRoot() {
+    if (aeroIsPortable())
+        return QCoreApplication::applicationDirPath();
+    return QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+}
 
 InfoFrame::InfoFrame(QWidget *parent) : QFrame(parent) {
     auto *layout = new QHBoxLayout(this);

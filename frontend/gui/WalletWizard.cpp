@@ -23,6 +23,7 @@
 #include <QStandardPaths>
 #include <QVBoxLayout>
 
+#include "components.h"
 #include "widgets/TextEdit.h"
 
 #include <QDateTime>
@@ -47,11 +48,11 @@ const QString kLockIcon = ":/assets/images/lock.svg";
 const QString kInfoIcon = ":/assets/images/info2.svg";
 const QString kWarnIcon = ":/assets/images/warning.png";
 
-// Feather-style wallet root: <Documents>/Aero/wallets. Each wallet lives in its own subfolder as
-// <name>/<name>.keys, so a wallet's files are grouped together.
+// Feather-style wallet root. Each wallet lives in its own subfolder as <name>/<name>.keys, so a
+// wallet's files are grouped together. In portable mode this is <exe dir>/wallets (next to the
+// unzipped build, Electrum-style); otherwise <Documents>/Aero/wallets.
 QString walletsRoot() {
-    const QString docs = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
-    return QDir(docs).filePath(QStringLiteral("Aero/wallets"));
+    return aeroWalletsRoot();
 }
 
 // Full path of a wallet's key file for a given name: <root>/<name>/<name>.keys.
@@ -660,9 +661,7 @@ OpenPage::OpenPage(WalletWizard *w) : m_w(w), ui(new Ui::PageOpenWallet) {
             [this](const QModelIndex &, const QModelIndex &) { updatePath(); });
     connect(ui->walletTable, &QTreeView::doubleClicked, this, [this]() { finishNow(); });
     connect(ui->btnBrowse, &QPushButton::clicked, this, [this]() {
-        const QString start = QDir(walletsRoot()).exists()
-                                  ? walletsRoot()
-                                  : QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+        const QString start = QDir(walletsRoot()).exists() ? walletsRoot() : aeroLegacyRoot();
         const QString f = QFileDialog::getOpenFileName(this, tr("Select your wallet file"), start,
                                                        tr("Aero wallet (*.keys *.aero *.plume)"));
         if (f.isEmpty()) return;
@@ -690,10 +689,11 @@ void OpenPage::refreshList() {
         files += QDir(sub.absoluteFilePath())
                      .entryInfoList({QStringLiteral("*.keys")}, QDir::Files, QDir::Time);
     }
-    // Also list legacy flat wallets in Documents (openable for backward compatibility).
-    const QString docs = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
-    files += QDir(docs).entryInfoList({QStringLiteral("*.aero"), QStringLiteral("*.plume")},
-                                      QDir::Files, QDir::Time);
+    // Also list legacy flat wallets (openable for backward compatibility): Documents for a normal
+    // install, or next to the executable in portable mode.
+    const QString legacy = aeroLegacyRoot();
+    files += QDir(legacy).entryInfoList({QStringLiteral("*.aero"), QStringLiteral("*.plume")},
+                                        QDir::Files, QDir::Time);
     for (const QFileInfo &fi : files) {
         auto *name = new QStandardItem(fi.completeBaseName());
         name->setEditable(false);

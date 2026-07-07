@@ -7,8 +7,25 @@
 #include <QFrame>
 #include <QLabel>
 #include <QMouseEvent>
+#include <QString>
 
 class QPushButton;
+
+// ---- Portable-mode data locations (Electrum-style) -----------------------------------------
+// When portable, Aero keeps ALL of its data (wallets + settings) next to the executable, so an
+// unzipped build is fully self-contained and leaves nothing in Documents or the registry.
+// Portable is enabled by launching with `--portable` or by shipping a `portable` marker file next
+// to the executable (the portable release does the latter).
+bool aeroIsPortable();
+
+// Root data directory:  portable => <exe dir> ;  otherwise => <Documents>/Aero.
+QString aeroDataRoot();
+
+// Wallets directory:  <dataRoot>/wallets  (each wallet in its own <name>/<name>.keys subfolder).
+QString aeroWalletsRoot();
+
+// Where legacy flat *.aero/*.plume wallets are looked for (portable => exe dir, else Documents).
+QString aeroLegacyRoot();
 
 class ClickableLabel : public QLabel
 {
