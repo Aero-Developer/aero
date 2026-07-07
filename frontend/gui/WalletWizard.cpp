@@ -90,6 +90,7 @@ WalletWizard::WalletWizard(QWidget *parent) : QWizard(parent) {
     setPage(Page_Password, new PasswordPage(this));
     setPage(Page_Open, new OpenPage(this));
     setPage(Page_Hardware, new HardwarePage(this));
+    setPage(Page_Watch, new WatchPage(this));
     setStartId(Page_Menu);
     if (!qEnvironmentVariableIsEmpty("AERO_OPEN")) setStartId(Page_Open); // dev hook
     if (!qEnvironmentVariableIsEmpty("AERO_RESTORE")) setStartId(Page_RestoreSeed); // dev hook
@@ -138,8 +139,8 @@ MenuPage::MenuPage(WalletWizard *w) : m_w(w), ui(new Ui::PageMenu) {
     ui->setupUi(this);
     // Feather's menu page has no title/subtitle header — the banner runs full-height from the top.
 
-    // Ethereum wallets have no Monero view-only-keys option; hardware (Ledger/Trezor) is supported.
-    ui->radioViewOnly->setVisible(false);
+    // Repurpose Feather's "view-only" option as an Ethereum address-only watch wallet.
+    ui->radioViewOnly->setText(tr("Watch-only wallet (track an address)"));
     ui->radioCreateFromDevice->setText(tr("Connect hardware wallet (Ledger / Trezor)"));
     ui->frame_seedBump->setVisible(false);
     ui->label_version->setText(tr("Aero — Ethereum wallet"));
@@ -154,6 +155,8 @@ MenuPage::MenuPage(WalletWizard *w) : m_w(w), ui(new Ui::PageMenu) {
         ui->radioSeed->setChecked(true);
     else if (last == QLatin1String("hardware"))
         ui->radioCreateFromDevice->setChecked(true);
+    else if (last == QLatin1String("watch"))
+        ui->radioViewOnly->setChecked(true);
     else
         ui->radioOpen->setChecked(true);
 }
@@ -163,6 +166,7 @@ MenuPage::~MenuPage() { delete ui; }
 int MenuPage::nextId() const {
     if (ui->radioOpen->isChecked()) return WalletWizard::Page_Open;
     if (ui->radioCreateFromDevice->isChecked()) return WalletWizard::Page_Hardware;
+    if (ui->radioViewOnly->isChecked()) return WalletWizard::Page_Watch;
     return WalletWizard::Page_File;
 }
 
@@ -170,6 +174,7 @@ bool MenuPage::validatePage() {
     QString mode;
     if (ui->radioOpen->isChecked()) { m_w->mode = WalletWizard::Open; mode = QStringLiteral("open"); }
     else if (ui->radioCreateFromDevice->isChecked()) { m_w->mode = WalletWizard::Hardware; mode = QStringLiteral("hardware"); }
+    else if (ui->radioViewOnly->isChecked()) { m_w->mode = WalletWizard::Watch; mode = QStringLiteral("watch"); }
     else if (ui->radioSeed->isChecked()) { m_w->mode = WalletWizard::Restore; mode = QStringLiteral("restore"); }
     else { m_w->mode = WalletWizard::Create; mode = QStringLiteral("create"); }
     QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
@@ -233,8 +238,11 @@ bool FilePage::validatePage() {
 }
 
 int FilePage::nextId() const {
-    return m_w->mode == WalletWizard::Restore ? WalletWizard::Page_RestoreSeed
-                                              : WalletWizard::Page_Seed;
+    if (m_w->mode == WalletWizard::Restore)
+        return WalletWizard::Page_RestoreSeed;
+    if (m_w->mode == WalletWizard::Watch)
+        return WalletWizard::Page_Password; // wallet already built on the Watch page; just save it
+    return WalletWizard::Page_Seed;
 }
 
 // ================= SeedPage =================
@@ -641,6 +649,53 @@ bool HardwarePage::validatePage() {
 int HardwarePage::nextId() const {
     return WalletWizard::Page_File; // choose a file name + set a password (encrypts the watch-only data)
 }
+
+// ================= WatchPage =================
+
+WatchPage::WatchPage(WalletWizard *w) : m_w(w) {
+    setTitle(tr("Watch-only wallet"));
+    auto *v = new QVBoxLayout(this);
+    auto *info = new QLabel(
+        tr("Enter one or more Ethereum addresses to watch (one per line). A watch-only wallet "
+           "tracks balances and history but cannot sign or send — it holds no private keys."),
+        this);
+    info->setWordWrap(true);
+    v->addWidget(info);
+    m_addresses = new QPlainTextEdit(this);
+    m_addresses->setPlaceholderText(QStringLiteral("0x…\n0x…"));
+    m_addresses->setMinimumHeight(110);
+    v->addWidget(m_addresses);
+    m_error = new QLabel(this);
+    m_error->setStyleSheet(QStringLiteral("color:#e74c3c;"));
+    m_error->setWordWrap(true);
+    v->addWidget(m_error);
+}
+
+bool WatchPage::validatePage() {
+    m_error->clear();
+    QStringList addrs;
+    for (const QString &line :
+         m_addresses->toPlainText().split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+        const QString t = line.trimmed();
+        if (!t.isEmpty())
+            addrs << t;
+    }
+    if (addrs.isEmpty()) {
+        m_error->setText(tr("Enter at least one address."));
+        return false;
+    }
+    Wallet *w = WalletManager::instance()->createWatchOnly(addrs);
+    if (!w) {
+        m_error->setText(
+            tr("Could not create watch wallet: %1").arg(WalletManager::instance()->errorString()));
+        return false;
+    }
+    delete m_w->wallet; // replace any wallet from a previous pass through this page
+    m_w->wallet = w;
+    return true;
+}
+
+int WatchPage::nextId() const { return WalletWizard::Page_File; }
 
 // ================= OpenPage =================
 

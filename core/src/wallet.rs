@@ -79,6 +79,9 @@ enum KeySource {
     /// Hardware wallet: keys stay on the Ledger/Trezor; we only hold the device kind and (for
     /// Trezor) the host-entered passphrase. Every signature requires the device.
     Hardware(HwContext),
+    /// Watch-only: no keys at all. Addresses come from `secrets.watch_addresses`; balances and
+    /// history work but any signing/sending is refused.
+    WatchOnly,
 }
 
 struct HwContext {
@@ -127,6 +130,7 @@ impl Wallet {
             tokens,
             imported_keys: Vec::new(),
             hardware: None,
+            watch_addresses: Vec::new(),
             metadata: String::new(),
         };
         normalize_account_order(&mut secrets);
@@ -153,6 +157,7 @@ impl Wallet {
             tokens: Vec::new(),
             imported_keys: Vec::new(),
             hardware: Some(HwDescriptor { kind: kind.as_str().to_string(), addresses }),
+            watch_addresses: Vec::new(),
             metadata: String::new(),
         };
         Ok(Self {
@@ -193,6 +198,16 @@ impl Wallet {
             });
         }
 
+        // Watch-only: no keys, just the tracked addresses.
+        if !secrets.watch_addresses.is_empty() {
+            return Ok(Self {
+                keys: KeySource::WatchOnly,
+                provider: None,
+                provider_cfg: ProviderConfig::default(),
+                secrets,
+            });
+        }
+
         // Software: re-attach the stored passphrase so HD addresses derive identically.
         let seed = SeedPhrase::parse(&secrets.mnemonic)?.with_passphrase(&secrets.passphrase);
         Ok(Self {
@@ -201,6 +216,46 @@ impl Wallet {
             provider_cfg: ProviderConfig::default(),
             secrets,
         })
+    }
+
+    /// Create an address-only watch wallet from one or more 0x addresses. No keys are stored, so
+    /// balances/history work but signing/sending is refused. Addresses are validated + checksummed.
+    pub fn watch_only(addresses: &[String]) -> Result<Self> {
+        let mut addrs: Vec<String> = Vec::new();
+        for a in addresses {
+            let a = a.trim();
+            if a.is_empty() {
+                continue;
+            }
+            addrs.push(parse_address(a)?.to_checksum(None));
+        }
+        if addrs.is_empty() {
+            return Err(CoreError::rpc("no valid addresses to watch".to_string()));
+        }
+        let n = addrs.len() as u32;
+        let account_order = (0..n).map(AccountEntry::Hd).collect();
+        let secrets = WalletSecrets {
+            mnemonic: String::new(),
+            passphrase: String::new(),
+            account_count: n,
+            account_order,
+            tokens: Vec::new(),
+            imported_keys: Vec::new(),
+            hardware: None,
+            watch_addresses: addrs,
+            metadata: String::new(),
+        };
+        Ok(Self {
+            secrets,
+            keys: KeySource::WatchOnly,
+            provider: None,
+            provider_cfg: ProviderConfig::default(),
+        })
+    }
+
+    /// Whether this is an address-only watch wallet (no keys; can't sign/send).
+    pub fn is_watch_only(&self) -> bool {
+        matches!(self.keys, KeySource::WatchOnly)
     }
 
     /// Whether this is a hardware wallet.
@@ -212,7 +267,7 @@ impl Wallet {
     pub fn hw_kind(&self) -> &str {
         match &self.keys {
             KeySource::Hardware(ctx) => ctx.kind.as_str(),
-            KeySource::Software(_) => "",
+            KeySource::Software(_) | KeySource::WatchOnly => "",
         }
     }
 
@@ -228,7 +283,7 @@ impl Wallet {
     pub fn mnemonic(&self) -> &str {
         match &self.keys {
             KeySource::Software(seed) => seed.as_str(),
-            KeySource::Hardware(_) => "",
+            KeySource::Hardware(_) | KeySource::WatchOnly => "",
         }
     }
 
@@ -237,6 +292,7 @@ impl Wallet {
         match &self.keys {
             KeySource::Software(seed) => seed.has_passphrase(),
             KeySource::Hardware(ctx) => !ctx.passphrase.is_empty(),
+            KeySource::WatchOnly => false,
         }
     }
 
@@ -247,6 +303,9 @@ impl Wallet {
 
     /// Append a new HD account and return its (stable) unified index.
     pub fn add_account(&mut self) -> u32 {
+        if matches!(self.keys, KeySource::WatchOnly) {
+            return self.account_count().saturating_sub(1); // no keys to derive from — no-op
+        }
         let hd_index = self.secrets.account_count;
         self.secrets.account_count += 1;
         self.secrets.account_order.push(AccountEntry::Hd(hd_index));
@@ -271,6 +330,11 @@ impl Wallet {
             KeySource::Hardware(_) => {
                 return Err(CoreError::Signing(
                     "hardware wallet: keys stay on the device".into(),
+                ))
+            }
+            KeySource::WatchOnly => {
+                return Err(CoreError::Signing(
+                    "watch-only wallet: no private keys (cannot sign or send)".into(),
                 ))
             }
         };
@@ -310,6 +374,12 @@ impl Wallet {
                     .cloned()
                     .ok_or_else(|| CoreError::Derivation(format!("no account at index {index}")))
             }
+            KeySource::WatchOnly => self
+                .secrets
+                .watch_addresses
+                .get(index as usize)
+                .cloned()
+                .ok_or_else(|| CoreError::Derivation(format!("no account at index {index}"))),
         }
     }
 
@@ -349,7 +419,9 @@ impl Wallet {
     pub async fn add_hardware_account(&mut self) -> Result<u32> {
         let ctx = match &self.keys {
             KeySource::Hardware(ctx) => ctx,
-            KeySource::Software(_) => return Err(CoreError::rpc("not a hardware wallet")),
+            KeySource::Software(_) | KeySource::WatchOnly => {
+                return Err(CoreError::rpc("not a hardware wallet"))
+            }
         };
         let next_hd = self.secrets.account_count;
         let addr = hardware::get_address(ctx.kind, &ctx.passphrase, next_hd).await?;
@@ -559,9 +631,9 @@ impl Wallet {
     /// `gap_limit` consecutive empty addresses. Balances are fetched in batched JSON-RPC requests
     /// so a deep scan is a handful of round-trips rather than one per address.
     pub async fn scan_funded(&mut self, gap_limit: u32) -> Result<Vec<u32>> {
-        // Hardware wallets derive addresses via slow device round-trips, so we don't run an
-        // automatic gap scan; the user adds accounts explicitly instead.
-        if matches!(self.keys, KeySource::Hardware(_)) {
+        // Hardware wallets derive addresses via slow device round-trips, and watch-only wallets have
+        // no keys to derive from, so neither runs an automatic gap scan.
+        if matches!(self.keys, KeySource::Hardware(_) | KeySource::WatchOnly) {
             return Ok(Vec::new());
         }
 
@@ -593,7 +665,7 @@ impl Wallet {
         {
             let seed = match &self.keys {
                 KeySource::Software(seed) => seed,
-                KeySource::Hardware(_) => unreachable!(),
+                KeySource::Hardware(_) | KeySource::WatchOnly => unreachable!(),
             };
             let provider = self.provider()?;
 
@@ -1271,6 +1343,9 @@ impl Wallet {
                     }
                 }
             }
+            KeySource::WatchOnly => Err(CoreError::Signing(
+                "watch-only wallet: cannot sign transactions".into(),
+            )),
         }
     }
 
@@ -1630,6 +1705,28 @@ mod tests {
             Wallet::verify_message("Tampered", &sig).unwrap().to_lowercase(),
             addr.to_lowercase()
         );
+    }
+
+    #[test]
+    fn watch_only_tracks_address_but_cannot_sign() {
+        let a = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+        let w = Wallet::watch_only(&[a.to_string()]).unwrap();
+        assert!(w.is_watch_only());
+        assert_eq!(w.account_count(), 1);
+        assert_eq!(w.address(0).unwrap().to_lowercase(), a.to_lowercase());
+        assert!(w.mnemonic().is_empty());
+        assert!(w.export_private_key(0).is_err(), "watch-only must have no key to export");
+        assert!(w.sign_message(0, "x").is_err(), "watch-only must not sign");
+
+        // Save + reopen must preserve the watch-only nature and the address.
+        let mut p = std::env::temp_dir();
+        p.push(format!("aero_watch_{}.keys", std::process::id()));
+        let ps = p.to_str().unwrap();
+        w.save(ps, "pw").unwrap();
+        let re = Wallet::open(ps, "pw").unwrap();
+        assert!(re.is_watch_only());
+        assert_eq!(re.address(0).unwrap().to_lowercase(), a.to_lowercase());
+        std::fs::remove_file(ps).ok();
     }
 
     #[test]

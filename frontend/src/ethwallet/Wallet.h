@@ -98,6 +98,9 @@ public:
     // Import a raw hex private key as a new account; returns its index (or 0xFFFFFFFF on error).
     quint32 importPrivateKey(const QString &hexKey);
 
+    // Address-only watch wallet: tracks addresses with no keys (can't sign or send).
+    bool isWatchOnly() const;
+
     // ##### Hardware wallets #####
     bool isHardware() const;      // keys live on a Ledger/Trezor
     QString hwKind() const;       // "ledger" | "trezor" | "" (software)

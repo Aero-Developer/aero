@@ -1329,6 +1329,16 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
         });
     }
 
+    // Watch-only wallets track balances/history but hold no keys: disable spending and reflect it
+    // in the title. Key-derivation actions (create address / import key) are guarded at their slots.
+    if (m_wallet->isWatchOnly()) {
+        setWindowTitle(tr("Aero — watch-only wallet"));
+        if (sendUi.btnSend) {
+            sendUi.btnSend->setEnabled(false);
+            sendUi.btnSend->setToolTip(tr("Watch-only wallet — no keys, cannot send"));
+        }
+    }
+
     // Track the common mainnet tokens by default so their balances and logos show up.
     if (m_wallet->tokens().isEmpty()) {
         m_wallet->addToken({QStringLiteral("0xdAC17F958D2ee523a2206206994597C13D831ec7"), QStringLiteral("USDT"), 6});
@@ -2031,9 +2041,9 @@ void AeroMainWindow::showCachedBalance(quint32 index) {
 
 void AeroMainWindow::ensureMinAddresses(quint32 count) {
     if (!m_wallet) return;
-    // Hardware wallets derive their accounts up front (via the device at create time); never
-    // fabricate extra HD entries here (they'd have no cached device address).
-    if (m_wallet->isHardware()) return;
+    // Hardware wallets derive their accounts up front (via the device at create time), and
+    // watch-only wallets have no keys to derive from — never fabricate extra HD entries for either.
+    if (m_wallet->isHardware() || m_wallet->isWatchOnly()) return;
     while (m_wallet->numAccounts() < count)
         m_wallet->addAccount();
 }
@@ -2051,6 +2061,12 @@ void AeroMainWindow::selectAddressRow(quint32 index) {
 
 void AeroMainWindow::onCreateAddress() {
     if (!m_wallet) return;
+    if (m_wallet->isWatchOnly()) {
+        QMessageBox::information(this, tr("Watch-only wallet"),
+                                 tr("A watch-only wallet can't derive new addresses — it only "
+                                    "tracks the addresses you added."));
+        return;
+    }
     quint32 idx;
     if (m_wallet->isHardware()) {
         // Derive the next address from the device (needs it connected; may take a moment).
@@ -2076,6 +2092,12 @@ void AeroMainWindow::onCreateAddress() {
 
 void AeroMainWindow::onImportKey() {
     if (!m_wallet) return;
+    if (m_wallet->isWatchOnly()) {
+        QMessageBox::information(this, tr("Watch-only wallet"),
+                                 tr("This is a watch-only wallet. Create or restore a normal wallet "
+                                    "to import a spending key."));
+        return;
+    }
     bool ok = false;
     const QString key = QInputDialog::getText(
         this, tr("Import private key"),
@@ -3086,6 +3108,12 @@ QIcon AeroMainWindow::tokenIcon(const QString &symbol) const {
 
 void AeroMainWindow::onSendClicked() {
     if (!m_wallet) return;
+    if (m_wallet->isWatchOnly()) {
+        QMessageBox::information(this, tr("Watch-only wallet"),
+                                 tr("This is a watch-only wallet — it holds no private keys, so it "
+                                    "can track balances but cannot send."));
+        return;
+    }
     const QString to = sendUi.lineAddress->text();
     const QString amount = sendUi.lineAmount->text().trimmed();
     if (to.isEmpty() || amount.isEmpty()) {

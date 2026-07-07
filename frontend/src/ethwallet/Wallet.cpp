@@ -113,6 +113,11 @@ bool Wallet::isHardware() const {
     return aero_wallet_is_hardware(m_core) != 0;
 }
 
+bool Wallet::isWatchOnly() const {
+    QReadLocker lock(&m_coreLock);
+    return aero_wallet_is_watch_only(m_core) != 0;
+}
+
 QString Wallet::hwKind() const {
     QReadLocker lock(&m_coreLock);
     return takeString(aero_wallet_hw_kind(m_core));

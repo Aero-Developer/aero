@@ -96,6 +96,17 @@ int aero_wallet_file_is_hardware(const char *path,
 int aero_wallet_is_hardware(AeroWallet *w);
 
 /**
+ * Create an address-only watch wallet from a JSON array of 0x addresses (e.g. `["0x..","0x.."]`).
+ * No keys are stored; balances/history work but signing/sending is refused.
+ */
+AeroWallet *aero_wallet_watch_only(const char *addresses_json);
+
+/**
+ * Whether the wallet is an address-only watch wallet (1 = yes, 0 = no).
+ */
+int aero_wallet_is_watch_only(AeroWallet *w);
+
+/**
  * Hardware device kind ("ledger"/"trezor"), or "" for software wallets. Caller frees.
  */
 char *aero_wallet_hw_kind(AeroWallet *w);

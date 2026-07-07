@@ -29,6 +29,10 @@ public:
     // Open an encrypted wallet file.
     Wallet *openWallet(const QString &path, const QString &password);
 
+    // Create an address-only watch wallet from one or more 0x addresses (no keys; view-only).
+    // Not yet persisted; the wizard saves it via Wallet::store() after the name/password pages.
+    Wallet *createWatchOnly(const QStringList &addresses);
+
     // ##### Hardware wallets (Ledger / Trezor) #####
     // Connected device names of `kind` ("ledger"/"trezor"); empty if none/unreachable.
     QStringList listHwDevices(const QString &kind);

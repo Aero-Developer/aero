@@ -95,6 +95,11 @@ pub struct WalletSecrets {
     /// `passphrase` and `imported_keys` are empty and signing is delegated to the device.
     #[serde(default)]
     pub hardware: Option<HwDescriptor>,
+    /// Address-only watch wallet: when non-empty (and no mnemonic/hardware), the wallet tracks these
+    /// addresses with no keys — balances/history work, signing/sending is refused. Absent in older
+    /// files (serde default).
+    #[serde(default)]
+    pub watch_addresses: Vec<String>,
     /// Opaque, frontend-owned JSON blob for per-wallet metadata (address labels, contacts, notes,
     /// funded-address list). Kept here so it is encrypted at rest instead of in plaintext settings.
     #[serde(default)]
@@ -247,6 +252,7 @@ mod tests {
             tokens: vec![],
             imported_keys: vec![],
             hardware: None,
+            watch_addresses: vec![],
             metadata: metadata.to_string(),
         }
     }
@@ -304,6 +310,7 @@ mod tests {
             }],
             imported_keys: vec![],
             hardware: None,
+            watch_addresses: vec![],
             metadata: String::new(),
         };
         let blob = encrypt(&secrets, "hunter2").unwrap();
@@ -327,6 +334,7 @@ mod tests {
             tokens: vec![],
             imported_keys: vec![],
             hardware: None,
+            watch_addresses: vec![],
             metadata: String::new(),
         };
         let mut salt = [0u8; 16];
@@ -355,6 +363,7 @@ mod tests {
             tokens: vec![],
             imported_keys: vec![],
             hardware: None,
+            watch_addresses: vec![],
             metadata: String::new(),
         };
         let blob = encrypt(&secrets, "correct").unwrap();

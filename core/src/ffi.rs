@@ -276,6 +276,34 @@ pub extern "C" fn aero_wallet_is_hardware(w: *mut Wallet) -> c_int {
     }
 }
 
+/// Create an address-only watch wallet from a JSON array of 0x addresses (e.g. `["0x..","0x.."]`).
+/// No keys are stored; balances/history work but signing/sending is refused.
+#[no_mangle]
+pub extern "C" fn aero_wallet_watch_only(addresses_json: *const c_char) -> *mut Wallet {
+    clear_error();
+    let Some(js) = from_cstr(addresses_json) else {
+        set_error("null addresses");
+        return ptr::null_mut();
+    };
+    let addrs: Vec<String> = serde_json::from_str(&js).unwrap_or_default();
+    match Wallet::watch_only(&addrs) {
+        Ok(w) => Box::into_raw(Box::new(w)),
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Whether the wallet is an address-only watch wallet (1 = yes, 0 = no).
+#[no_mangle]
+pub extern "C" fn aero_wallet_is_watch_only(w: *mut Wallet) -> c_int {
+    match unsafe { w.as_ref() } {
+        Some(w) if w.is_watch_only() => 1,
+        _ => 0,
+    }
+}
+
 /// Hardware device kind ("ledger"/"trezor"), or "" for software wallets. Caller frees.
 #[no_mangle]
 pub extern "C" fn aero_wallet_hw_kind(w: *mut Wallet) -> *mut c_char {

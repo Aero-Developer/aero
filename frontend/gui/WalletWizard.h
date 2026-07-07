@@ -30,8 +30,8 @@ class WalletWizard : public QWizard
 {
     Q_OBJECT
 public:
-    enum Page { Page_Menu, Page_File, Page_Seed, Page_RestoreSeed, Page_Password, Page_Open, Page_Hardware };
-    enum Mode { Create, Restore, Open, Hardware };
+    enum Page { Page_Menu, Page_File, Page_Seed, Page_RestoreSeed, Page_Password, Page_Open, Page_Hardware, Page_Watch };
+    enum Mode { Create, Restore, Open, Hardware, Watch };
 
     explicit WalletWizard(QWidget *parent = nullptr);
     ~WalletWizard() override;
@@ -155,6 +155,22 @@ private:
     QLabel *m_status = nullptr;
     QCheckBox *m_usePass = nullptr;
     QLineEdit *m_passphrase = nullptr;
+    QLabel *m_error = nullptr;
+};
+
+// Watch-only: enter one or more 0x addresses to track without keys (view balances/history, no
+// spending). The created wallet is still saved as an encrypted .keys file (name + password pages).
+class WatchPage : public QWizardPage
+{
+    Q_OBJECT
+public:
+    explicit WatchPage(WalletWizard *w);
+    bool validatePage() override;
+    int nextId() const override;
+
+private:
+    WalletWizard *m_w;
+    QPlainTextEdit *m_addresses = nullptr;
     QLabel *m_error = nullptr;
 };
 

@@ -43,6 +43,22 @@ Wallet *WalletManager::recoveryWallet(const QString &mnemonic, const QString &pa
     return new Wallet(core);
 }
 
+Wallet *WalletManager::createWatchOnly(const QStringList &addresses) {
+    QJsonArray arr;
+    for (const QString &a : addresses) {
+        const QString t = a.trimmed();
+        if (!t.isEmpty())
+            arr.append(t);
+    }
+    const QByteArray json = QJsonDocument(arr).toJson(QJsonDocument::Compact);
+    AeroWallet *core = aero_wallet_watch_only(json.constData());
+    if (!core) {
+        m_errorString = takeError();
+        return nullptr;
+    }
+    return new Wallet(core);
+}
+
 Wallet *WalletManager::openWallet(const QString &path, const QString &password) {
     AeroWallet *core = aero_wallet_open(path.toUtf8().constData(), password.toUtf8().constData());
     if (!core) {
