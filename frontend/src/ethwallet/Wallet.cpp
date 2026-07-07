@@ -709,6 +709,35 @@ void Wallet::broadcastRaw(const QString &rawHex) {
     });
 }
 
+void Wallet::buildUnsigned(const PendingEthTx &tx) {
+    QtConcurrent::run(&m_netPool, [this, tx]() {
+        QReadLocker lock(&m_coreLock);
+        const QByteArray maxFee = tx.fee.maxFee.toUtf8();
+        const QByteArray maxPriority = tx.fee.maxPriorityFee.toUtf8();
+        char *res = aero_wallet_build_unsigned(
+            m_core, tx.fromIndex, tx.to.toUtf8().constData(), tx.amountWei.toUtf8().constData(),
+            tx.token.toUtf8().constData(), tx.amountUnits.toUtf8().constData(), maxFee.constData(),
+            maxPriority.constData(), tx.nonce);
+        QString json, err;
+        if (res)
+            json = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, json, err]() { emit unsignedTxReady(json, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+QString Wallet::signUnsigned(const QString &json) {
+    QReadLocker lock(&m_coreLock); // signing reads the key (&self); no network needed
+    char *res = aero_wallet_sign_unsigned(m_core, json.toUtf8().constData());
+    if (!res) {
+        m_errorString = takeLastError();
+        return QString();
+    }
+    return takeString(res);
+}
+
 QString Wallet::parseUnits(const QString &amount, quint8 decimals) {
     return takeString(aero_parse_units(amount.toUtf8().constData(), decimals));
 }

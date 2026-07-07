@@ -323,6 +323,28 @@ char *aero_wallet_broadcast_raw(AeroWallet *w,
                                 const char *raw_hex);
 
 /**
+ * Build an UNSIGNED transaction (resolves nonce/gas/fees over the network) as JSON, for air-gapped
+ * signing. `token` empty = native (uses `amount_wei`), else ERC-20 transfer (`amount_units`).
+ * `nonce` = u64::MAX for automatic. Caller frees the string.
+ */
+char *aero_wallet_build_unsigned(AeroWallet *w,
+                                 uint32_t from_index,
+                                 const char *to,
+                                 const char *amount_wei,
+                                 const char *token,
+                                 const char *amount_units,
+                                 const char *max_fee_wei,
+                                 const char *max_priority_wei,
+                                 uint64_t nonce);
+
+/**
+ * Sign an unsigned-tx JSON (from `aero_wallet_build_unsigned`) with the local key; returns the 0x
+ * raw RLP hex (no network needed — runs offline). Null on error. Caller frees the string.
+ */
+char *aero_wallet_sign_unsigned(AeroWallet *w,
+                                const char *json);
+
+/**
  * Cancel a pending tx by broadcasting a 0-value self-send at `nonce` with a (bumped) fee. Returns
  * JSON `SendResult`. Caller frees the string.
  */

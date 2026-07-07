@@ -1151,6 +1151,8 @@ void AeroMainWindow::setupMenu() {
             &AeroMainWindow::onSignVerifyMessage);
     connect(ui.menuTools->addAction(tr("Broadcast Raw Transaction…")), &QAction::triggered, this,
             &AeroMainWindow::onBroadcastRaw);
+    connect(ui.menuTools->addAction(tr("Sign Unsigned Transaction…")), &QAction::triggered, this,
+            &AeroMainWindow::onSignUnsigned);
     ui.menuTools->addSeparator();
     m_speedUpAction = ui.menuTools->addAction(tr("Speed Up Last Transaction"));
     m_cancelTxAction = ui.menuTools->addAction(tr("Cancel Last Transaction"));
@@ -1389,15 +1391,17 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
         });
     }
 
-    // Watch-only wallets track balances/history but hold no keys: disable spending and reflect it
-    // in the title. Key-derivation actions (create address / import key) are guarded at their slots.
+    // Watch-only wallets hold no keys: they can't sign, but they CAN build an unsigned transaction
+    // for air-gapped signing, so the Send button becomes "Export Unsigned Tx".
     if (m_wallet->isWatchOnly()) {
         setWindowTitle(tr("Aero — watch-only wallet"));
         if (sendUi.btnSend) {
-            sendUi.btnSend->setEnabled(false);
-            sendUi.btnSend->setToolTip(tr("Watch-only wallet — no keys, cannot send"));
+            sendUi.btnSend->setText(tr("Export Unsigned Tx"));
+            sendUi.btnSend->setToolTip(
+                tr("Watch-only: builds an unsigned transaction to sign on an offline wallet"));
         }
     }
+    connect(m_wallet, &Wallet::unsignedTxReady, this, &AeroMainWindow::onUnsignedTxReady);
 
     // Track the common mainnet tokens by default so their balances and logos show up.
     if (m_wallet->tokens().isEmpty()) {
@@ -2770,6 +2774,97 @@ void AeroMainWindow::onBroadcastRaw() {
     m_wallet->broadcastRaw(raw); // result surfaces via onTransactionCommitted
 }
 
+void AeroMainWindow::onUnsignedTxReady(const QString &json, const QString &error) {
+    if (!error.isEmpty() || json.isEmpty()) {
+        QMessageBox::warning(this, tr("Export unsigned transaction"),
+                             error.isEmpty() ? tr("Could not build the transaction.") : error);
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Unsigned transaction"));
+    dlg.setMinimumWidth(560);
+    auto *v = new QVBoxLayout(&dlg);
+    v->addWidget(new QLabel(
+        tr("Move this to your offline wallet and sign it there (Tools → Sign Unsigned "
+           "Transaction), then broadcast the signed result here (Tools → Broadcast Raw "
+           "Transaction)."),
+        &dlg));
+    auto *edit = new QPlainTextEdit(&dlg);
+    edit->setReadOnly(true);
+    edit->setPlainText(json);
+    edit->setMinimumHeight(150);
+    v->addWidget(edit);
+    auto *row = new QHBoxLayout();
+    auto *copyBtn = new QPushButton(tr("Copy"), &dlg);
+    auto *saveBtn = new QPushButton(tr("Save to file…"), &dlg);
+    auto *closeBtn = new QPushButton(tr("Close"), &dlg);
+    row->addWidget(copyBtn);
+    row->addWidget(saveBtn);
+    row->addStretch();
+    row->addWidget(closeBtn);
+    v->addLayout(row);
+    connect(copyBtn, &QPushButton::clicked, &dlg, [json]() { QApplication::clipboard()->setText(json); });
+    connect(saveBtn, &QPushButton::clicked, &dlg, [this, json]() {
+        const QString f = QFileDialog::getSaveFileName(this, tr("Save unsigned transaction"),
+                                                       QStringLiteral("unsigned-tx.json"),
+                                                       tr("JSON (*.json)"));
+        if (f.isEmpty()) return;
+        QFile out(f);
+        if (out.open(QIODevice::WriteOnly | QIODevice::Text))
+            out.write(json.toUtf8());
+    });
+    connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
+    dlg.exec();
+}
+
+void AeroMainWindow::onSignUnsigned() {
+    if (!m_wallet) return;
+    if (m_wallet->isWatchOnly()) {
+        QMessageBox::information(this, tr("Sign unsigned transaction"),
+                                 tr("This wallet is watch-only (no keys). Open the wallet that owns "
+                                    "the address on an offline machine to sign."));
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Sign Unsigned Transaction"));
+    dlg.setMinimumWidth(560);
+    auto *v = new QVBoxLayout(&dlg);
+    v->addWidget(new QLabel(tr("Paste an unsigned transaction (JSON exported from a watch-only "
+                               "wallet). It is signed locally — no network is used."),
+                            &dlg));
+    auto *in = new QPlainTextEdit(&dlg);
+    in->setMinimumHeight(120);
+    v->addWidget(in);
+    auto *signBtn = new QPushButton(tr("Sign"), &dlg);
+    v->addWidget(signBtn);
+    v->addWidget(new QLabel(tr("Signed raw transaction (broadcast this on an online wallet):"), &dlg));
+    auto *out = new QPlainTextEdit(&dlg);
+    out->setReadOnly(true);
+    out->setMinimumHeight(90);
+    v->addWidget(out);
+    auto *row = new QHBoxLayout();
+    auto *copyBtn = new QPushButton(tr("Copy raw tx"), &dlg);
+    auto *closeBtn = new QPushButton(tr("Close"), &dlg);
+    row->addWidget(copyBtn);
+    row->addStretch();
+    row->addWidget(closeBtn);
+    v->addLayout(row);
+    connect(signBtn, &QPushButton::clicked, &dlg, [this, in, out]() {
+        const QString raw = m_wallet->signUnsigned(in->toPlainText().trimmed());
+        if (raw.isEmpty())
+            out->setPlainText(tr("Sign failed: %1").arg(m_wallet->errorString()));
+        else
+            out->setPlainText(raw);
+    });
+    connect(copyBtn, &QPushButton::clicked, &dlg, [out]() {
+        const QString s = out->toPlainText().trimmed();
+        if (s.startsWith(QLatin1String("0x")))
+            QApplication::clipboard()->setText(s);
+    });
+    connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
+    dlg.exec();
+}
+
 void AeroMainWindow::onTransactionSent(const PendingEthTx &tx, const QString &txHash) {
     Q_UNUSED(txHash);
     m_lastSent = tx; // carries the nonce it was broadcast at
@@ -3240,12 +3335,6 @@ QIcon AeroMainWindow::tokenIcon(const QString &symbol) const {
 
 void AeroMainWindow::onSendClicked() {
     if (!m_wallet) return;
-    if (m_wallet->isWatchOnly()) {
-        QMessageBox::information(this, tr("Watch-only wallet"),
-                                 tr("This is a watch-only wallet — it holds no private keys, so it "
-                                    "can track balances but cannot send."));
-        return;
-    }
     const QString to = sendUi.lineAddress->text();
     const QString amount = sendUi.lineAmount->text().trimmed();
     if (to.isEmpty() || amount.isEmpty()) {
@@ -3284,6 +3373,23 @@ void AeroMainWindow::onSendClicked() {
     }
 
     const QPair<QString, QString> fee = chosenFeeWei(); // empty = automatic
+
+    // Watch-only: don't sign/send — build an unsigned tx to sign on an offline wallet.
+    if (m_wallet->isWatchOnly()) {
+        PendingEthTx tx;
+        tx.fromIndex = static_cast<quint32>(fromIndex);
+        tx.to = to;
+        tx.token = currentTokenAddr();
+        tx.fee.maxFee = fee.first;
+        tx.fee.maxPriorityFee = fee.second;
+        if (tx.token.isEmpty())
+            tx.amountWei = Wallet::parseUnits(tokenAmount, 18);
+        else
+            tx.amountUnits = Wallet::parseUnits(tokenAmount, currentDecimals());
+        m_wallet->buildUnsigned(tx); // result via onUnsignedTxReady
+        return;
+    }
+
     m_wallet->createTransaction(static_cast<quint32>(fromIndex), to, tokenAmount, currentTokenAddr(),
                                 fee.first, fee.second, currentDecimals());
 }

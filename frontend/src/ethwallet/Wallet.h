@@ -221,6 +221,11 @@ public:
     // Broadcast an already-signed raw tx (0x RLP hex) over Tor; emits transactionCommitted().
     void broadcastRaw(const QString &rawHex);
 
+    // Air-gapped signing. buildUnsigned resolves nonce/gas/fees over the network and emits
+    // unsignedTxReady(json). signUnsigned signs that JSON locally (offline) and returns 0x raw hex.
+    void buildUnsigned(const PendingEthTx &tx);
+    QString signUnsigned(const QString &json);
+
     // Utility: convert human amount -> base units for `decimals`.
     static QString parseUnits(const QString &amount, quint8 decimals);
 
@@ -236,6 +241,8 @@ signals:
     // Emitted after a successful broadcast with the sent tx (including the nonce it used), so the UI
     // can offer speed-up/cancel on it.
     void transactionSent(const PendingEthTx &tx, const QString &txHash);
+    // Emitted when buildUnsigned() finishes: `json` is the unsigned tx (empty on error).
+    void unsignedTxReady(const QString &json, const QString &error);
     void historyRefreshed(const QVector<HistoryItem> &items);
     void fundedScanned(const QList<quint32> &indices);
     void tokenLiquidity(const QString &tokenAddress, double usd);

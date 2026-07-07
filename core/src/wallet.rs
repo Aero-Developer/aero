@@ -1092,6 +1092,128 @@ impl Wallet {
         Ok(SendResult { tx_hash, nonce: 0 })
     }
 
+    /// Build the fields of an UNSIGNED transaction (resolving nonce + gas + fees over the network),
+    /// for air-gapped signing. Returns JSON the offline signer consumes via [`sign_unsigned`].
+    /// `token` empty = native send (`amount_wei`), else ERC-20 transfer (`amount_units`).
+    pub async fn build_unsigned(
+        &self,
+        from_index: u32,
+        to: &str,
+        amount_wei: &str,
+        token: &str,
+        amount_units: &str,
+        fee: Option<(u128, u128)>,
+        nonce_override: Option<u64>,
+    ) -> Result<serde_json::Value> {
+        let provider = self.provider()?;
+        let from = parse_address(&self.address(from_index)?)?;
+        let (to_addr, value, data) = if token.is_empty() {
+            let v = U256::from_str(amount_wei)
+                .map_err(|_| CoreError::Amount("invalid wei amount".into()))?;
+            (parse_address(to)?, v, Bytes::new())
+        } else {
+            let amt = U256::from_str(amount_units)
+                .map_err(|_| CoreError::Amount("invalid token amount".into()))?;
+            let d = Bytes::from(erc20::encode_transfer(parse_address(to)?, amt));
+            (parse_address(token)?, U256::ZERO, d)
+        };
+        let nonce = match nonce_override {
+            Some(n) => n,
+            None => parse_hex_u64(&provider.get_transaction_count(&from.to_string()).await?)?,
+        };
+        let (max_fee, max_priority) = match fee {
+            Some(f) => f,
+            None => {
+                let s = self.suggest_fees().await?;
+                (
+                    u128::from_str(&s.max_fee).unwrap_or(0),
+                    u128::from_str(&s.max_priority_fee).unwrap_or(0),
+                )
+            }
+        };
+        let est = provider
+            .estimate_gas(serde_json::json!({
+                "from": from.to_string(), "to": to_addr.to_string(),
+                "value": format!("0x{:x}", value), "data": format!("0x{}", hex::encode(&data)),
+            }))
+            .await?;
+        let g = parse_hex_u64(&est)?;
+        let gas_limit = g + g / 4;
+        let chain_id = provider.chain_id();
+        Ok(serde_json::json!({
+            "chain_id": chain_id, "from_index": from_index, "nonce": nonce,
+            "to": to_addr.to_string(), "value": value.to_string(),
+            "data": format!("0x{}", hex::encode(&data)), "gas_limit": gas_limit,
+            "max_fee": max_fee.to_string(), "max_priority": max_priority.to_string(),
+            "legacy": chain_info(chain_id).legacy_gas,
+        }))
+    }
+
+    /// Sign an unsigned-tx JSON (from [`build_unsigned`]) with the local key and return the 0x raw
+    /// RLP. Pure signing — no network needed, so it runs on an offline machine.
+    pub async fn sign_unsigned(&self, json_str: &str) -> Result<String> {
+        let v: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| CoreError::Amount(format!("bad unsigned tx json: {e}")))?;
+        let from_index = v["from_index"].as_u64().unwrap_or(0) as u32;
+        let chain_id = v["chain_id"]
+            .as_u64()
+            .ok_or_else(|| CoreError::Amount("missing chain_id".into()))?;
+        let nonce = v["nonce"]
+            .as_u64()
+            .ok_or_else(|| CoreError::Amount("missing nonce".into()))?;
+        let to = parse_address(v["to"].as_str().unwrap_or_default())?;
+        let value = U256::from_str(v["value"].as_str().unwrap_or("0"))
+            .map_err(|_| CoreError::Amount("bad value".into()))?;
+        let data_hex = v["data"].as_str().unwrap_or("0x");
+        let data = Bytes::from(
+            hex::decode(data_hex.trim_start_matches("0x"))
+                .map_err(|_| CoreError::Amount("bad data hex".into()))?,
+        );
+        let gas_limit = v["gas_limit"]
+            .as_u64()
+            .ok_or_else(|| CoreError::Amount("missing gas_limit".into()))?;
+        let max_fee = u128::from_str(v["max_fee"].as_str().unwrap_or("0")).unwrap_or(0);
+        let max_priority = u128::from_str(v["max_priority"].as_str().unwrap_or("0")).unwrap_or(0);
+        let legacy = v["legacy"].as_bool().unwrap_or(false);
+
+        let raw = if legacy {
+            let mut tx = TxLegacy {
+                chain_id: Some(chain_id),
+                nonce,
+                gas_price: max_fee,
+                gas_limit,
+                to: TxKind::Call(to),
+                value,
+                input: data.clone(),
+            };
+            let sig = self
+                .sign_built_tx(from_index, chain_id, true, &mut tx, nonce, gas_limit, max_fee,
+                    max_priority, to, value, &data)
+                .await?;
+            let env: TxEnvelope = tx.into_signed(sig).into();
+            env.encoded_2718()
+        } else {
+            let mut tx = TxEip1559 {
+                chain_id,
+                nonce,
+                gas_limit,
+                max_fee_per_gas: max_fee,
+                max_priority_fee_per_gas: max_priority,
+                to: TxKind::Call(to),
+                value,
+                access_list: Default::default(),
+                input: data.clone(),
+            };
+            let sig = self
+                .sign_built_tx(from_index, chain_id, false, &mut tx, nonce, gas_limit, max_fee,
+                    max_priority, to, value, &data)
+                .await?;
+            let env: TxEnvelope = tx.into_signed(sig).into();
+            env.encoded_2718()
+        };
+        Ok(format!("0x{}", hex::encode(raw)))
+    }
+
     /// Cancel a pending transaction by replacing it with a 0-value self-send at the same `nonce`.
     /// The replacement must pay more gas than the stuck tx (the caller supplies a bumped `fee`), so
     /// the network prefers it; once it mines, the original is dropped. Returns the replacement hash.

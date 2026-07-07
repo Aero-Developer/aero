@@ -870,6 +870,59 @@ pub extern "C" fn aero_wallet_broadcast_raw(w: *mut Wallet, raw_hex: *const c_ch
     block_json(w, |w| RUNTIME.block_on(w.broadcast_raw(&raw)))
 }
 
+/// Build an UNSIGNED transaction (resolves nonce/gas/fees over the network) as JSON, for air-gapped
+/// signing. `token` empty = native (uses `amount_wei`), else ERC-20 transfer (`amount_units`).
+/// `nonce` = u64::MAX for automatic. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_build_unsigned(
+    w: *mut Wallet,
+    from_index: u32,
+    to: *const c_char,
+    amount_wei: *const c_char,
+    token: *const c_char,
+    amount_units: *const c_char,
+    max_fee_wei: *const c_char,
+    max_priority_wei: *const c_char,
+    nonce: u64,
+) -> *mut c_char {
+    let (Some(to), Some(amount_wei), Some(token), Some(amount_units)) = (
+        from_cstr(to),
+        from_cstr(amount_wei),
+        from_cstr(token),
+        from_cstr(amount_units),
+    ) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    let fee = parse_fee_override(max_fee_wei, max_priority_wei);
+    let nonce_ov = (nonce != u64::MAX).then_some(nonce);
+    block_json(w, |w| {
+        RUNTIME.block_on(w.build_unsigned(from_index, &to, &amount_wei, &token, &amount_units, fee, nonce_ov))
+    })
+}
+
+/// Sign an unsigned-tx JSON (from `aero_wallet_build_unsigned`) with the local key; returns the 0x
+/// raw RLP hex (no network needed — runs offline). Null on error. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_sign_unsigned(w: *mut Wallet, json: *const c_char) -> *mut c_char {
+    clear_error();
+    let Some(w) = (unsafe { w.as_ref() }) else {
+        set_error("null wallet");
+        return ptr::null_mut();
+    };
+    let Some(json) = from_cstr(json) else {
+        set_error("null json");
+        return ptr::null_mut();
+    };
+    match RUNTIME.block_on(w.sign_unsigned(&json)) {
+        Ok(s) => to_cstr(&s),
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
 /// Cancel a pending tx by broadcasting a 0-value self-send at `nonce` with a (bumped) fee. Returns
 /// JSON `SendResult`. Caller frees the string.
 #[no_mangle]
