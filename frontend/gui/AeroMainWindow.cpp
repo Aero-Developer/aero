@@ -2508,7 +2508,17 @@ void AeroMainWindow::onChangePassword() {
         QMessageBox::warning(this, tr("Change password"), tr("Passwords do not match."));
         return;
     }
-    // store() re-encrypts with the new password and retains it for future saves.
+    // An empty password still encrypts the file, but with a trivially-derivable key — warn before
+    // effectively removing the passphrase protection.
+    if (p1->text().isEmpty() &&
+        QMessageBox::warning(
+            this, tr("Change password"),
+            tr("An empty password offers no protection — anyone with the wallet file could open "
+               "it.\n\nContinue without a password?"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+        return;
+    // store() re-encrypts (fresh salt + nonce) with the new password and retains it for future
+    // saves. The write is atomic, so a crash mid-change can't corrupt or lose the wallet.
     if (m_wallet->store(m_wallet->walletPath(), p1->text()))
         QMessageBox::information(this, tr("Change password"), tr("Password updated."));
     else

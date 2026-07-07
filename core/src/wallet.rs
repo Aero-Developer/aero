@@ -1356,14 +1356,31 @@ impl Wallet {
 /// created with owner-only (0600) permissions so the encrypted wallet isn't world-readable.
 fn atomic_write(path: &str, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
     let target = std::path::Path::new(path);
     let dir = target.parent().unwrap_or_else(|| std::path::Path::new("."));
     if !dir.as_os_str().is_empty() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = target.with_extension("tmp");
+
+    // Unique temp name in the same directory. A per-process/per-call suffix means two concurrent
+    // saves (which only hold a shared read lock) can't clobber each other's temp file, and a stale
+    // temp left by a crash is never reused.
+    let base = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("wallet");
+    let tmp = dir.join(format!(
+        "{base}.{}.{}.tmp",
+        std::process::id(),
+        SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
 
     let mut opts = std::fs::OpenOptions::new();
+    // Unique temp name (pid+seq) makes collisions between live writers impossible; truncate cleanly
+    // reuses a stale temp left by a crashed prior run that happened to reuse this pid.
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
@@ -1376,13 +1393,29 @@ fn atomic_write(path: &str, bytes: &[u8]) -> Result<()> {
         f.flush()?;
         f.sync_all()?; // durability: ensure bytes hit disk before the rename
     }
-    // Atomic replace. On Windows, rename fails if the destination exists, so remove it first.
-    #[cfg(windows)]
-    {
-        let _ = std::fs::remove_file(target);
+
+    // Atomically replace the target. std::fs::rename overwrites an existing file on BOTH Unix and
+    // Windows (MoveFileExW | MOVEFILE_REPLACE_EXISTING), so there is no delete-then-rename window
+    // that could lose the wallet on a crash/power loss. On Windows a transient lock (AV/indexer)
+    // can make the replace fail, so retry briefly; on persistent failure the original is left
+    // intact and the temp is cleaned up.
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..5 {
+        match std::fs::rename(&tmp, target) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                #[cfg(windows)]
+                std::thread::sleep(std::time::Duration::from_millis(40 * (attempt + 1)));
+                #[cfg(not(windows))]
+                let _ = attempt;
+            }
+        }
     }
-    std::fs::rename(&tmp, target)?;
-    Ok(())
+    let _ = std::fs::remove_file(&tmp); // don't leave the temp behind on failure
+    Err(last_err
+        .map(CoreError::from)
+        .unwrap_or_else(|| CoreError::Keystore("atomic rename failed".into())))
 }
 
 /// Ensure `secrets.account_order` is populated. Older wallet files (and freshly-built secrets) have
@@ -1553,6 +1586,45 @@ mod tests {
         let reopened = Wallet::open(p, "filepw").unwrap();
         assert!(reopened.has_passphrase());
         assert_eq!(reopened.address(0).unwrap(), pass_addr);
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn change_password_reencrypts_over_existing_file() {
+        // Simulates the "change password" flow: save, then save AGAIN over the same file with a new
+        // password. The overwrite must be atomic/clean — the old password must stop working and the
+        // new one must open the identical wallet (no corruption, no key loss).
+        let phrase = "test test test test test test test test test test test junk";
+        let w = Wallet::restore(phrase).unwrap();
+        let addr = w.address(0).unwrap();
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("aero_chpw_{}.keys", std::process::id()));
+        let p = path.to_str().unwrap();
+
+        w.save(p, "oldpw").unwrap();
+        assert!(Wallet::open(p, "oldpw").is_ok());
+
+        // Re-encrypt over the existing file with a new password (this is what onChangePassword does).
+        w.save(p, "newpw").unwrap();
+
+        assert!(std::fs::metadata(p).is_ok(), "wallet file must still exist after re-encrypt");
+        assert!(Wallet::open(p, "oldpw").is_err(), "old password must no longer decrypt");
+        let reopened = Wallet::open(p, "newpw").unwrap();
+        assert_eq!(reopened.address(0).unwrap(), addr, "wallet must be intact after re-encrypt");
+
+        // No temp files should be left behind in the directory.
+        let dir = path.parent().unwrap();
+        let stem = path.file_name().unwrap().to_str().unwrap();
+        let leftover = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with(stem) && n.ends_with(".tmp")
+            });
+        assert!(!leftover, "no .tmp file should remain after a successful save");
         std::fs::remove_file(p).ok();
     }
 
