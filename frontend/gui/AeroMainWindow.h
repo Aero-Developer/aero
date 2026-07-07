@@ -56,6 +56,7 @@ private slots:
     void onSettings();
     void onChangePassword();
     void onShowSeed();
+    void onSignVerifyMessage(); // Tools -> Sign / Verify Message (EIP-191 personal_sign)
     void onFundedScanned(const QList<quint32> &indices);
     void onTokenLiquidity(const QString &tokenAddress, double usd);
     void onFiatRate(const QString &currency, double rate);

@@ -320,6 +320,31 @@ impl Wallet {
         Ok(format!("0x{}", hex::encode(signer.to_bytes())))
     }
 
+    /// Sign a UTF-8 message with EIP-191 (`personal_sign`) using account `index`.
+    /// Returns a 0x-prefixed 65-byte signature. Unavailable for hardware wallets here.
+    pub fn sign_message(&self, index: u32, message: &str) -> Result<String> {
+        let signer = self.local_signer(index)?;
+        let sig = signer
+            .sign_message_sync(message.as_bytes())
+            .map_err(|e| CoreError::Signing(format!("sign message: {e}")))?;
+        Ok(format!("0x{}", hex::encode(sig.as_bytes())))
+    }
+
+    /// Recover the address that produced an EIP-191 (`personal_sign`) signature over `message`.
+    /// Returns the recovered, checksummed address so the caller can compare it to who they expected.
+    /// This is a pure function (no keys involved) — hence `&self` isn't required.
+    pub fn verify_message(message: &str, signature: &str) -> Result<String> {
+        let hexs = signature.trim().trim_start_matches("0x").trim_start_matches("0X");
+        let bytes = hex::decode(hexs)
+            .map_err(|e| CoreError::Signing(format!("bad signature hex: {e}")))?;
+        let sig = alloy::primitives::Signature::try_from(bytes.as_slice())
+            .map_err(|e| CoreError::Signing(format!("bad signature: {e}")))?;
+        let addr = sig
+            .recover_address_from_msg(message.as_bytes())
+            .map_err(|e| CoreError::Signing(format!("could not recover signer: {e}")))?;
+        Ok(addr.to_checksum(None))
+    }
+
     /// Derive and append one more hardware account from the device; returns its unified index.
     pub async fn add_hardware_account(&mut self) -> Result<u32> {
         let ctx = match &self.keys {
@@ -1587,6 +1612,24 @@ mod tests {
         assert!(reopened.has_passphrase());
         assert_eq!(reopened.address(0).unwrap(), pass_addr);
         std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn sign_and_verify_message_roundtrip() {
+        let w = Wallet::restore("test test test test test test test test test test test junk").unwrap();
+        let addr = w.address(0).unwrap();
+        let sig = w.sign_message(0, "Hello Aero").unwrap();
+        assert!(sig.starts_with("0x") && sig.len() == 132, "expect 65-byte hex sig");
+        // The recovered signer must equal the signing account.
+        assert_eq!(
+            Wallet::verify_message("Hello Aero", &sig).unwrap().to_lowercase(),
+            addr.to_lowercase()
+        );
+        // A different message must NOT recover the same address.
+        assert_ne!(
+            Wallet::verify_message("Tampered", &sig).unwrap().to_lowercase(),
+            addr.to_lowercase()
+        );
     }
 
     #[test]

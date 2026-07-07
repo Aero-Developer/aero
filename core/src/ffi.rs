@@ -432,6 +432,53 @@ pub extern "C" fn aero_wallet_export_private_key(w: *mut Wallet, index: u32) -> 
     }
 }
 
+/// EIP-191 personal_sign of `message` (UTF-8) with account `index`. Returns 0x-prefixed 65-byte
+/// signature hex; null on error. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_sign_message(
+    w: *mut Wallet,
+    index: u32,
+    message: *const c_char,
+) -> *mut c_char {
+    clear_error();
+    let Some(w) = (unsafe { w.as_ref() }) else {
+        set_error("null wallet");
+        return ptr::null_mut();
+    };
+    let Some(message) = from_cstr(message) else {
+        set_error("null message");
+        return ptr::null_mut();
+    };
+    match w.sign_message(index, &message) {
+        Ok(sig) => to_cstr(&sig),
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Recover the signer address of an EIP-191 personal_sign `signature` over `message`. Returns the
+/// checksummed address hex; null on error (bad signature). Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_verify_message(
+    message: *const c_char,
+    signature: *const c_char,
+) -> *mut c_char {
+    clear_error();
+    let (Some(message), Some(signature)) = (from_cstr(message), from_cstr(signature)) else {
+        set_error("null message/signature");
+        return ptr::null_mut();
+    };
+    match Wallet::verify_message(&message, &signature) {
+        Ok(addr) => to_cstr(&addr),
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
 // ---------------- tokens ----------------
 
 /// Track an ERC20 token in the wallet's Tokens/Assets panel.

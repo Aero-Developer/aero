@@ -154,6 +154,21 @@ char *aero_wallet_export_private_key(AeroWallet *w,
                                      uint32_t index);
 
 /**
+ * EIP-191 personal_sign of `message` (UTF-8) with account `index`. Returns 0x-prefixed 65-byte
+ * signature hex; null on error. Caller frees the string.
+ */
+char *aero_wallet_sign_message(AeroWallet *w,
+                               uint32_t index,
+                               const char *message);
+
+/**
+ * Recover the signer address of an EIP-191 personal_sign `signature` over `message`. Returns the
+ * checksummed address hex; null on error (bad signature). Caller frees the string.
+ */
+char *aero_wallet_verify_message(const char *message,
+                                 const char *signature);
+
+/**
  * Track an ERC20 token in the wallet's Tokens/Assets panel.
  */
 int aero_wallet_add_token(AeroWallet *w,

@@ -565,13 +565,31 @@ void AeroMainWindow::setupTabs() {
     });
     connect(sendUi.lineAmount, &QLineEdit::textChanged, this, &AeroMainWindow::onAmountConversion);
     connect(m_fromCombo, &QComboBox::currentIndexChanged, this, &AeroMainWindow::updateAvailable);
-    // Max fills the amount field with the full available balance (in the selected asset).
+    // Max fills the amount field with the full available balance (in the selected asset). For the
+    // native coin we must reserve the gas cost (value + gasLimit*maxFee must fit the balance), or
+    // the send fails; ERC-20 sends pay gas separately, so their Max is the full token balance.
     connect(sendUi.btnMax, &QPushButton::clicked, this, [this]() {
         if (m_availAmount.isEmpty())
             return;
         if (m_amountUnit && m_amountUnit->isVisible())
             m_amountUnit->setCurrentIndex(0); // switch to the token unit, not USD
-        sendUi.lineAmount->setText(m_availAmount);
+        QString amount = m_availAmount;
+        if (currentTokenAddr().isEmpty()) {
+            const double avail = m_availAmount.toDouble();
+            const QPair<QString, QString> fee = chosenFeeWei(); // wei; empty == automatic
+            double maxFeeWei = !fee.first.isEmpty() ? fee.first.toDouble()
+                                                    : (m_feeBaseWei * 2.0 + m_feeTipWei);
+            if (maxFeeWei <= 0.0)
+                maxFeeWei = 2e9; // fees not loaded yet — assume a safe 2 gwei floor
+            // 21000 (plain transfer) + the core's 25% gas-limit headroom, plus a 5% cushion so
+            // rounding never pushes the send over the balance.
+            const double reserveEth = 21000.0 * 1.25 * maxFeeWei / 1e18 * 1.05;
+            double sendEth = avail - reserveEth;
+            if (sendEth < 0.0)
+                sendEth = 0.0;
+            amount = trimZeros(QString::number(sendEth, 'f', 9));
+        }
+        sendUi.lineAmount->setText(amount);
     });
 
     // Fee section: priority tiers + Custom, with a live estimate (fee + ETA) below.
@@ -1077,8 +1095,10 @@ void AeroMainWindow::setupMenu() {
     hide(ui.actionPlaceholderEnd);
     hide(ui.actionShow_Searchbar);
 
-    // --- Tools: all Monero-specific; hide the whole menu. ---
-    ui.menuTools->menuAction()->setVisible(false);
+    // --- Tools: drop the Monero-specific actions and expose Aero tools. ---
+    ui.menuTools->clear();
+    connect(ui.menuTools->addAction(tr("Sign / Verify Message…")), &QAction::triggered, this,
+            &AeroMainWindow::onSignVerifyMessage);
 
     // --- Help: keep About; the rest have no Aero targets. ---
     connect(ui.actionAbout, &QAction::triggered, this, [this]() {
@@ -2551,6 +2571,94 @@ void AeroMainWindow::onChangePassword() {
         QMessageBox::information(this, tr("Change password"), tr("Password updated."));
     else
         QMessageBox::warning(this, tr("Change password"), m_wallet->errorString());
+}
+
+void AeroMainWindow::onSignVerifyMessage() {
+    if (!m_wallet) return;
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Sign / Verify Message"));
+    dlg.setMinimumWidth(540);
+    auto *v = new QVBoxLayout(&dlg);
+
+    auto *form = new QFormLayout();
+    auto *accountCombo = new QComboBox(&dlg);
+    const quint32 n = m_wallet->numAccounts();
+    for (quint32 i = 0; i < n; ++i)
+        accountCombo->addItem(accountLabel(i));
+    if (static_cast<int>(m_account) < accountCombo->count())
+        accountCombo->setCurrentIndex(static_cast<int>(m_account));
+    form->addRow(tr("Account (for signing)"), accountCombo);
+    v->addLayout(form);
+
+    v->addWidget(new QLabel(tr("Message"), &dlg));
+    auto *msg = new QPlainTextEdit(&dlg);
+    msg->setMinimumHeight(90);
+    v->addWidget(msg);
+
+    v->addWidget(new QLabel(tr("Signature"), &dlg));
+    auto *sig = new QLineEdit(&dlg);
+    sig->setPlaceholderText(tr("0x… — produced by Sign, or paste a signature to Verify"));
+    v->addWidget(sig);
+
+    auto *result = new QLabel(&dlg);
+    result->setWordWrap(true);
+    result->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    v->addWidget(result);
+
+    auto *row = new QHBoxLayout();
+    auto *signBtn = new QPushButton(tr("Sign"), &dlg);
+    auto *verifyBtn = new QPushButton(tr("Verify"), &dlg);
+    auto *copyBtn = new QPushButton(tr("Copy signature"), &dlg);
+    auto *closeBtn = new QPushButton(tr("Close"), &dlg);
+    row->addWidget(signBtn);
+    row->addWidget(verifyBtn);
+    row->addWidget(copyBtn);
+    row->addStretch();
+    row->addWidget(closeBtn);
+    v->addLayout(row);
+
+    connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
+    connect(copyBtn, &QPushButton::clicked, &dlg, [sig]() {
+        const QString s = sig->text().trimmed();
+        if (!s.isEmpty())
+            QApplication::clipboard()->setText(s);
+    });
+    connect(signBtn, &QPushButton::clicked, &dlg, [this, accountCombo, msg, sig, result]() {
+        if (m_wallet->isHardware()) {
+            result->setText(tr("<span style='color:#e0b040;'>Message signing on the device isn't "
+                               "supported here yet.</span>"));
+            return;
+        }
+        const quint32 idx = static_cast<quint32>(qMax(0, accountCombo->currentIndex()));
+        const QString s = m_wallet->signMessage(idx, msg->toPlainText());
+        if (s.isEmpty()) {
+            result->setText(tr("<span style='color:#e74c3c;'>Sign failed: %1</span>")
+                                .arg(m_wallet->errorString().toHtmlEscaped()));
+            return;
+        }
+        sig->setText(s);
+        result->setText(tr("<span style='color:#27ae60;'>Signed with %1</span>")
+                            .arg(m_wallet->address(idx)));
+    });
+    connect(verifyBtn, &QPushButton::clicked, &dlg, [this, msg, sig, result]() {
+        const QString recovered = m_wallet->verifyMessage(msg->toPlainText(), sig->text().trimmed());
+        if (recovered.isEmpty()) {
+            result->setText(tr("<span style='color:#e74c3c;'>Invalid signature — could not "
+                               "recover a signer.</span>"));
+            return;
+        }
+        bool mine = false;
+        const quint32 n2 = m_wallet->numAccounts();
+        for (quint32 i = 0; i < n2; ++i)
+            if (m_wallet->address(i).compare(recovered, Qt::CaseInsensitive) == 0) {
+                mine = true;
+                break;
+            }
+        result->setText(tr("<span style='color:#27ae60;'>Signed by %1%2</span>")
+                            .arg(recovered, mine ? tr("  (one of your accounts)") : QString()));
+    });
+
+    dlg.exec();
 }
 
 void AeroMainWindow::onShowSeed() {

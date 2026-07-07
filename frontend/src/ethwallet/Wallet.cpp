@@ -87,6 +87,27 @@ QString Wallet::exportPrivateKey(quint32 index) const {
     return takeString(aero_wallet_export_private_key(m_core, index));
 }
 
+QString Wallet::signMessage(quint32 index, const QString &message) {
+    QReadLocker lock(&m_coreLock); // reads the signer (&self)
+    char *j = aero_wallet_sign_message(m_core, index, message.toUtf8().constData());
+    if (!j) {
+        m_errorString = takeLastError();
+        return QString();
+    }
+    return takeString(j);
+}
+
+QString Wallet::verifyMessage(const QString &message, const QString &signature) {
+    // Pure recovery — doesn't touch the core wallet, so no lock needed.
+    char *j = aero_wallet_verify_message(message.toUtf8().constData(),
+                                         signature.toUtf8().constData());
+    if (!j) {
+        m_errorString = takeLastError();
+        return QString();
+    }
+    return takeString(j);
+}
+
 bool Wallet::isHardware() const {
     QReadLocker lock(&m_coreLock);
     return aero_wallet_is_hardware(m_core) != 0;

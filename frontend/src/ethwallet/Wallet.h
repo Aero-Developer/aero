@@ -107,6 +107,13 @@ public:
     QString exportPrivateKey(quint32 index) const;
     QString getSeed() const;
 
+    // ##### Message signing (EIP-191 personal_sign) #####
+    // Sign a UTF-8 message with account `index`; returns 0x 65-byte sig, or "" on error.
+    QString signMessage(quint32 index, const QString &message);
+    // Recover the signer address from a personal_sign signature; returns checksummed address, or ""
+    // on error (bad signature). Pure function — no keys involved.
+    QString verifyMessage(const QString &message, const QString &signature);
+
     // ##### Persistence #####
     bool store(const QString &path, const QString &password);
     void setWalletPath(const QString &path) { m_path = path; }
