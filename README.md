@@ -166,8 +166,15 @@ Tor-only policy.
 - [x] Multichain (8 EVM networks)
 - [x] BIP39 passphrase + multi-derivation-path recovery
 - [x] Hardware wallets (Ledger / Trezor)
-- [ ] Third-party security audit
-- [ ] macOS / Linux release builds
+- [x] Watch-only wallets, message sign/verify, offline (air-gapped) signing, raw-tx broadcast
+- [x] Speed-up / cancel pending transactions, pay-to-many, EIP-681 URIs, image QR scan
+- [x] Light/dark theme, historical fiat value in history
+- [ ] Third-party security audit (see `SECURITY.md`)
+- [ ] macOS / Linux release builds (CI in `ci/build.yml` — move to `.github/workflows/` to enable)
+- [ ] **Multisig (planned milestone)** — via Gnosis **Safe** smart accounts: connect/deploy a Safe,
+  propose/confirm transactions, and collect co-signer signatures off-chain. This is a large,
+  standalone feature (Safe contracts + off-chain signature aggregation) and is intentionally out of
+  scope for the current single-sig releases.
 
 ## Disclaimer
 
