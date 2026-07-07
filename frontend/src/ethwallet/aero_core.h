@@ -399,6 +399,15 @@ char *aero_wallet_scan_funded(AeroWallet *w,
                               uint32_t gap_limit);
 
 /**
+ * Scan for funded addresses across MULTIPLE chains. `configs_json` is a JSON array of
+ * `{"chain_id":<u64>,"endpoints":["..."],"socks":"socks5h://..."}` (blank socks = direct).
+ * Registers funded addresses as accounts and returns their unified indices as a JSON array.
+ */
+char *aero_wallet_scan_funded_multi(AeroWallet *w,
+                                    const char *configs_json,
+                                    uint32_t gap_limit);
+
+/**
  * Owned NFT collections (ERC-721 + ERC-1155) for an account as a JSON array. Caller frees.
  */
 char *aero_wallet_account_nfts(AeroWallet *w,

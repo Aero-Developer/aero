@@ -1034,6 +1034,61 @@ pub extern "C" fn aero_wallet_scan_funded(w: *mut Wallet, gap_limit: u32) -> *mu
     }
 }
 
+/// Scan for funded addresses across MULTIPLE chains. `configs_json` is a JSON array of
+/// `{"chain_id":<u64>,"endpoints":["..."],"socks":"socks5h://..."}` (blank socks = direct).
+/// Registers funded addresses as accounts and returns their unified indices as a JSON array.
+#[no_mangle]
+pub extern "C" fn aero_wallet_scan_funded_multi(
+    w: *mut Wallet,
+    configs_json: *const c_char,
+    gap_limit: u32,
+) -> *mut c_char {
+    clear_error();
+    let Some(w) = (unsafe { w.as_mut() }) else {
+        set_error("null wallet");
+        return ptr::null_mut();
+    };
+    let Some(js) = from_cstr(configs_json) else {
+        set_error("null configs");
+        return ptr::null_mut();
+    };
+    #[derive(serde::Deserialize)]
+    struct ScanChain {
+        chain_id: u64,
+        endpoints: Vec<String>,
+        #[serde(default)]
+        socks: String,
+    }
+    let chains: Vec<ScanChain> = serde_json::from_str(&js).unwrap_or_default();
+    let configs: Vec<ProviderConfig> = chains
+        .into_iter()
+        .map(|c| {
+            let socks = c.socks.trim().to_string();
+            let direct = socks.is_empty();
+            ProviderConfig {
+                chain_id: c.chain_id,
+                endpoints: c.endpoints,
+                socks_proxy: if direct { None } else { Some(socks) },
+                allow_clearnet: direct,
+                timeout_secs: 30, // fail fast on an unreachable chain
+            }
+        })
+        .collect();
+    match RUNTIME.block_on(w.scan_funded_all_chains(configs, gap_limit)) {
+        Ok(v) => match serde_json::to_string(&v) {
+            Ok(s) => to_cstr(&s),
+            Err(e) => {
+                set_error(e.to_string());
+                ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
 /// Owned NFT collections (ERC-721 + ERC-1155) for an account as a JSON array. Caller frees.
 #[no_mangle]
 pub extern "C" fn aero_wallet_account_nfts(w: *mut Wallet, index: u32) -> *mut c_char {

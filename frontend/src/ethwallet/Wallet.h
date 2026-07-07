@@ -158,8 +158,11 @@ public:
     // Async: merged history across accounts [0, numAccounts); emits historyRefreshed() once.
     void refreshHistoryAll(quint32 numAccounts);
 
-    // Async: gap-limit scan of HD addresses; emits fundedScanned() with the funded indices.
+    // Async: gap-limit scan of HD addresses (current chain); emits fundedScanned().
     void scanFunded(quint32 gapLimit = 20);
+    // Async: gap-limit scan across MULTIPLE chains. `configsJson` is a JSON array of
+    // {"chain_id","endpoints":[...],"socks"}. Finds addresses funded on any chain. Emits fundedScanned().
+    void scanFundedMulti(const QString &configsJson, quint32 gapLimit = 20);
 
     // Async: query a token's deepest DEX pool liquidity (USD) via DexScreener over Tor; emits
     // tokenLiquidity(). Used to auto-trust unknown-but-liquid tokens in History.

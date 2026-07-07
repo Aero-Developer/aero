@@ -526,11 +526,10 @@ void AeroMainWindow::setupTabs() {
             if (m_addressModel->rowCount() > 0)
                 selectAddressRow(m_addressModel->accountAt(0));
         });
-        connect(menu->addAction(tr("Rescan for funded addresses")), &QAction::triggered, this,
-                [this]() {
-                    if (!m_wallet) return;
-                    setConnectionState(2, tr("Scanning for funded addresses\u2026"));
-                    m_wallet->scanFunded(20);
+        connect(menu->addAction(tr("Rescan for funded addresses (all chains)")), &QAction::triggered,
+                this, [this]() {
+                    if (m_wallet)
+                        m_wallet->scanFundedMulti(allChainsScanConfig(), 20); // silent, cross-chain
                 });
         recvUi.toolBtn_options->setMenu(menu);
         recvUi.toolBtn_options->setPopupMode(QToolButton::InstantPopup);
@@ -1574,6 +1573,23 @@ QString AeroMainWindow::socksFor(quint64 chainId) const {
     return m_tor ? m_tor->socksProxy() : kDefaultSocks;
 }
 
+// Build the JSON config (endpoints + socks per chain) for a cross-chain funded-address scan, using
+// each chain's custom node if set, else its bundled endpoints over the current Tor proxy.
+QString AeroMainWindow::allChainsScanConfig() const {
+    QJsonArray arr;
+    for (const ChainDef &c : chainDefs()) {
+        QJsonObject o;
+        o[QStringLiteral("chain_id")] = static_cast<double>(c.id);
+        QJsonArray eps;
+        for (const QString &e : endpointsFor(c.id))
+            eps.append(e);
+        o[QStringLiteral("endpoints")] = eps;
+        o[QStringLiteral("socks")] = socksFor(c.id);
+        arr.append(o);
+    }
+    return QString::fromUtf8(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
 // (Re)connect the active chain using the resolved node settings. A custom node with a blank proxy
 // connects directly (for a local/own node); otherwise we go over Tor.
 void AeroMainWindow::connectCurrentChain() {
@@ -1683,11 +1699,11 @@ void AeroMainWindow::onProviderConnected(int mode, const QString &message) {
             m_wallet->refreshFiatRate(m_fiatCurrency); // USD->fiat rate for display
         refreshNfts();
         // First time we can reach the chain: if we've never scanned this wallet for funded
-        // addresses, do it now (finds addresses with a balance across the seed).
+        // addresses, do it now — silently, across all chains (an address funded on any chain is
+        // discovered even though we're connected to one).
         if (!m_fundedScanned && !m_fundedScanTried) {
             m_fundedScanTried = true;
-            setConnectionState(mode, tr("Scanning for funded addresses\u2026"));
-            m_wallet->scanFunded(20);
+            m_wallet->scanFundedMulti(allChainsScanConfig(), 20);
         }
     }
 }

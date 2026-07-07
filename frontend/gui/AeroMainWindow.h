@@ -169,6 +169,7 @@ private:
     // (registry RPCs over the running Tor proxy) are used. socksFor("") == direct/own-node.
     QStringList endpointsFor(quint64 chainId) const;
     QString socksFor(quint64 chainId) const;
+    QString allChainsScanConfig() const; // JSON of every chain's endpoints+socks, for cross-chain scan
     void connectCurrentChain(); // (re)connect the active chain using the resolved node settings
 
     QLabel *m_balanceLabel = nullptr;

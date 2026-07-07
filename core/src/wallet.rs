@@ -766,6 +766,36 @@ impl Wallet {
         Ok(out)
     }
 
+    /// Scan for funded addresses across MULTIPLE chains. EVM chains share the same addresses, so an
+    /// address funded on any chain should be discovered on restore. Runs the derivation-scheme gap
+    /// scan against each provider config in turn (skipping unreachable ones), accumulating funded
+    /// accounts, then restores the original (UI-selected) provider.
+    pub async fn scan_funded_all_chains(
+        &mut self,
+        configs: Vec<ProviderConfig>,
+        gap_limit: u32,
+    ) -> Result<Vec<u32>> {
+        if matches!(self.keys, KeySource::Hardware(_) | KeySource::WatchOnly) {
+            return Ok(Vec::new());
+        }
+        let original = self.provider_cfg.clone();
+        let mut found: Vec<u32> = Vec::new();
+        for cfg in configs {
+            if cfg.endpoints.is_empty() || self.set_provider(cfg).is_err() {
+                continue;
+            }
+            if let Ok(mut v) = self.scan_funded(gap_limit).await {
+                found.append(&mut v); // one unreachable chain shouldn't abort the whole scan
+            }
+        }
+        if !original.endpoints.is_empty() {
+            let _ = self.set_provider(original); // back to the chain the UI is showing
+        }
+        found.sort_unstable();
+        found.dedup();
+        Ok(found)
+    }
+
     /// ETH/USD price read on-chain from the Chainlink mainnet aggregator via `eth_call`
     /// (over the same Tor RPC) — no third-party price API. Returns USD per 1 ETH.
     /// USD price of the connected chain's native coin. On Ethereum mainnet this uses the trustless

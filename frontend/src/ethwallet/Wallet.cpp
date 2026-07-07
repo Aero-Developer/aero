@@ -435,9 +435,26 @@ void Wallet::refreshHistoryAll(quint32 numAccounts) {
 
 void Wallet::scanFunded(quint32 gapLimit) {
     QtConcurrent::run(&m_netPool, [this, gapLimit]() {
-        QReadLocker lock(&m_coreLock);
+        QWriteLocker lock(&m_coreLock); // scan_funded mutates account_order (&mut)
         QList<quint32> indices;
         char *j = aero_wallet_scan_funded(m_core, gapLimit);
+        if (j) {
+            const QJsonArray arr = QJsonDocument::fromJson(takeString(j).toUtf8()).array();
+            for (const QJsonValue &v : arr)
+                indices.append(static_cast<quint32>(v.toDouble()));
+        }
+        QMetaObject::invokeMethod(this, [this, indices]() { emit fundedScanned(indices); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::scanFundedMulti(const QString &configsJson, quint32 gapLimit) {
+    QtConcurrent::run(&m_netPool, [this, configsJson, gapLimit]() {
+        // Exclusive: the multi-chain scan mutates account_order AND swaps the provider per chain,
+        // so no reader may run concurrently. Held for the whole (one-time) scan.
+        QWriteLocker lock(&m_coreLock);
+        QList<quint32> indices;
+        char *j = aero_wallet_scan_funded_multi(m_core, configsJson.toUtf8().constData(), gapLimit);
         if (j) {
             const QJsonArray arr = QJsonDocument::fromJson(takeString(j).toUtf8()).array();
             for (const QJsonValue &v : arr)
