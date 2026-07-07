@@ -1413,6 +1413,14 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
         }
     }
     connect(m_wallet, &Wallet::unsignedTxReady, this, &AeroMainWindow::onUnsignedTxReady);
+    // Event-driven history: after a batched balance refresh, only re-pull the (heavy) history if a
+    // balance actually changed. This keeps steady-state bandwidth to the cheap balance batch.
+    connect(m_wallet, &Wallet::allBalancesRefreshed, this, [this]() {
+        if (m_balancesChanged) {
+            m_balancesChanged = false;
+            refreshHistoryView();
+        }
+    });
 
     // Track the common mainnet tokens by default so their balances and logos show up.
     if (m_wallet->tokens().isEmpty()) {
@@ -1571,6 +1579,13 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
         m_wallet->refreshMarketPrices();
     });
     m_refreshTimer->start();
+
+    // Fees are only polled per-block while the Send tab is open (see onBlockNumber), so refresh
+    // them once when the user switches to Send to make sure the estimate is current.
+    connect(ui.tabWidget, &QTabWidget::currentChanged, this, [this](int) {
+        if (m_wallet && ui.tabWidget->currentWidget() == ui.tabSend)
+            m_wallet->refreshFees();
+    });
 }
 
 void AeroMainWindow::onBlockNumber(quint64 block) {
@@ -1580,11 +1595,12 @@ void AeroMainWindow::onBlockNumber(quint64 block) {
     m_lastBlock = block;
     if (firstSeen)
         return; // baseline; the connect handler already did the initial refresh
-    // A new block landed — refresh balances + history so incoming/outgoing txs surface at once,
-    // and refresh the fee suggestion (base fee changes each block). Balances are one batched call.
+    // A new block landed. Do only the cheap batched balance fetch; history is re-pulled (via
+    // allBalancesRefreshed) only if a balance actually changed. Refresh the fee suggestion just
+    // when the Send tab is open (it's where the estimate is shown), to avoid a call every block.
     refreshAllBalances();
-    refreshHistoryView();
-    m_wallet->refreshFees();
+    if (ui.tabWidget->currentWidget() == ui.tabSend)
+        m_wallet->refreshFees();
 }
 
 // RPC endpoints for `chainId`: a user-saved custom node (Settings -> Node) wins over the bundled
@@ -1953,6 +1969,9 @@ void AeroMainWindow::onAvailableBalance(quint32 index, const QString &token,
         m_tokenRawByKey.insert(key, newBal);
         recomputeHomeTotal();
         updateUsed(index);
+        // Any change (incoming or outgoing) means a new tx touched this address -> refresh history.
+        if (oldBal >= 0.0 && qAbs(newBal - oldBal) > 1e-9)
+            m_balancesChanged = true;
         if (oldBal >= 0.0 && newBal > oldBal + 1e-9)
             notify(tr("Payment received"),
                    tr("+%1 %2 to Account #%3")
@@ -2036,6 +2055,9 @@ void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, c
     m_ethRawByAccount.insert(index, newBal); // raw, for the combined total
     recomputeHomeTotal();
     updateUsed(index);
+    // Any change (incoming or outgoing) means a new tx touched this address -> refresh history.
+    if (oldBal >= 0.0 && qAbs(newBal - oldBal) > 1e-12)
+        m_balancesChanged = true;
     // A balance increase means an incoming payment (our own sends decrease it).
     if (oldBal >= 0.0 && newBal > oldBal + 1e-12)
         notify(tr("Payment received"),

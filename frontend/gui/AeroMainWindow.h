@@ -196,6 +196,9 @@ private:
     QToolButton *m_networkButton = nullptr; // status-bar network selector
     QMessageBox *m_deviceDialog = nullptr;  // "confirm on your device" prompt during hardware signing
     bool m_parsingUri = false; // guard against re-entrancy while rewriting the Pay-to field
+    // Set when a batched balance refresh sees an actual change vs the cached value; drives an
+    // event-driven history refresh (so we don't re-pull the full history on every block).
+    bool m_balancesChanged = false;
     // Last broadcast tx this session, for Tools -> Speed Up / Cancel (replacement reuses its nonce).
     PendingEthTx m_lastSent;
     bool m_hasPending = false;
