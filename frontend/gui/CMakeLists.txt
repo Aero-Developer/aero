@@ -2,7 +2,7 @@
 # Aero GUI — a Qt6 Widgets app that reuses Feather's actual .ui layouts + stylesheet, wired to
 # the Rust `aero_core` backend (via the ethwallet C++ shim).
 cmake_minimum_required(VERSION 3.18)
-project(aero_gui LANGUAGES CXX)
+project(aero_gui LANGUAGES CXX C) # C is for the vendored quirc QR decoder
 
 # Compile the Windows resource (.rc) that gives the executable its icon.
 if(WIN32)
@@ -40,7 +40,6 @@ set(ETHWALLET_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../src/ethwallet)
 
 add_executable(aero_gui WIN32
     main.cpp
-    appicon.rc  # embeds the .ico so the .exe itself shows the Aero logo (Windows)
     AeroMainWindow.cpp
     AeroMainWindow.h
     TorManager.cpp
@@ -49,6 +48,11 @@ add_executable(aero_gui WIN32
     WalletWizard.h
     qrcodegen.cpp
     qrcodegen.hpp
+    # Vendored quirc QR decoder (image-based Scan). MIT.
+    quirc/quirc.c
+    quirc/decode.c
+    quirc/identify.c
+    quirc/version_db.c
 
     # promoted-widget stand-ins + InfoFrame
     components.h
@@ -91,6 +95,11 @@ target_include_directories(aero_gui PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src   # so "ethwallet/Wallet.h" resolves
     ${ETHWALLET_DIR}
 )
+
+# Embed the .ico so the .exe itself shows the Aero logo (Windows only; .rc needs the RC compiler).
+if(WIN32)
+    target_sources(aero_gui PRIVATE appicon.rc)
+endif()
 
 target_link_libraries(aero_gui PRIVATE
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Network

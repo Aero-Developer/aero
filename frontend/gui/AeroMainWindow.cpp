@@ -63,8 +63,45 @@
 
 #include "qrcodegen.hpp"
 
+#include <cstring>
+extern "C" {
+#include "quirc/quirc.h"
+}
+
 // Defined in main.cpp: applies the persisted dark/light theme app-wide.
 void aeroApplyTheme();
+
+// Decode the first QR code found in an image (via the vendored quirc). Returns its text, or "".
+static QString decodeQrImage(const QImage &in) {
+    if (in.isNull())
+        return QString();
+    const QImage img = in.convertToFormat(QImage::Format_Grayscale8);
+    struct quirc *q = quirc_new();
+    if (!q)
+        return QString();
+    QString out;
+    if (quirc_resize(q, img.width(), img.height()) >= 0) {
+        int w = 0, h = 0;
+        uint8_t *buf = quirc_begin(q, &w, &h);
+        for (int y = 0; y < h; ++y)
+            std::memcpy(buf + static_cast<size_t>(y) * w, img.constScanLine(y),
+                        static_cast<size_t>(w));
+        quirc_end(q);
+        const int n = quirc_count(q);
+        for (int i = 0; i < n; ++i) {
+            struct quirc_code code;
+            struct quirc_data data;
+            quirc_extract(q, i, &code);
+            if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
+                out = QString::fromUtf8(reinterpret_cast<const char *>(data.payload),
+                                        static_cast<int>(data.payload_len));
+                break;
+            }
+        }
+    }
+    quirc_destroy(q);
+    return out;
+}
 
 namespace {
 const quint64 kChainId = 1;
@@ -527,7 +564,23 @@ void AeroMainWindow::setupTabs() {
     // just type the amount in that asset.
     sendUi.comboCurrencySelection->hide();
     // Hide Monero/OpenAlias leftovers that were never wired for Ethereum.
-    sendUi.btnScan->hide();                    // QR scanner (not implemented)
+    // Scan a QR code from an image file into the Pay-to field (which then auto-parses an
+    // ethereum: URI or a plain address). Webcam scanning would need Qt Multimedia in the build.
+    sendUi.btnScan->setToolTip(tr("Scan a QR code from an image file"));
+    connect(sendUi.btnScan, &QAbstractButton::clicked, this, [this]() {
+        const QString f = QFileDialog::getOpenFileName(
+            this, tr("Scan QR from image"), QString(),
+            tr("Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp)"));
+        if (f.isEmpty())
+            return;
+        const QString text = decodeQrImage(QImage(f));
+        if (text.trimmed().isEmpty()) {
+            QMessageBox::warning(this, tr("Scan QR"), tr("No QR code found in that image."));
+            return;
+        }
+        sendUi.lineAddress->setPlainText(text.trimmed()); // auto-parses ethereum:/address
+        ui.tabWidget->setCurrentWidget(ui.tabSend);
+    });
     sendUi.btn_openAlias->hide();              // OpenAlias resolver (Monero)
     sendUi.check_subtractFeeFromAmount->hide();// unused
     sendUi.label_Description->hide();          // local-only description isn't stored anywhere
