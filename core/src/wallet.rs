@@ -672,19 +672,81 @@ impl Wallet {
     /// back to CoinGecko over Tor, keyed by the chain's native coin id.
     pub async fn native_usd_price(&self) -> Result<f64> {
         let info = chain_info(self.provider()?.chain_id());
+
+        // Ethereum mainnet: prefer the trustless on-chain Chainlink feed.
         if info.chain_id == 1 {
-            return self.eth_usd_price().await; // on-chain, trustless
+            if let Ok(p) = self.eth_usd_price().await {
+                if p > 0.0 {
+                    return Ok(p);
+                }
+            }
+            // else fall through to the market sources (feed RPC hiccup shouldn't blank the price)
         }
-        let url = format!(
-            "https://api.coingecko.com/api/v3/simple/price?ids={}&vs_currencies=usd",
-            info.coingecko_id
+
+        // Gnosis' native coin (xDAI) is a DAI-pegged stablecoin with no spot market — it's ~$1.
+        if info.native_symbol.eq_ignore_ascii_case("XDAI")
+            || info.native_symbol.eq_ignore_ascii_case("DAI")
+        {
+            return Ok(1.0);
+        }
+
+        match self
+            .market_native_price(info.native_symbol, info.coingecko_id)
+            .await
+        {
+            Some(p) => Ok(p),
+            None => Err(CoreError::rpc("no native price")),
+        }
+    }
+
+    /// Best-effort USD spot price for a native coin from keyless, Tor-friendly public APIs.
+    /// CoinGecko is unreliable over shared Tor exit IPs (empty/429 responses), so we try Coinbase
+    /// first (covers ETH/POL/BNB/AVAX and rarely rate-limits), then Kraken, then CoinGecko. Returns
+    /// `None` only if every source fails.
+    async fn market_native_price(&self, symbol: &str, coingecko_id: &str) -> Option<f64> {
+        let provider = self.provider().ok()?;
+        let sym = symbol.to_uppercase();
+
+        // 1) Coinbase spot price.
+        let cb = format!("https://api.coinbase.com/v2/prices/{sym}-USD/spot");
+        if let Ok(v) = provider.http_get_json(&cb).await {
+            if let Some(p) = v["data"]["amount"].as_str().and_then(|s| s.parse::<f64>().ok()) {
+                if p > 0.0 {
+                    return Some(p);
+                }
+            }
+        }
+
+        // 2) Kraken ticker. The result key can differ from the requested pair (e.g. ETHUSD ->
+        // XETHZUSD), so just read the single entry's last-trade price.
+        let kr = format!("https://api.kraken.com/0/public/Ticker?pair={sym}USD");
+        if let Ok(v) = provider.http_get_json(&kr).await {
+            if let Some(node) = v
+                .get("result")
+                .and_then(|r| r.as_object())
+                .and_then(|m| m.values().next())
+            {
+                if let Some(p) = node["c"][0].as_str().and_then(|s| s.parse::<f64>().ok()) {
+                    if p > 0.0 {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+
+        // 3) CoinGecko — last resort (often empty over Tor, but free when it works).
+        let cg = format!(
+            "https://api.coingecko.com/api/v3/simple/price?ids={coingecko_id}&vs_currencies=usd"
         );
-        let v = self.provider()?.http_get_json(&url).await?;
-        let price = v[info.coingecko_id]["usd"].as_f64().unwrap_or(0.0);
-        if price <= 0.0 {
-            return Err(CoreError::rpc("no native price"));
+        if let Ok(v) = provider.http_get_json(&cg).await {
+            if let Some(p) = v[coingecko_id]["usd"].as_f64() {
+                if p > 0.0 {
+                    return Some(p);
+                }
+            }
         }
-        Ok(price)
+
+        None
     }
 
     pub async fn eth_usd_price(&self) -> Result<f64> {

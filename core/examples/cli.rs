@@ -72,6 +72,22 @@ fn main() {
             let v = rt.block_on(w.all_balances(num)).unwrap();
             println!("{}", serde_json::to_string_pretty(&v).unwrap());
         }
+        "nativeprice" => {
+            let chain_id: u64 = args[1].parse().unwrap();
+            let rpc = args[2].clone();
+            let socks = args.get(3).cloned();
+            let mut w = Wallet::create_new(WordCount::Words12).unwrap();
+            w.set_provider(ProviderConfig {
+                chain_id,
+                endpoints: vec![rpc],
+                socks_proxy: socks,
+                allow_clearnet: false,
+                timeout_secs: 60,
+            })
+            .unwrap();
+            let p = rt.block_on(w.native_usd_price()).unwrap();
+            println!("native price = {p}");
+        }
         "fees" => {
             let chain_id: u64 = args[1].parse().unwrap();
             let rpc = args[2].clone();
