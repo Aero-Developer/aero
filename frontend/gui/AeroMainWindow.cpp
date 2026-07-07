@@ -63,6 +63,9 @@
 
 #include "qrcodegen.hpp"
 
+// Defined in main.cpp: applies the persisted dark/light theme app-wide.
+void aeroApplyTheme();
+
 namespace {
 const quint64 kChainId = 1;
 const QStringList kDefaultEndpoints = {
@@ -2262,6 +2265,17 @@ void AeroMainWindow::onSettings() {
     nftHint->setStyleSheet(QStringLiteral("color:#8a8a8a; font-size:11px;"));
     appForm->addRow(nftHint);
 
+    auto *themeCombo = new QComboBox(appTab);
+    themeCombo->addItem(tr("Dark"), QStringLiteral("dark"));
+    themeCombo->addItem(tr("Light"), QStringLiteral("light"));
+    {
+        const QString cur = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
+                                .value(QStringLiteral("appearance/theme"), QStringLiteral("dark"))
+                                .toString();
+        themeCombo->setCurrentIndex(cur == QLatin1String("light") ? 1 : 0);
+    }
+    appForm->addRow(tr("Theme"), themeCombo);
+
     auto *fiatCombo = new QComboBox(appTab);
     fiatCombo->addItems({QStringLiteral("USD"), QStringLiteral("EUR"), QStringLiteral("GBP"),
                          QStringLiteral("JPY"), QStringLiteral("CNY"), QStringLiteral("CAD"),
@@ -2337,6 +2351,14 @@ void AeroMainWindow::onSettings() {
     }
     if (nftTabChk->isChecked() != m_nftEnabled)
         setNftTabEnabled(nftTabChk->isChecked());
+    {
+        const QString theme = themeCombo->currentData().toString();
+        QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+        if (s.value(QStringLiteral("appearance/theme"), QStringLiteral("dark")).toString() != theme) {
+            s.setValue(QStringLiteral("appearance/theme"), theme);
+            aeroApplyTheme(); // switch dark/light live
+        }
+    }
     if (fiatCombo->currentText().toUpper() != m_fiatCurrency) {
         m_fiatCurrency = fiatCombo->currentText().toUpper();
         m_fiatSymbol = fiatSymbolFor(m_fiatCurrency);

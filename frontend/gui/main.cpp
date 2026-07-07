@@ -22,12 +22,19 @@
 #include "components.h"
 #include "ethwallet/WalletManager.h"
 
-static void applyTheme(QApplication &app) {
-    // Feather does not force a QStyle; it relies on the platform style + the qdarkstyle sheet.
-    QFile qss(":/qdarkstyle/style.qss");
-    if (qss.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        app.setStyleSheet(QString::fromUtf8(qss.readAll()));
+// Apply the selected theme app-wide. "dark" (default) uses the bundled qdarkstyle sheet; "light"
+// clears it so the native platform (light) style is used. Shared by startup + the Settings dialog.
+void aeroApplyTheme() {
+    const QString theme = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
+                              .value(QStringLiteral("appearance/theme"), QStringLiteral("dark"))
+                              .toString();
+    if (theme == QLatin1String("light")) {
+        qApp->setStyleSheet(QString());
+        return;
     }
+    QFile qss(QStringLiteral(":/qdarkstyle/style.qss"));
+    if (qss.open(QIODevice::ReadOnly | QIODevice::Text))
+        qApp->setStyleSheet(QString::fromUtf8(qss.readAll()));
 }
 
 int main(int argc, char *argv[]) {
@@ -55,7 +62,7 @@ int main(int argc, char *argv[]) {
     QApplication::setFont(fontDef);
 #endif
 
-    applyTheme(app);
+    aeroApplyTheme();
 
     WalletWizard wizard;
     if (wizard.exec() != QDialog::Accepted)
