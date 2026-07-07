@@ -25,8 +25,10 @@
 #include <QDoubleSpinBox>
 #include <QListWidget>
 #include <QListWidgetItem>
+#include <QScrollArea>
 #include <QSortFilterProxyModel>
 #include <QTabWidget>
+#include <QTreeWidget>
 #include <QToolButton>
 #include <QClipboard>
 #include <QCloseEvent>
@@ -37,6 +39,7 @@
 #include <QFont>
 #include <QFormLayout>
 #include <QFrame>
+#include <QGridLayout>
 #include <QGroupBox>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -55,6 +58,7 @@
 #include <QDesktopServices>
 #include <QPainter>
 #include <QPushButton>
+#include <QRadioButton>
 #include <QSettings>
 #include <QSystemTrayIcon>
 #include <QUrl>
@@ -125,6 +129,9 @@ struct ChainDef {
     QString icon;        // bundled qrc icon
     QStringList rpcs;    // keyless endpoints, rotated
     QString explorer;    // block-explorer base for tx links
+    bool cow = false;            // CoW Protocol swaps available (mirrors core chains.rs cow_network)
+    bool ethFlow = false;        // CoW eth-flow (native-ETH sells) available on this chain
+    QString wrappedNative;       // wrapped-native ERC-20 (WETH/WMATIC/…) for swaps
 };
 
 const QList<ChainDef> &chainDefs() {
@@ -135,49 +142,57 @@ const QList<ChainDef> &chainDefs() {
           QStringLiteral("https://ethereum-rpc.publicnode.com"),
           QStringLiteral("https://eth.drpc.org"),
           QStringLiteral("https://rpc.mevblocker.io")},
-         QStringLiteral("https://etherscan.io")},
+         QStringLiteral("https://etherscan.io"),
+         true, true, QStringLiteral("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")},
         {42161, QStringLiteral("Arbitrum One"), QStringLiteral("ETH"),
          QStringLiteral(":/assets/images/chains/arbitrum.png"),
          {QStringLiteral("https://arbitrum-one-rpc.publicnode.com"),
           QStringLiteral("https://arb1.arbitrum.io/rpc"),
           QStringLiteral("https://arbitrum.drpc.org")},
-         QStringLiteral("https://arbiscan.io")},
+         QStringLiteral("https://arbiscan.io"),
+         true, false, QStringLiteral("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1")},
         {8453, QStringLiteral("Base"), QStringLiteral("ETH"),
          QStringLiteral(":/assets/images/chains/base.png"),
          {QStringLiteral("https://base-rpc.publicnode.com"),
           QStringLiteral("https://mainnet.base.org"),
           QStringLiteral("https://base.drpc.org")},
-         QStringLiteral("https://basescan.org")},
+         QStringLiteral("https://basescan.org"),
+         true, false, QStringLiteral("0x4200000000000000000000000000000000000006")},
         {10, QStringLiteral("Optimism"), QStringLiteral("ETH"),
          QStringLiteral(":/assets/images/chains/optimism.png"),
          {QStringLiteral("https://optimism-rpc.publicnode.com"),
           QStringLiteral("https://mainnet.optimism.io"),
           QStringLiteral("https://optimism.drpc.org")},
-         QStringLiteral("https://optimistic.etherscan.io")},
+         QStringLiteral("https://optimistic.etherscan.io"),
+         false, false, QStringLiteral("0x4200000000000000000000000000000000000006")},
         {137, QStringLiteral("Polygon"), QStringLiteral("POL"),
          QStringLiteral(":/assets/images/chains/polygon.png"),
          {QStringLiteral("https://polygon-bor-rpc.publicnode.com"),
           QStringLiteral("https://polygon-rpc.com"),
           QStringLiteral("https://polygon.drpc.org")},
-         QStringLiteral("https://polygonscan.com")},
+         QStringLiteral("https://polygonscan.com"),
+         true, false, QStringLiteral("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270")},
         {56, QStringLiteral("BNB Smart Chain"), QStringLiteral("BNB"),
          QStringLiteral(":/assets/images/chains/bsc.png"),
          {QStringLiteral("https://bsc-rpc.publicnode.com"),
           QStringLiteral("https://bsc-dataseed.bnbchain.org"),
           QStringLiteral("https://bsc.drpc.org")},
-         QStringLiteral("https://bscscan.com")},
+         QStringLiteral("https://bscscan.com"),
+         false, false, QStringLiteral("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c")},
         {100, QStringLiteral("Gnosis"), QStringLiteral("XDAI"),
          QStringLiteral(":/assets/images/chains/gnosis.png"),
          {QStringLiteral("https://gnosis-rpc.publicnode.com"),
           QStringLiteral("https://rpc.gnosischain.com"),
           QStringLiteral("https://gnosis.drpc.org")},
-         QStringLiteral("https://gnosisscan.io")},
+         QStringLiteral("https://gnosisscan.io"),
+         true, false, QStringLiteral("0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d")},
         {43114, QStringLiteral("Avalanche"), QStringLiteral("AVAX"),
          QStringLiteral(":/assets/images/chains/avalanche.png"),
          {QStringLiteral("https://avalanche-c-chain-rpc.publicnode.com"),
           QStringLiteral("https://api.avax.network/ext/bc/C/rpc"),
           QStringLiteral("https://avalanche.drpc.org")},
-         QStringLiteral("https://snowtrace.io")},
+         QStringLiteral("https://snowtrace.io"),
+         true, false, QStringLiteral("0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7")},
     };
     return defs;
 }
@@ -189,36 +204,107 @@ const ChainDef &chainDefFor(quint64 id) {
     return chainDefs().first(); // default to Ethereum
 }
 
-// Curated list of well-known mainnet ERC-20s that are auto-trusted in History (so legitimate
-// transfers of these aren't hidden by the spam filter). This is an allow-list only: these are not
-// balance-tracked unless the user explicitly adds them. Matched case-insensitively by address.
-QVector<TokenInfo> curatedTopTokens() {
-    return {
-        {QStringLiteral("0xdAC17F958D2ee523a2206206994597C13D831ec7"), QStringLiteral("USDT"), 6},
-        {QStringLiteral("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), QStringLiteral("USDC"), 6},
-        {QStringLiteral("0x6B175474E89094C44Da98b954EedeAC495271d0F"), QStringLiteral("DAI"), 18},
-        {QStringLiteral("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), QStringLiteral("WETH"), 18},
-        {QStringLiteral("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"), QStringLiteral("WBTC"), 8},
-        {QStringLiteral("0x514910771AF9Ca656af840dff83E8264EcF986CA"), QStringLiteral("LINK"), 18},
-        {QStringLiteral("0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984"), QStringLiteral("UNI"), 18},
-        {QStringLiteral("0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE"), QStringLiteral("SHIB"), 18},
-        {QStringLiteral("0x6982508145454Ce325dDbE47a25d4ec3d2311933"), QStringLiteral("PEPE"), 18},
-        {QStringLiteral("0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84"), QStringLiteral("stETH"), 18},
-        {QStringLiteral("0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"), QStringLiteral("wstETH"), 18},
-        {QStringLiteral("0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"), QStringLiteral("AAVE"), 18},
-        {QStringLiteral("0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2"), QStringLiteral("MKR"), 18},
-        {QStringLiteral("0x5A98FcBEA516Cf06857215779Fd812CA3beF1B32"), QStringLiteral("LDO"), 18},
-        {QStringLiteral("0xD533a949740bb3306d119CC777fa900bA034cd52"), QStringLiteral("CRV"), 18},
-        {QStringLiteral("0x4d224452801ACEd8B2F0aebE155379bb5D594381"), QStringLiteral("APE"), 18},
-        {QStringLiteral("0x3845badAde8e6dFF049820680d1F14bD3903a5d0"), QStringLiteral("SAND"), 18},
-        {QStringLiteral("0x0F5D2fB29fb7d3CFeE444a200298f468908cC942"), QStringLiteral("MANA"), 18},
-        {QStringLiteral("0xc944E90C64B2c07662A292be6244BDf05Cda44a7"), QStringLiteral("GRT"), 18},
-        {QStringLiteral("0x111111111117dC0aa78b770fA6A738034120C302"), QStringLiteral("1INCH"), 18},
-        {QStringLiteral("0xc00e94Cb662C3520282E6f5717214004A7f26888"), QStringLiteral("COMP"), 18},
-        {QStringLiteral("0xC011a73ee8576Fb46F5E1c5751cA3B9Fe0af2a6F"), QStringLiteral("SNX"), 18},
-        {QStringLiteral("0x0000000000085d4780B73119b644AE5ecd22b376"), QStringLiteral("TUSD"), 18},
-        {QStringLiteral("0x853d955aCEf822Db058eb8505911ED77F175b99e"), QStringLiteral("FRAX"), 18},
-    };
+// Curated list of well-known ERC-20s per chain, auto-trusted in History (so legitimate transfers
+// aren't hidden by the spam filter) and offered in the swap picker. Allow-list only: not
+// balance-tracked unless the user adds them. Matched case-insensitively by address.
+QVector<TokenInfo> curatedTopTokens(quint64 chainId) {
+    switch (chainId) {
+    case 42161: // Arbitrum One
+        return {
+            {QStringLiteral("0xaf88d065e77c8cC2239327C5EDb3A432268e5831"), QStringLiteral("USDC"), 6},
+            {QStringLiteral("0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"), QStringLiteral("USDC.e"), 6},
+            {QStringLiteral("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"), QStringLiteral("USDT"), 6},
+            {QStringLiteral("0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1"), QStringLiteral("DAI"), 18},
+            {QStringLiteral("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"), QStringLiteral("WETH"), 18},
+            {QStringLiteral("0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f"), QStringLiteral("WBTC"), 8},
+            {QStringLiteral("0x912CE59144191C1204E64559FE8253a0e49E6548"), QStringLiteral("ARB"), 18},
+            {QStringLiteral("0xf97f4df75117a78c1A5a0DBb814Af92458539FB4"), QStringLiteral("LINK"), 18},
+        };
+    case 8453: // Base
+        return {
+            {QStringLiteral("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"), QStringLiteral("USDC"), 6},
+            {QStringLiteral("0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"), QStringLiteral("USDbC"), 6},
+            {QStringLiteral("0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"), QStringLiteral("DAI"), 18},
+            {QStringLiteral("0x4200000000000000000000000000000000000006"), QStringLiteral("WETH"), 18},
+            {QStringLiteral("0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"), QStringLiteral("cbETH"), 18},
+        };
+    case 10: // Optimism
+        return {
+            {QStringLiteral("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"), QStringLiteral("USDC"), 6},
+            {QStringLiteral("0x7F5c764cBc14f9669B88837ca1490cCa17c31607"), QStringLiteral("USDC.e"), 6},
+            {QStringLiteral("0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"), QStringLiteral("USDT"), 6},
+            {QStringLiteral("0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1"), QStringLiteral("DAI"), 18},
+            {QStringLiteral("0x4200000000000000000000000000000000000006"), QStringLiteral("WETH"), 18},
+            {QStringLiteral("0x4200000000000000000000000000000000000042"), QStringLiteral("OP"), 18},
+            {QStringLiteral("0x68f180fcCe6836688e9084f035309E29Bf0A2095"), QStringLiteral("WBTC"), 8},
+        };
+    case 137: // Polygon
+        return {
+            {QStringLiteral("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"), QStringLiteral("USDC"), 6},
+            {QStringLiteral("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"), QStringLiteral("USDC.e"), 6},
+            {QStringLiteral("0xc2132D05D31c914a87C6611C10748AEb04B58e8F"), QStringLiteral("USDT"), 6},
+            {QStringLiteral("0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063"), QStringLiteral("DAI"), 18},
+            {QStringLiteral("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"), QStringLiteral("WPOL"), 18},
+            {QStringLiteral("0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"), QStringLiteral("WETH"), 18},
+            {QStringLiteral("0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6"), QStringLiteral("WBTC"), 8},
+            {QStringLiteral("0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39"), QStringLiteral("LINK"), 18},
+        };
+    case 56: // BNB Smart Chain
+        return {
+            {QStringLiteral("0x55d398326f99059fF775485246999027B3197955"), QStringLiteral("USDT"), 18},
+            {QStringLiteral("0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"), QStringLiteral("USDC"), 18},
+            {QStringLiteral("0x1AF3F329e8BE154074D8769D1FFa4eE058B1DBc3"), QStringLiteral("DAI"), 18},
+            {QStringLiteral("0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56"), QStringLiteral("BUSD"), 18},
+            {QStringLiteral("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"), QStringLiteral("WBNB"), 18},
+            {QStringLiteral("0x2170Ed0880ac9A755fd29B2688956BD959F933F8"), QStringLiteral("ETH"), 18},
+            {QStringLiteral("0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c"), QStringLiteral("BTCB"), 18},
+        };
+    case 100: // Gnosis
+        return {
+            {QStringLiteral("0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"), QStringLiteral("USDC"), 6},
+            {QStringLiteral("0x4ECaBa5870353805a9F068101A40E0f32ed605C6"), QStringLiteral("USDT"), 6},
+            {QStringLiteral("0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"), QStringLiteral("WXDAI"), 18},
+            {QStringLiteral("0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1"), QStringLiteral("WETH"), 18},
+            {QStringLiteral("0x9C58BAcC331c9aa871AFD802DB6379a98e80CEdb"), QStringLiteral("GNO"), 18},
+        };
+    case 43114: // Avalanche
+        return {
+            {QStringLiteral("0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E"), QStringLiteral("USDC"), 6},
+            {QStringLiteral("0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7"), QStringLiteral("USDT"), 6},
+            {QStringLiteral("0xd586E7F844cEa2F87f50152665BCbc2C279D8d70"), QStringLiteral("DAI.e"), 18},
+            {QStringLiteral("0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7"), QStringLiteral("WAVAX"), 18},
+            {QStringLiteral("0x49D5c2BdFfac6CE2BFdB6640F4F80f226bc10bAB"), QStringLiteral("WETH.e"), 18},
+            {QStringLiteral("0x50b7545627a5162F82A992c33b87aDc75187B218"), QStringLiteral("WBTC.e"), 8},
+        };
+    case 1: // Ethereum mainnet
+    default:
+        return {
+            {QStringLiteral("0xdAC17F958D2ee523a2206206994597C13D831ec7"), QStringLiteral("USDT"), 6},
+            {QStringLiteral("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), QStringLiteral("USDC"), 6},
+            {QStringLiteral("0x6B175474E89094C44Da98b954EedeAC495271d0F"), QStringLiteral("DAI"), 18},
+            {QStringLiteral("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), QStringLiteral("WETH"), 18},
+            {QStringLiteral("0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"), QStringLiteral("WBTC"), 8},
+            {QStringLiteral("0x514910771AF9Ca656af840dff83E8264EcF986CA"), QStringLiteral("LINK"), 18},
+            {QStringLiteral("0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984"), QStringLiteral("UNI"), 18},
+            {QStringLiteral("0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE"), QStringLiteral("SHIB"), 18},
+            {QStringLiteral("0x6982508145454Ce325dDbE47a25d4ec3d2311933"), QStringLiteral("PEPE"), 18},
+            {QStringLiteral("0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84"), QStringLiteral("stETH"), 18},
+            {QStringLiteral("0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"), QStringLiteral("wstETH"), 18},
+            {QStringLiteral("0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"), QStringLiteral("AAVE"), 18},
+            {QStringLiteral("0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2"), QStringLiteral("MKR"), 18},
+            {QStringLiteral("0x5A98FcBEA516Cf06857215779Fd812CA3beF1B32"), QStringLiteral("LDO"), 18},
+            {QStringLiteral("0xD533a949740bb3306d119CC777fa900bA034cd52"), QStringLiteral("CRV"), 18},
+            {QStringLiteral("0x4d224452801ACEd8B2F0aebE155379bb5D594381"), QStringLiteral("APE"), 18},
+            {QStringLiteral("0x3845badAde8e6dFF049820680d1F14bD3903a5d0"), QStringLiteral("SAND"), 18},
+            {QStringLiteral("0x0F5D2fB29fb7d3CFeE444a200298f468908cC942"), QStringLiteral("MANA"), 18},
+            {QStringLiteral("0xc944E90C64B2c07662A292be6244BDf05Cda44a7"), QStringLiteral("GRT"), 18},
+            {QStringLiteral("0x111111111117dC0aa78b770fA6A738034120C302"), QStringLiteral("1INCH"), 18},
+            {QStringLiteral("0xc00e94Cb662C3520282E6f5717214004A7f26888"), QStringLiteral("COMP"), 18},
+            {QStringLiteral("0xC011a73ee8576Fb46F5E1c5751cA3B9Fe0af2a6F"), QStringLiteral("SNX"), 18},
+            {QStringLiteral("0x0000000000085d4780B73119b644AE5ecd22b376"), QStringLiteral("TUSD"), 18},
+            {QStringLiteral("0x853d955aCEf822Db058eb8505911ED77F175b99e"), QStringLiteral("FRAX"), 18},
+        };
+    }
 }
 
 QString shortAddr(const QString &a) {
@@ -269,6 +355,13 @@ QString fiatSymbolFor(const QString &code) {
 QString labelsGroup(const QString &walletPath) {
     const QByteArray h = QCryptographicHash::hash(walletPath.toUtf8(), QCryptographicHash::Md5);
     return QStringLiteral("labels/%1").arg(QString::fromLatin1(h.toHex()));
+}
+
+// Stable per-wallet settings key remembering which account was last selected, so reopening a wallet
+// returns to that account instead of jumping back to #0.
+QString selectedAccountKey(const QString &walletPath) {
+    const QByteArray h = QCryptographicHash::hash(walletPath.toUtf8(), QCryptographicHash::Md5);
+    return QStringLiteral("ui/%1/selectedAccount").arg(QString::fromLatin1(h.toHex()));
 }
 
 // Drop trailing zeros from a fixed-decimal string ("1.230000" -> "1.23", "5.000000" -> "5").
@@ -626,6 +719,10 @@ void AeroMainWindow::setupTabs() {
     });
     connect(sendUi.lineAmount, &QLineEdit::textChanged, this, &AeroMainWindow::onAmountConversion);
     connect(m_fromCombo, &QComboBox::currentIndexChanged, this, &AeroMainWindow::updateAvailable);
+    // Remember the chosen "From" as the active account so Receive/Swap stay in sync with it.
+    connect(m_fromCombo, &QComboBox::currentIndexChanged, this, [this](int i) {
+        if (i >= 0) m_account = static_cast<quint32>(i);
+    });
     // Accept pasted EIP-681 payment URIs in Pay-to: "ethereum:0xADDR@chainId?value=<wei>" fills the
     // recipient (and, for the simple value form, the amount). Other wallets/QR codes emit these.
     connect(sendUi.lineAddress, &QPlainTextEdit::textChanged, this, [this]() {
@@ -735,6 +832,7 @@ void AeroMainWindow::setupTabs() {
 
     setupHomeTab();
     setupNftTab();
+    setupSwapTab();
     setupMenu();
 
     // Notes tab: a per-wallet scratch pad, stored encrypted inside the wallet (loaded in
@@ -938,6 +1036,1727 @@ void AeroMainWindow::setNftTabEnabled(bool on) {
     } else if (!on && cur >= 0) {
         ui.tabWidget->removeTab(cur); // widget is retained (owned via m_nftTab)
     }
+}
+
+// DefiLlama chain slug for a chain id (for building coin keys "<slug>:<addr>"). Empty if unknown.
+static QString defillamaChain(quint64 id) {
+    switch (id) {
+    case 1: return QStringLiteral("ethereum");
+    case 42161: return QStringLiteral("arbitrum");
+    case 8453: return QStringLiteral("base");
+    case 10: return QStringLiteral("optimism");
+    case 137: return QStringLiteral("polygon");
+    case 56: return QStringLiteral("bsc");
+    case 100: return QStringLiteral("xdai");
+    case 43114: return QStringLiteral("avax");
+    default: return QString();
+    }
+}
+
+// CoinGecko id for a chain's native coin (used for DefiLlama's "coingecko:<id>" key).
+static QString nativeCoingeckoId(quint64 id) {
+    switch (id) {
+    case 137: return QStringLiteral("matic-network");
+    case 56: return QStringLiteral("binancecoin");
+    case 100: return QStringLiteral("xdai");
+    case 43114: return QStringLiteral("avalanche-2");
+    default: return QStringLiteral("ethereum"); // ETH-native chains (1/10/42161/8453)
+    }
+}
+
+// Whether at least one keyless on-chain router (KyberSwap/Odos/Paraswap/OpenOcean) supports the
+// chain. Mirrors the per-router slug maps in core/src/chains.rs.
+static bool swapChainSupported(quint64 chainId) {
+    switch (chainId) {
+    case 1: case 10: case 56: case 137: case 8453: case 42161: case 43114:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// A DefiLlama coin key for a swap asset (native -> coingecko:<id>, token -> <chain>:<addr>).
+static QString defillamaKey(quint64 chainId, const QString &tokenAddr) {
+    if (tokenAddr.isEmpty())
+        return QStringLiteral("coingecko:%1").arg(nativeCoingeckoId(chainId));
+    const QString slug = defillamaChain(chainId);
+    return slug.isEmpty() ? QString() : QStringLiteral("%1:%2").arg(slug, tokenAddr);
+}
+
+void AeroMainWindow::setupSwapTab() {
+    m_swapTab = new QWidget();
+    auto *outer = new QVBoxLayout(m_swapTab);
+    outer->setContentsMargins(12, 12, 12, 12);
+    outer->setSpacing(10);
+
+    // No page heading — the tab (icon + "Swap") already labels it.
+
+    // Feather-style form: clean labeled rows (no flashy cards), width-capped so fields don't sprawl
+    // edge-to-edge on a wide window — everything lines up to a consistent, sensible width.
+    auto *formHost = new QWidget(m_swapTab);
+    formHost->setMaximumWidth(520);
+    auto *form = new QFormLayout(formHost);
+    form->setContentsMargins(0, 0, 0, 0);
+    form->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    form->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
+    form->setHorizontalSpacing(12);
+    form->setVerticalSpacing(6);
+
+    // From account — fills the (capped) field column, doesn't grow to the long label text.
+    m_swapFrom = new QComboBox(m_swapTab);
+    m_swapFrom->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    m_swapFrom->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    m_swapFrom->setMinimumContentsLength(10);
+    // The collapsed box stays compact, but widen the dropdown so the full label (with balance on
+    // the right) is visible when opened.
+    m_swapFrom->view()->setMinimumWidth(360);
+    connect(m_swapFrom, &QComboBox::currentIndexChanged, this, [this](int i) {
+        if (i >= 0) m_account = static_cast<quint32>(i); // keep the active account unified
+        updateSwapAvailable();
+        updateSwapPayUsd();
+        if (m_swapQuoteTimer) m_swapQuoteTimer->start(200);
+    });
+    form->addRow(tr("From account"), m_swapFrom);
+
+    // You pay: compact asset picker (hugs its content) + amount + Max, all together so Max sits
+    // right next to the number it fills (not stranded at the far edge).
+    auto *payRow = new QHBoxLayout();
+    payRow->setSpacing(8);
+    m_swapSellButton = new QToolButton(m_swapTab);
+    m_swapSellButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_swapSellButton->setIconSize(QSize(16, 16));
+    m_swapSellButton->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
+    m_swapSellButton->setCursor(Qt::PointingHandCursor);
+    m_swapSellButton->setIcon(tokenIcon(m_nativeSymbol));
+    m_swapSellButton->setText(m_nativeSymbol + QStringLiteral(" \u25be"));
+    m_swapSellButton->setFixedHeight(28);
+    connect(m_swapSellButton, &QToolButton::clicked, this, [this]() { openSwapPicker(true); });
+    m_swapAmount = new QLineEdit(m_swapTab);
+    m_swapAmount->setPlaceholderText(tr("0.0"));
+    m_swapAmount->setAlignment(Qt::AlignRight);
+    m_swapAmount->setFixedHeight(28);
+    m_swapAmount->setFixedWidth(170); // a number field, not a full-width block
+    auto *maxBtn = new QToolButton(m_swapTab);
+    maxBtn->setText(tr("Max"));
+    maxBtn->setCursor(Qt::PointingHandCursor);
+    maxBtn->setAutoRaise(true);
+    maxBtn->setFixedHeight(28);
+    maxBtn->setToolTip(tr("Use your full available balance"));
+    connect(maxBtn, &QToolButton::clicked, this, [this]() {
+        const double avail = swapAvailable();
+        if (avail > 0.0)
+            m_swapAmount->setText(QString::number(avail, 'f', 8));
+    });
+    payRow->addWidget(m_swapSellButton);
+    payRow->addWidget(m_swapAmount);
+    payRow->addWidget(maxBtn);      // Max sits right against the amount it fills
+    payRow->addStretch(1);          // keep the trio grouped compactly on the left
+    form->addRow(tr("You pay"), payRow);
+
+    // Sub-line under "You pay": available balance (left) and its USD value (right).
+    auto *paySub = new QHBoxLayout();
+    m_swapAvailLabel = new QLabel(tr("Available: —"), m_swapTab);
+    m_swapAvailLabel->setStyleSheet(QStringLiteral("color:#8a8a8a; font-size:11px;"));
+    m_swapPayUsd = new QLabel(m_swapTab);
+    m_swapPayUsd->setStyleSheet(QStringLiteral("color:#8a8a8a; font-size:11px;"));
+    paySub->addWidget(m_swapAvailLabel);
+    paySub->addStretch(1);
+    paySub->addWidget(m_swapPayUsd);
+    form->addRow(QString(), paySub);
+
+    // Reverse direction (swap the two assets). Transparent (no button chrome) horizontal ↔ arrows,
+    // placed out in the empty space on the right rather than as a boxed button.
+    auto *revRow = new QHBoxLayout();
+    auto *reverseBtn = new QToolButton(m_swapTab);
+    // U+FE0E forces text (monochrome) presentation so the glyph doesn't render as a colored emoji.
+    reverseBtn->setText(QStringLiteral("\u21C4\uFE0E"));
+    reverseBtn->setToolTip(tr("Reverse — swap the pay and receive assets"));
+    reverseBtn->setCursor(Qt::PointingHandCursor);
+    reverseBtn->setAutoRaise(true); // flat: no border/background
+    reverseBtn->setStyleSheet(QStringLiteral(
+        "QToolButton{border:none; background:transparent; color:#9aa0ab;}"
+        "QToolButton:hover{color:#ffffff;}"));
+    { QFont rf = reverseBtn->font(); rf.setPointSize(rf.pointSize() + 6); reverseBtn->setFont(rf); }
+    connect(reverseBtn, &QToolButton::clicked, this, [this]() {
+        if (m_swapBuySymbol.isEmpty())
+            return; // need a "receive" asset to reverse into
+        std::swap(m_swapSellSymbol, m_swapBuySymbol);
+        std::swap(m_swapSellAddr, m_swapBuyAddr);
+        std::swap(m_swapSellDecimals, m_swapBuyDecimals);
+        if (m_swapSellButton) {
+            m_swapSellButton->setIcon(tokenIcon(m_swapSellSymbol));
+            m_swapSellButton->setText(m_swapSellSymbol + QStringLiteral(" \u25be"));
+        }
+        if (m_swapBuyButton) {
+            m_swapBuyButton->setIcon(tokenIcon(m_swapBuySymbol));
+            m_swapBuyButton->setText(m_swapBuySymbol + QStringLiteral(" \u25be"));
+        }
+        m_swapQuoteJson.clear();
+        resetSwapFlow(); // reversing the pair abandons any half-finished swap
+        m_swapUserPickedRouter = false;
+        if (m_swapConfirmBtn) m_swapConfirmBtn->setEnabled(false);
+        if (m_swapList) m_swapList->clear();
+        if (m_swapReceive) m_swapReceive->setText(QStringLiteral("—"));
+        updateSwapAvailable();
+        updateSwapPayUsd();
+        refreshSwapQuote();
+    });
+    revRow->addWidget(reverseBtn); // sits at the start of the field column, between the two pickers
+    revRow->addStretch(1);
+    form->addRow(QString(), revRow);
+
+    // You receive: compact asset picker + estimated output (from the picked route, with USD).
+    auto *recvRow = new QHBoxLayout();
+    recvRow->setSpacing(8);
+    m_swapBuyButton = new QToolButton(m_swapTab);
+    m_swapBuyButton->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    m_swapBuyButton->setIconSize(QSize(16, 16));
+    m_swapBuyButton->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
+    m_swapBuyButton->setCursor(Qt::PointingHandCursor);
+    m_swapBuyButton->setText(tr("Select \u25be"));
+    m_swapBuyButton->setFixedHeight(28);
+    connect(m_swapBuyButton, &QToolButton::clicked, this, [this]() { openSwapPicker(false); });
+    m_swapReceive = new QLabel(QStringLiteral("—"), m_swapTab);
+    m_swapReceive->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    m_swapReceive->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    recvRow->addWidget(m_swapBuyButton);
+    recvRow->addSpacing(8);
+    recvRow->addWidget(m_swapReceive, 1);
+    form->addRow(tr("You receive"), recvRow);
+
+    // Max slippage: Auto (scales with trade size, like CoW) / preset / Custom manual %.
+    auto *slipRow = new QHBoxLayout();
+    m_swapSlipCustom = new QDoubleSpinBox(m_swapTab);
+    m_swapSlipCustom->setRange(0.05, 50.0);
+    m_swapSlipCustom->setDecimals(2);
+    m_swapSlipCustom->setSingleStep(0.1);
+    m_swapSlipCustom->setValue(0.5);
+    m_swapSlipCustom->setSuffix(QStringLiteral("%"));
+    m_swapSlipCustom->setMaximumWidth(90);
+    m_swapSlipCustom->setVisible(false);
+    m_swapSlippage = new QComboBox(m_swapTab);
+    m_swapSlippage->addItems({tr("Auto (dynamic)"), QStringLiteral("0.1%"), QStringLiteral("0.5%"),
+                              QStringLiteral("1%"), QStringLiteral("2%"), tr("Custom\u2026")});
+    m_swapSlippage->setCurrentIndex(0); // default: auto-detect the best slippage for the size
+    connect(m_swapSlippage, &QComboBox::currentIndexChanged, this, [this](int) {
+        const bool custom = m_swapSlippage->currentText().startsWith(QStringLiteral("Custom"));
+        m_swapSlipCustom->setVisible(custom);
+        if (m_swapQuoteTimer) m_swapQuoteTimer->start(200);
+    });
+    connect(m_swapSlipCustom, &QDoubleSpinBox::valueChanged, this,
+            [this](double) { if (m_swapQuoteTimer) m_swapQuoteTimer->start(300); });
+    slipRow->addWidget(m_swapSlipCustom);
+    slipRow->addWidget(m_swapSlippage);
+    slipRow->addStretch(1);
+    form->addRow(tr("Max slippage"), slipRow);
+
+    // Effective slippage note (updates per trade; explains Auto).
+    m_swapSlipNote = new QLabel(m_swapTab);
+    m_swapSlipNote->setStyleSheet(QStringLiteral("color:#8a8a8a; font-size:11px;"));
+    m_swapSlipNote->setWordWrap(true);
+    form->addRow(QString(), m_swapSlipNote);
+
+    outer->addWidget(formHost);
+
+    auto *listLabel = new QLabel(tr("Routes (best first) — select one"), m_swapTab);
+    listLabel->setStyleSheet(QStringLiteral("color:#8a8a8a; font-weight:bold;"));
+    outer->addWidget(listLabel);
+
+    // Comparison table: columns like Feather's tables; native full-row selection makes the picked
+    // route unmistakable.
+    m_swapList = new QTreeWidget(m_swapTab);
+    m_swapList->setColumnCount(4);
+    m_swapList->setHeaderLabels(
+        {tr("Router"), tr("You receive"), tr("Net (after gas)"), tr("Type")});
+    m_swapList->setRootIsDecorated(false);
+    m_swapList->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_swapList->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_swapList->setAlternatingRowColors(true);
+    m_swapList->setUniformRowHeights(true);
+    m_swapList->setMinimumHeight(150);
+    m_swapList->setAllColumnsShowFocus(true);
+    m_swapList->header()->setStretchLastSection(false);
+    m_swapList->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    m_swapList->header()->setSectionResizeMode(1, QHeaderView::Stretch);
+    m_swapList->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    m_swapList->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    // A click/keyboard activation is an explicit user pick — keep it sticky across live re-quotes.
+    connect(m_swapList, &QTreeWidget::itemClicked, this,
+            [this](QTreeWidgetItem *, int) { m_swapUserPickedRouter = true; });
+    connect(m_swapList, &QTreeWidget::itemActivated, this,
+            [this](QTreeWidgetItem *, int) { m_swapUserPickedRouter = true; });
+    connect(m_swapList, &QTreeWidget::currentItemChanged, this,
+            [this](QTreeWidgetItem *cur, QTreeWidgetItem *) {
+                if (!cur) {
+                    m_swapSelRouter.clear();
+                    m_swapConfirmBtn->setEnabled(false);
+                    return;
+                }
+                const QVariantMap d = cur->data(0, Qt::UserRole).toMap();
+                m_swapSelRouter = d.value(QStringLiteral("router_id")).toString();
+                m_swapSelKind = d.value(QStringLiteral("kind")).toString();
+                m_swapSelLabel = d.value(QStringLiteral("label")).toString();
+                m_swapSelBuyAmount = d.value(QStringLiteral("buy_amount")).toString();
+                m_swapSelGasUsd = d.value(QStringLiteral("gas_usd")).toDouble();
+                // Reflect the picked route's output (with USD) in the "You receive" field.
+                if (m_swapReceive) {
+                    const bool buyIsNative = m_swapBuyAddr.isEmpty();
+                    const quint8 buyDec = buyIsNative ? 18 : m_swapBuyDecimals;
+                    const double buyH = m_swapSelBuyAmount.toDouble() / std::pow(10.0, buyDec);
+                    QString txt = QStringLiteral("%1 %2").arg(formatBalance(buyH), m_swapBuySymbol);
+                    if (m_swapLlamaBuyUsd > 0.0)
+                        txt += QStringLiteral("   \u2248 %1").arg(fiatStr(buyH * m_swapLlamaBuyUsd));
+                    m_swapReceive->setText(txt);
+                }
+                m_swapConfirmBtn->setEnabled(!m_swapSelRouter.isEmpty());
+            });
+    outer->addWidget(m_swapList, 1);
+
+    m_swapRate = new QLabel(m_swapTab);
+    m_swapRate->setWordWrap(true);
+    m_swapRate->setStyleSheet(QStringLiteral("color:#9a9a9a;"));
+    outer->addWidget(m_swapRate);
+    // No trailing stretch: the routes table (added with stretch 1) should absorb the extra vertical
+    // space so all routers are visible and there's no dead gap above the pinned Confirm bar.
+
+    // Debounced live quote: typing an amount waits 600ms, then re-fetches all router quotes.
+    m_swapQuoteTimer = new QTimer(this);
+    m_swapQuoteTimer->setSingleShot(true);
+    connect(m_swapQuoteTimer, &QTimer::timeout, this, &AeroMainWindow::refreshSwapQuote);
+    connect(m_swapAmount, &QLineEdit::textChanged, this, [this]() {
+        m_swapQuoteJson.clear();
+        resetSwapFlow(); // editing the amount abandons any half-finished swap; unblock re-quoting
+        m_swapUserPickedRouter = false; // amount changed -> re-evaluate the best route
+        m_swapConfirmBtn->setEnabled(false);
+        if (m_swapReceive) m_swapReceive->setText(QStringLiteral("—"));
+        updateSwapPayUsd();
+        m_swapQuoteTimer->start(600);
+    });
+
+    // Wrap the content in a scroll area so the (tall) Swap page never forces the whole window to
+    // grow past the screen — the window stays freely resizable/movable and the page scrolls instead.
+    m_swapScroll = new QScrollArea();
+    m_swapScroll->setWidgetResizable(true);
+    m_swapScroll->setFrameShape(QFrame::NoFrame);
+    m_swapScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_swapScroll->setWidget(m_swapTab);
+
+    // Tab page = scroll on top + a PINNED status/Confirm bar at the bottom, so you never have to
+    // scroll down to reach Confirm.
+    m_swapPage = new QWidget();
+    auto *pageLayout = new QVBoxLayout(m_swapPage);
+    pageLayout->setContentsMargins(0, 0, 0, 0);
+    pageLayout->setSpacing(0);
+    pageLayout->addWidget(m_swapScroll, 1);
+    auto *bar = new QWidget(m_swapPage);
+    auto *barLayout = new QVBoxLayout(bar);
+    barLayout->setContentsMargins(12, 6, 12, 10);
+    barLayout->setSpacing(6);
+    m_swapStatus = new QLabel(bar);
+    m_swapStatus->setWordWrap(true);
+    barLayout->addWidget(m_swapStatus);
+    auto *confirmRow = new QHBoxLayout();
+    confirmRow->addStretch(1);
+    m_swapConfirmBtn = new QPushButton(tr("Confirm Swap"), bar);
+    m_swapConfirmBtn->setEnabled(false);
+    m_swapConfirmBtn->setCursor(Qt::PointingHandCursor);
+    m_swapConfirmBtn->setMinimumWidth(160);
+    connect(m_swapConfirmBtn, &QPushButton::clicked, this, &AeroMainWindow::onSwapConfirm);
+    confirmRow->addWidget(m_swapConfirmBtn);
+    barLayout->addLayout(confirmRow);
+    pageLayout->addWidget(bar);
+
+    // Inserted after Send/Receive/History (position 3) when a router supports the chain.
+    updateSwapTabEnabled();
+}
+
+quint32 AeroMainWindow::swapSlippageBps() const {
+    if (!m_swapSlippage)
+        return 50;
+    const QString mode = m_swapSlippage->currentText();
+    if (mode.startsWith(QStringLiteral("Custom"))) {
+        const int bps = m_swapSlipCustom ? qRound(m_swapSlipCustom->value() * 100.0) : 50;
+        return static_cast<quint32>(qBound(1, bps, 5000)); // 0.01% .. 50%
+    }
+    if (mode.startsWith(QStringLiteral("Auto"))) {
+        // Dynamic: smaller trades tolerate more slippage so they still fill (like CoW's dynamic
+        // slippage). Scale by the USD value of the trade when we have a price for the sell asset.
+        double usd = 0.0;
+        if (m_swapLlamaSellUsd > 0.0 && m_swapAmount)
+            usd = m_swapAmount->text().trimmed().toDouble() * m_swapLlamaSellUsd;
+        if (usd <= 0.0) return 50;    // unknown value -> 0.5%
+        if (usd < 50.0) return 300;   // 3%
+        if (usd < 200.0) return 200;  // 2%
+        if (usd < 1000.0) return 100; // 1%
+        if (usd < 10000.0) return 50; // 0.5%
+        return 30;                    // 0.3% for large trades
+    }
+    if (mode.startsWith(QStringLiteral("0.1"))) return 10;
+    if (mode.startsWith(QStringLiteral("1"))) return 100;
+    if (mode.startsWith(QStringLiteral("2"))) return 200;
+    return 50; // 0.5%
+}
+
+bool AeroMainWindow::isKnownRouter(const QString &addr) const {
+    static const QSet<QString> known = {
+        QStringLiteral("0xc92e8bdf79f0507f65a392b0ab4667716bfe0110"), // CoW Vault Relayer
+        QStringLiteral("0x9008d19f58aabd9ed0d60971565aa8510560ab41"), // CoW Settlement
+        QStringLiteral("0x6131b5fae19ea4f9d964eac0408e4408b66337b5"), // KyberSwap MetaAggregationRouterV2
+        QStringLiteral("0xdef171fe48cf0115b1d80b88dc8eab59176fee57"), // Paraswap AugustusSwapper
+        QStringLiteral("0x216b4b4ba9f3e719726886d34a177484278bfcae"), // Paraswap TokenTransferProxy
+        QStringLiteral("0xcf5540fffcdc3d510b18bfca6d2b9987b0772559"), // Odos router v2
+        QStringLiteral("0x6352a56caadc4f1e25cd6c75970fa768a3304e64"), // OpenOcean Exchange
+    };
+    return !addr.isEmpty() && known.contains(addr.toLower());
+}
+
+void AeroMainWindow::updateSwapTabEnabled() {
+    if (!m_swapPage)
+        return;
+    // Offered if ANY keyless router supports this chain (CoW, KyberSwap, Odos, Paraswap, OpenOcean).
+    const ChainDef &cd = chainDefFor(m_chainId);
+    const bool anyRouter = cd.cow || swapChainSupported(m_chainId);
+    const bool supported = anyRouter && m_wallet && !m_wallet->isWatchOnly();
+    const int cur = ui.tabWidget->indexOf(m_swapPage);
+    if (supported && cur < 0) {
+        ui.tabWidget->insertTab(qMin(3, ui.tabWidget->count()), m_swapPage,
+                                QIcon(QStringLiteral(":/assets/images/tab_swap.png")), tr("Swap"));
+        if (m_swapFrom && m_swapFrom->count() == 0)
+            rebuildAccountCombos();
+        updateSwapAvailable();
+    } else if (!supported && cur >= 0) {
+        ui.tabWidget->removeTab(cur); // widget retained via m_swapPage
+    }
+}
+
+void AeroMainWindow::setSwapAsset(bool sell, const QString &symbol, const QString &address,
+                                  quint8 decimals) {
+    if (sell) {
+        m_swapSellSymbol = symbol;
+        m_swapSellAddr = address;
+        m_swapSellDecimals = decimals;
+        if (m_swapSellButton) {
+            m_swapSellButton->setIcon(tokenIcon(symbol));
+            m_swapSellButton->setText(symbol + QStringLiteral("  \u25be"));
+        }
+    } else {
+        m_swapBuySymbol = symbol;
+        m_swapBuyAddr = address;
+        m_swapBuyDecimals = decimals;
+        if (m_swapBuyButton) {
+            m_swapBuyButton->setIcon(tokenIcon(symbol));
+            m_swapBuyButton->setText(symbol + QStringLiteral("  \u25be"));
+        }
+    }
+    m_swapQuoteJson.clear();
+    resetSwapFlow(); // changing an asset abandons any half-finished swap; unblock re-quoting
+    m_swapUserPickedRouter = false; // new asset -> let the best route be chosen again
+    if (m_swapConfirmBtn)
+        m_swapConfirmBtn->setEnabled(false);
+    if (m_swapList)
+        m_swapList->clear();
+    if (m_swapReceive)
+        m_swapReceive->setText(QStringLiteral("—"));
+    if (sell) {
+        updateSwapAvailable();
+        updateSwapPayUsd();
+    }
+    refreshSwapQuote();
+}
+
+double AeroMainWindow::swapAvailable() const {
+    if (!m_swapFrom || !m_wallet)
+        return 0.0;
+    const int from = qMax(0, m_swapFrom->currentIndex());
+    if (m_swapSellAddr.isEmpty())
+        return m_ethRawByAccount.value(from, 0.0);
+    return m_tokenRawByKey.value(QStringLiteral("%1|%2").arg(from).arg(m_swapSellAddr), 0.0);
+}
+
+void AeroMainWindow::updateSwapAvailable() {
+    if (!m_swapAvailLabel)
+        return;
+    m_swapAvailLabel->setText(
+        tr("Available: %1 %2").arg(formatBalance(swapAvailable()), m_swapSellSymbol));
+}
+
+void AeroMainWindow::updateSwapPayUsd() {
+    if (!m_swapPayUsd)
+        return;
+    const double amt = m_swapAmount ? m_swapAmount->text().trimmed().toDouble() : 0.0;
+    // Prefer the DefiLlama sell price; fall back to the cached native-coin price so the value shows
+    // immediately (before/without a DefiLlama round-trip) when selling the native coin.
+    double price = m_swapLlamaSellUsd;
+    if (price <= 0.0 && m_swapSellAddr.isEmpty())
+        price = m_nativeUsd;
+    if (amt > 0.0 && price > 0.0)
+        m_swapPayUsd->setText(QStringLiteral("\u2248 %1").arg(fiatStr(amt * price)));
+    else
+        m_swapPayUsd->clear();
+}
+
+void AeroMainWindow::openSwapPicker(bool sell) {
+    if (!m_wallet)
+        return;
+    auto *popup = new QWidget(this, Qt::Popup);
+    popup->setAttribute(Qt::WA_DeleteOnClose);
+    auto *v = new QVBoxLayout(popup);
+    v->setContentsMargins(6, 6, 6, 6);
+    auto *search = new QLineEdit(popup);
+    search->setPlaceholderText(tr("Search symbol"));
+    v->addWidget(search);
+    auto *list = new QListWidget(popup);
+    v->addWidget(list, 1);
+
+    // Held balance for an asset at the selected "From" account ("" == native coin). The lookup is
+    // case-insensitive so a checksum/lowercase mismatch in the cache key never reads as 0.
+    const int fromIndex = m_swapFrom ? qMax(0, m_swapFrom->currentIndex()) : 0;
+    auto heldOf = [this, fromIndex](const QString &addr) -> double {
+        if (addr.isEmpty())
+            return m_ethRawByAccount.value(fromIndex, 0.0);
+        const QString want = QStringLiteral("%1|%2").arg(fromIndex).arg(addr.toLower());
+        for (auto it = m_tokenRawByKey.constBegin(); it != m_tokenRawByKey.constEnd(); ++it)
+            if (it.key().toLower() == want)
+                return it.value();
+        return 0.0;
+    };
+
+    struct Asset { QString symbol, address; quint8 decimals; double held; double usd; };
+    auto *assets = new QVector<Asset>();
+    QSet<QString> seen;
+    auto add = [&](const QString &sym, const QString &addr, quint8 dec) {
+        const QString key = addr.toLower();
+        if (!addr.isEmpty() && seen.contains(key))
+            return;
+        if (!addr.isEmpty())
+            seen.insert(key);
+        const double h = heldOf(addr);
+        assets->push_back({sym, addr, dec, h, h * unitPriceUsd(sym)});
+    };
+    add(m_nativeSymbol, QString(), 18); // native coin
+    const ChainDef &cd = chainDefFor(m_chainId);
+    if (!cd.wrappedNative.isEmpty())
+        add(QStringLiteral("W%1").arg(m_nativeSymbol), cd.wrappedNative, 18);
+    // Curated well-known tokens for THIS chain (correct per-chain addresses).
+    for (const TokenInfo &t : curatedTopTokens(m_chainId))
+        add(t.symbol, t.address, t.decimals);
+    for (const TokenInfo &t : m_wallet->tokens()) // tracked tokens on any chain
+        add(t.symbol, t.address, t.decimals);
+
+    // "You pay" (sell): only assets you actually hold — keep native as a fallback so the list is
+    // never empty. "You receive" (buy): keep everything. Both show held-first with the balance on
+    // the right, so a funded token (e.g. DAI) surfaces at the top instead of needing a search.
+    if (sell) {
+        QVector<Asset> heldOnly;
+        for (const Asset &a : *assets)
+            if (a.held > 0.0)
+                heldOnly.push_back(a);
+        if (heldOnly.isEmpty()) {
+            const double h = heldOf(QString());
+            heldOnly.push_back({m_nativeSymbol, QString(), 18, h, h * unitPriceUsd(m_nativeSymbol)});
+        }
+        *assets = heldOnly;
+    }
+    // Highest holdings VALUE (USD) first — so the biggest position (e.g. DAI) is at the top, not
+    // whichever token happens to have the largest raw count. Tie-break by token amount.
+    std::stable_sort(assets->begin(), assets->end(), [](const Asset &a, const Asset &b) {
+        if (a.usd != b.usd)
+            return a.usd > b.usd;
+        return a.held > b.held;
+    });
+
+    // Same plain row style as the Send tab's "you send" picker: icon + "SYMBOL  addr" with the held
+    // balance appended on the right. Kept identical for consistency (no bold, no custom widgets).
+    auto rebuild = [=](const QString &filter) {
+        list->clear();
+        const QString f = filter.trimmed();
+        for (int i = 0; i < assets->size(); ++i) {
+            const Asset &a = assets->at(i);
+            if (!f.isEmpty() && !a.symbol.contains(f, Qt::CaseInsensitive))
+                continue;
+            QString text = a.address.isEmpty()
+                               ? a.symbol
+                               : QStringLiteral("%1   %2").arg(a.symbol, shortAddr(a.address));
+            if (a.held > 0.0)
+                text += QStringLiteral("      %1 %2").arg(formatBalance(a.held), a.symbol);
+            auto *it = new QListWidgetItem(tokenIcon(a.symbol), text, list);
+            it->setData(Qt::UserRole, i);
+        }
+    };
+    rebuild(QString());
+    connect(search, &QLineEdit::textChanged, popup, [=](const QString &t) { rebuild(t); });
+    auto activate = [this, popup, assets, sell](QListWidgetItem *it) {
+        const int i = it->data(Qt::UserRole).toInt();
+        if (i >= 0 && i < assets->size()) {
+            const Asset &a = assets->at(i);
+            setSwapAsset(sell, a.symbol, a.address, a.decimals);
+        }
+        popup->close();
+    };
+    connect(list, &QListWidget::itemClicked, popup, activate);
+    connect(popup, &QObject::destroyed, [assets]() { delete assets; });
+
+    QToolButton *anchor = sell ? m_swapSellButton : m_swapBuyButton;
+    popup->resize(qMax(300, anchor->width() * 2), 360);
+    popup->move(anchor->mapToGlobal(QPoint(0, anchor->height())));
+    popup->show();
+    search->setFocus();
+}
+
+// Clear all "swap in flight" state so the live re-quote guard can't stay stuck (which would block
+// all future quoting). Safe to call on user input or at any terminal state.
+void AeroMainWindow::resetSwapFlow() {
+    m_swapExecQuote.clear();
+    m_swapBuiltTo.clear();
+    m_swapAwaitingApprove = false;
+    m_swapCowExecuting = false;
+    m_swapApprovePolls = 0;
+}
+
+void AeroMainWindow::refreshSwapQuote() {
+    if (!m_wallet || !m_swapPage || ui.tabWidget->indexOf(m_swapPage) < 0)
+        return;
+    // CRITICAL: never re-quote while a swap is being confirmed / approved / submitted. The live
+    // 20s refresh would wipe the routes, reset the selection, and overwrite the flow's status with
+    // "Fetching quotes…", stranding the approve→submit sequence (the user would approve the token
+    // but never get to complete the swap). Reschedule and resume once the swap settles.
+    const bool midFlight = m_swapCowExecuting || m_swapAwaitingApprove ||
+                           !m_swapExecQuote.isEmpty() || !m_swapBuiltTo.isEmpty();
+    if (midFlight) {
+        if (m_swapQuoteTimer)
+            m_swapQuoteTimer->start(20000);
+        return;
+    }
+    if (m_swapBuySymbol.isEmpty()) {
+        m_swapStatus->clear();
+        return;
+    }
+    const bool sellIsNative = m_swapSellAddr.isEmpty();
+    const bool buyIsNative = m_swapBuyAddr.isEmpty();
+    if (sellIsNative && buyIsNative) {
+        m_swapStatus->setText(tr("Pick two different assets."));
+        return;
+    }
+    if (m_swapSellSymbol == m_swapBuySymbol && m_swapSellAddr.compare(m_swapBuyAddr,
+                                                                      Qt::CaseInsensitive) == 0) {
+        m_swapStatus->setText(tr("Pick two different assets."));
+        return;
+    }
+    const QString amt = m_swapAmount->text().trimmed();
+    bool ok = false;
+    const double amtV = amt.toDouble(&ok);
+    if (!ok || amtV <= 0.0) {
+        m_swapStatus->clear();
+        if (m_swapList) m_swapList->clear();
+        return;
+    }
+    const quint8 sellDec = sellIsNative ? 18 : m_swapSellDecimals;
+    const quint8 buyDec = buyIsNative ? 18 : m_swapBuyDecimals;
+    const QString sellAmountWei = m_wallet->parseUnits(amt, sellDec);
+    const int from = m_swapFrom ? qMax(0, m_swapFrom->currentIndex()) : 0;
+
+    m_swapStatus->setText(tr("Fetching quotes from routers…"));
+    const quint32 slipBps = swapSlippageBps();
+    if (m_swapSlipNote) {
+        const bool autoMode = m_swapSlippage &&
+                              m_swapSlippage->currentText().startsWith(QStringLiteral("Auto"));
+        const QString pct = QString::number(slipBps / 100.0, 'f', 2);
+        m_swapSlipNote->setText(autoMode
+            ? tr("Auto: %1% for this trade size — applied to all routers (incl. CoW min-received)").arg(pct)
+            : tr("%1% max slippage — applied to all routers (incl. CoW min-received)").arg(pct));
+    }
+    // Empty address = native coin; core maps it to each router's native sentinel.
+    m_wallet->swapQuotes(static_cast<quint32>(from), m_swapSellAddr, m_swapBuyAddr, sellAmountWei,
+                         sellIsNative, sellDec, buyDec, slipBps);
+
+    // Cross-check / value the outputs against DefiLlama in parallel.
+    const QString sellKey = defillamaKey(m_chainId, sellIsNative ? QString() : m_swapSellAddr);
+    const QString buyKey = defillamaKey(m_chainId, buyIsNative ? QString() : m_swapBuyAddr);
+    if (!sellKey.isEmpty() && !buyKey.isEmpty())
+        m_wallet->defillamaPrices(QStringLiteral("%1,%2").arg(sellKey, buyKey));
+}
+
+void AeroMainWindow::onSwapQuotesReady(const QString &json, const QString &error) {
+    if (!m_swapTab || !m_swapList)
+        return;
+    // Remember the user's manual pick (if any) BEFORE clearing, so a live re-quote doesn't snap the
+    // selection back to "best".
+    const QString desiredRouter = m_swapUserPickedRouter ? m_swapSelRouter : QString();
+    m_swapList->clear();
+    m_swapSelRouter.clear();
+    m_swapConfirmBtn->setEnabled(false);
+    if (m_swapReceive)
+        m_swapReceive->setText(QStringLiteral("—"));
+    if (!error.isEmpty()) {
+        m_swapStatus->setText(tr("No quotes: %1").arg(error));
+        return;
+    }
+    const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8())
+                               .object().value(QStringLiteral("quotes")).toArray();
+    if (arr.isEmpty()) {
+        m_swapStatus->setText(tr("No routes found for this pair/amount."));
+        return;
+    }
+    const bool buyIsNative = m_swapBuyAddr.isEmpty();
+    const quint8 buyDec = buyIsNative ? 18 : m_swapBuyDecimals;
+
+    // Current gas price (wei/gas) for estimating gas cost of routers that don't report a USD gas.
+    const double gasPriceWei = m_feeBaseWei + m_feeTipWei;
+
+    struct Row { QString id, label, kind, buyAmount; double buyH, gasUsd, net; };
+    QList<Row> rows;
+    for (const QJsonValue &v : arr) {
+        const QJsonObject o = v.toObject();
+        Row r;
+        r.id = o.value(QStringLiteral("router_id")).toString();
+        r.label = o.value(QStringLiteral("label")).toString();
+        r.kind = o.value(QStringLiteral("kind")).toString();
+        r.buyAmount = o.value(QStringLiteral("buy_amount")).toString();
+        r.buyH = r.buyAmount.toDouble() / std::pow(10.0, buyDec);
+        r.gasUsd = o.value(QStringLiteral("gas_usd")).toDouble();
+        // Some routers (e.g. OpenOcean) report gas units but not USD — estimate it so the
+        // net-after-gas comparison is fair and we can show a real fee.
+        if (r.gasUsd <= 0.0 && r.kind != QLatin1String("signed-order")) {
+            const double units = o.value(QStringLiteral("gas_estimate")).toString().toDouble();
+            if (units > 0.0 && gasPriceWei > 0.0 && m_nativeUsd > 0.0)
+                r.gasUsd = units * gasPriceWei / 1e18 * m_nativeUsd;
+        }
+        const double buyUsd = m_swapLlamaBuyUsd > 0.0 ? r.buyH * m_swapLlamaBuyUsd : 0.0;
+        // Net-after-gas when we can value the output; else fall back to raw output.
+        r.net = buyUsd > 0.0 ? buyUsd - r.gasUsd : r.buyH;
+        rows.push_back(r);
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) { return a.net > b.net; });
+
+    for (int i = 0; i < rows.size(); ++i) {
+        const Row &r = rows[i];
+        const bool gasless = r.kind == QLatin1String("signed-order");
+
+        auto *it = new QTreeWidgetItem(m_swapList);
+        // Router column: best route gets a star marker.
+        it->setText(0, i == 0 ? tr("\u2605 %1").arg(r.label) : r.label);
+        it->setText(1, QStringLiteral("%1 %2").arg(formatBalance(r.buyH), m_swapBuySymbol));
+        QString net = QStringLiteral("—");
+        if (m_swapLlamaBuyUsd > 0.0) {
+            const double buyUsd = r.buyH * m_swapLlamaBuyUsd;
+            net = fiatStr(r.gasUsd > 0.0 ? buyUsd - r.gasUsd : buyUsd);
+        }
+        it->setText(2, net);
+        it->setText(3, gasless ? tr("gasless") : tr("on-chain"));
+        it->setTextAlignment(1, Qt::AlignRight | Qt::AlignVCenter);
+        it->setTextAlignment(2, Qt::AlignRight | Qt::AlignVCenter);
+        if (gasless)
+            it->setToolTip(3, tr("MEV-protected off-chain order (no gas)"));
+        else if (r.gasUsd > 0.0)
+            it->setToolTip(3, tr("On-chain swap · est. gas ~%1").arg(fiatStr(r.gasUsd)));
+
+        QVariantMap d;
+        d[QStringLiteral("router_id")] = r.id;
+        d[QStringLiteral("label")] = r.label;
+        d[QStringLiteral("kind")] = r.kind;
+        d[QStringLiteral("buy_amount")] = r.buyAmount;
+        d[QStringLiteral("gas_usd")] = r.gasUsd;
+        it->setData(0, Qt::UserRole, d);
+
+        if (i == 0) { // emphasize the best route
+            QFont bold = it->font(0);
+            bold.setBold(true);
+            for (int c = 0; c < 4; ++c)
+                it->setFont(c, bold);
+        }
+    }
+    m_swapStatus->clear();
+    // Re-select the user's router if it's still available; otherwise default to the best (row 0).
+    int selRow = 0;
+    if (!desiredRouter.isEmpty()) {
+        for (int i = 0; i < rows.size(); ++i)
+            if (rows[i].id == desiredRouter) {
+                selRow = i;
+                break;
+            }
+    }
+    m_swapList->setCurrentItem(m_swapList->topLevelItem(selRow));
+    // Keep quotes fresh while the tab is open (rates and gas move).
+    if (m_swapQuoteTimer)
+        m_swapQuoteTimer->start(20000);
+}
+
+// CoW execution continuation: after the user picks CoW and confirms, we fetch a fresh full quote
+// here, show the detailed confirm dialog, and either submit the signed order or run eth-flow.
+void AeroMainWindow::onSwapQuoteReady(const QString &quoteJson, const QString &error) {
+    if (!m_swapTab || !m_swapCowExecuting)
+        return;
+    m_swapCowExecuting = false;
+    if (!error.isEmpty() || quoteJson.isEmpty()) {
+        m_swapStatus->setText(tr("Quote failed: %1").arg(error.isEmpty() ? tr("no route") : error));
+        m_swapConfirmBtn->setEnabled(true);
+        return;
+    }
+    const QJsonObject root = QJsonDocument::fromJson(quoteJson.toUtf8()).object();
+    const bool cowVerified = root.value(QStringLiteral("verified")).toBool();
+    const QJsonObject q = root.value(QStringLiteral("quote")).toObject();
+    const QString buyAmountStr = q.value(QStringLiteral("buyAmount")).toString();
+    if (buyAmountStr.isEmpty()) {
+        m_swapStatus->setText(tr("Quote failed: empty response."));
+        m_swapConfirmBtn->setEnabled(true);
+        return;
+    }
+    m_swapQuoteJson = quoteJson;
+    const bool sellIsNative = m_swapSellAddr.isEmpty();
+    const bool buyIsNative = m_swapBuyAddr.isEmpty();
+    const quint8 sellDec = sellIsNative ? 18 : m_swapSellDecimals;
+    const quint8 buyDec = buyIsNative ? 18 : m_swapBuyDecimals;
+    const double sellH = m_swapAmount->text().trimmed().toDouble();
+    const double buyH = buyAmountStr.toDouble() / std::pow(10.0, buyDec);
+    const double feeH = q.value(QStringLiteral("feeAmount")).toString().toDouble()
+                        / std::pow(10.0, sellDec);
+    const qint64 validTo = static_cast<qint64>(q.value(QStringLiteral("validTo")).toDouble());
+    const double sellUsd = m_swapLlamaSellUsd > 0.0 ? sellH * m_swapLlamaSellUsd : 0.0;
+    const double buyUsd = m_swapLlamaBuyUsd > 0.0 ? buyH * m_swapLlamaBuyUsd : 0.0;
+    const double feeUsd = m_swapLlamaSellUsd > 0.0 ? feeH * m_swapLlamaSellUsd : 0.0;
+    const double refOut = (m_swapLlamaSellUsd > 0.0 && m_swapLlamaBuyUsd > 0.0)
+                              ? sellH * m_swapLlamaSellUsd / m_swapLlamaBuyUsd : 0.0;
+    const double diffPct = refOut > 0.0 ? (buyH - refOut) / refOut * 100.0 : 0.0;
+
+    if (!swapConfirmDialog(sellIsNative, buyIsNative, sellH, buyH, feeH, sellUsd, buyUsd, feeUsd,
+                           refOut, diffPct, validTo, m_swapExecFrom, cowVerified,
+                           QStringLiteral("cow"), QStringLiteral("CoW Protocol"), QString(),
+                           Wallet::cowVaultRelayer())) {
+        m_swapConfirmBtn->setEnabled(true);
+        return;
+    }
+    m_swapExecQuote = m_swapQuoteJson;
+    m_swapExecNative = sellIsNative;
+    if (sellIsNative) {
+        m_swapStatus->setText(tr("Submitting eth-flow order on-chain…"));
+        m_wallet->swapEthFlow(m_swapExecFrom, m_swapExecQuote, m_swapExecBuyAddr,
+                              m_swapExecSlippageBps);
+    } else {
+        m_swapStatus->setText(tr("Checking token approval…"));
+        m_wallet->swapAllowance(m_swapExecFrom, m_swapExecSellAddr);
+    }
+}
+
+void AeroMainWindow::onDefillamaPricesReady(const QString &json, const QString &error) {
+    if (!error.isEmpty() || !m_swapTab)
+        return;
+    const QJsonObject coins = QJsonDocument::fromJson(json.toUtf8()).object()
+                                  .value(QStringLiteral("coins")).toObject();
+    const bool sellIsNative = m_swapSellAddr.isEmpty();
+    const bool buyIsNative = m_swapBuyAddr.isEmpty();
+    const QString sellKey = defillamaKey(m_chainId, sellIsNative ? QString() : m_swapSellAddr);
+    const QString buyKey = defillamaKey(m_chainId, buyIsNative ? QString() : m_swapBuyAddr);
+    m_swapLlamaSellUsd = coins.value(sellKey).toObject().value(QStringLiteral("price")).toDouble();
+    m_swapLlamaBuyUsd = coins.value(buyKey).toObject().value(QStringLiteral("price")).toDouble();
+    updateSwapPayUsd(); // now that we have a sell-token price, show the "≈ $X" under You pay
+}
+
+// Inline swap result (Feather-style): no modal popup. Sets a check-marked status line on the Swap
+// tab (with an optional explorer/CoW link) and refreshes History so the swap shows up there — as a
+// pending CoW order or a freshly-mined on-chain swap.
+// Show a just-placed swap as "pending" in History immediately (works on every network, including
+// on-chain router swaps that only reach the explorer once mined). Reconciled by the model when the
+// real row appears (CoW order by uid, or the mined tx by hash).
+void AeroMainWindow::addPendingSwap(const QString &id) {
+    if (!m_historyModel || id.isEmpty())
+        return;
+    HistoryItem h;
+    h.kind = QStringLiteral("swap");
+    h.status = QStringLiteral("pending");
+    h.direction = QStringLiteral("swap");
+    h.symbol = m_swapSellSymbol;
+    h.formatted = m_swapAmount ? m_swapAmount->text().trimmed() : QString();
+    h.buySymbol = m_swapBuySymbol;
+    const bool buyIsNative = m_swapBuyAddr.isEmpty();
+    const quint8 buyDec = buyIsNative ? 18 : m_swapBuyDecimals;
+    const double buyH = m_swapSelBuyAmount.toDouble() / std::pow(10.0, buyDec);
+    h.buyFormatted = QString::number(buyH, 'f', 6);
+    h.txHash = id;
+    h.counterparty = m_swapSelLabel;
+    h.timestamp = static_cast<quint64>(QDateTime::currentSecsSinceEpoch());
+    m_historyModel->addLocalSwap(h);
+}
+
+void AeroMainWindow::swapInlineDone(const QString &summary, const QString &url,
+                                    const QString &linkText) {
+    if (m_swapStatus) {
+        QString msg = QStringLiteral("\u2714  %1").arg(summary.toHtmlEscaped());
+        if (!url.isEmpty())
+            msg += QStringLiteral("&nbsp;&nbsp;<a href=\"%1\">%2</a>")
+                       .arg(url, linkText.toHtmlEscaped());
+        m_swapStatus->setTextFormat(Qt::RichText);
+        m_swapStatus->setOpenExternalLinks(true);
+        m_swapStatus->setText(msg);
+    }
+    refreshHistoryView();
+    // CoW/explorers need a moment to index; refresh once more so a just-placed order flips to a row.
+    QTimer::singleShot(20000, this, [this]() { refreshHistoryView(); });
+}
+
+bool AeroMainWindow::swapConfirmDialog(bool sellIsNative, bool buyIsNative, double sellH,
+                                       double buyH, double feeH, double sellUsd, double buyUsd,
+                                       double feeUsd, double refOut, double diffPct, qint64 validTo,
+                                       quint32 fromIndex, bool cowVerified, const QString &routerId,
+                                       const QString &routerLabel, const QString &routerTo,
+                                       const QString &routerSpender) {
+    const bool isCow = routerId == QLatin1String("cow");
+    const bool sellKnown = sellIsNative || isKnownToken(m_swapSellAddr);
+    const bool buyKnown = buyIsNative || isKnownToken(m_swapBuyAddr);
+    const bool routerKnown = isCow || isKnownRouter(routerTo);
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Confirm swap"));
+    dlg.setMinimumWidth(500);
+    dlg.setMaximumHeight(720);
+    auto *root = new QVBoxLayout(&dlg);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(0);
+
+    // Scrollable content so a tall confirm never runs off-screen; buttons stay pinned below.
+    auto *scroll = new QScrollArea(&dlg);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    auto *content = new QWidget();
+    auto *cv = new QVBoxLayout(content);
+    cv->setContentsMargins(16, 16, 16, 12);
+    cv->setSpacing(12);
+
+    auto *net = new QLabel(tr("on %1  ·  via %2").arg(chainDefFor(m_chainId).name, routerLabel),
+                           content);
+    net->setStyleSheet(QStringLiteral("color:#8a8a8a;"));
+    cv->addWidget(net);
+
+    // --- Summary: a clean group-box form (matches the Details/Interacting-with sections). ---
+    auto *summary = new QGroupBox(tr("Swap"), content);
+    auto *sg = new QFormLayout(summary);
+    sg->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    sg->setHorizontalSpacing(12);
+    sg->setVerticalSpacing(8);
+    auto valueLabel = [&](double amt, const QString &sym, double usd) {
+        QString t = QStringLiteral("%1 %2").arg(formatBalance(amt), sym);
+        if (usd > 0.0)
+            t += QStringLiteral("   (%1)").arg(fiatStr(usd));
+        auto *l = new QLabel(t, summary);
+        QFont f = l->font();
+        f.setBold(true);
+        l->setFont(f);
+        l->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        return l;
+    };
+    sg->addRow(tr("You pay"), valueLabel(sellH, m_swapSellSymbol, sellUsd));
+    sg->addRow(tr("You receive"), valueLabel(buyH, m_swapBuySymbol, buyUsd));
+    cv->addWidget(summary);
+
+    // --- Security banner (private, no-third-party alternative to Blockaid). ---
+    {
+        auto *sec = new QLabel(content);
+        sec->setWordWrap(true);
+        if (sellKnown && buyKnown && routerKnown && cowVerified) {
+            // All good: a clean green confirmation line (no heavy filled box).
+            sec->setText(isCow
+                ? tr("\u2713 Verified contracts and known tokens\u2014CoW-verified price.")
+                : tr("\u2713 Recognized %1 router and known tokens.").arg(routerLabel));
+            sec->setStyleSheet(QStringLiteral("color:#4caf7d; padding:2px 0;"));
+        } else {
+            // Only surface a highlighted warning when something actually needs checking.
+            QStringList notes;
+            if (!sellKnown || !buyKnown)
+                notes << tr("a token is NOT on your verified list \u2014 check its address below");
+            if (!routerKnown)
+                notes << tr("the router contract is not recognized \u2014 verify it");
+            if (isCow && !cowVerified)
+                notes << tr("CoW could not verify this price");
+            sec->setText(tr("\u26a0 Review carefully: %1.").arg(notes.join(QStringLiteral("; "))));
+            sec->setStyleSheet(QStringLiteral(
+                "color:#c99a3a; background:rgba(200,150,0,0.10); border-radius:6px; padding:8px;"));
+        }
+        cv->addWidget(sec);
+    }
+
+    // --- Transaction details. ---
+    auto *det = new QGroupBox(tr("Details"), content);
+    auto *df = new QFormLayout(det);
+    df->setLabelAlignment(Qt::AlignRight);
+    df->addRow(tr("From"),
+               new QLabel(tr("%1  ·  %2").arg(accountLabel(fromIndex),
+                                              shortAddr(m_wallet->address(fromIndex))), det));
+    if (sellH > 0.0)
+        df->addRow(tr("Rate"),
+                   new QLabel(tr("1 %1 \u2248 %2 %3").arg(m_swapSellSymbol, formatBalance(buyH / sellH),
+                                                          m_swapBuySymbol), det));
+    df->addRow(isCow ? tr("Minimum received") : tr("Expected received"),
+               new QLabel(isCow
+                   ? tr("%1 %2  (guaranteed by the order)").arg(formatBalance(buyH), m_swapBuySymbol)
+                   : tr("%1 %2  (min enforced by slippage)").arg(formatBalance(buyH), m_swapBuySymbol),
+                          det));
+    if (isCow) {
+        df->addRow(tr("Network fee"), new QLabel(feeUsd > 0.0
+            ? tr("%1 %2  (%3)  ·  from the sold amount")
+                  .arg(formatBalance(feeH), m_swapSellSymbol, fiatStr(feeUsd))
+            : tr("%1 %2  ·  from the sold amount").arg(formatBalance(feeH), m_swapSellSymbol), det));
+    } else {
+        // On-chain routers: the fee is gas, paid separately. Show the estimate (native + USD).
+        QString feeTxt;
+        if (feeH > 0.0 && feeUsd > 0.0)
+            feeTxt = tr("\u2248 %1 %2  (%3)  ·  network gas, est.")
+                         .arg(formatBalance(feeH), m_nativeSymbol, fiatStr(feeUsd));
+        else if (feeUsd > 0.0)
+            feeTxt = tr("\u2248 %1  ·  network gas, est.").arg(fiatStr(feeUsd));
+        else
+            feeTxt = tr("paid separately in %1 gas (estimate unavailable)").arg(m_nativeSymbol);
+        df->addRow(tr("Network fee"), new QLabel(feeTxt, det));
+    }
+    if (refOut > 0.0) {
+        auto *ref = new QLabel(tr("\u2248 %1 %2  (%3%4% vs quote)")
+                                   .arg(formatBalance(refOut), m_swapBuySymbol,
+                                        diffPct >= 0 ? QStringLiteral("+") : QString(),
+                                        QString::number(diffPct, 'f', 2)), det);
+        if (diffPct < -5.0)
+            ref->setStyleSheet(QStringLiteral("color:#d0a000;"));
+        df->addRow(tr("DefiLlama price"), ref);
+    }
+    if (validTo > 0)
+        df->addRow(tr("Order expires"),
+                   new QLabel(QDateTime::fromSecsSinceEpoch(validTo).toString(Qt::TextDate), det));
+    df->addRow(tr("Method"), new QLabel(isCow
+        ? (sellIsNative ? tr("On-chain (eth-flow) — you pay gas")
+                        : tr("Off-chain signature (EIP-712) — gasless"))
+        : tr("On-chain via %1 — you pay gas").arg(routerLabel), det));
+    cv->addWidget(det);
+
+    // --- Interacting with — exact contract addresses + verified/unverified badges. ---
+    auto *contracts = new QGroupBox(tr("Interacting with (verify addresses)"), content);
+    auto *xf = new QFormLayout(contracts);
+    xf->setLabelAlignment(Qt::AlignRight);
+    auto addrRow = [&](const QString &name, const QString &addr, int trust) {
+        auto *w = new QWidget(contracts);
+        auto *h = new QHBoxLayout(w);
+        h->setContentsMargins(0, 0, 0, 0);
+        auto *l = new QLabel(addr, w);
+        l->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        l->setStyleSheet(QStringLiteral("font-family:Consolas,monospace;"));
+        h->addWidget(l, 1);
+        if (trust >= 0) {
+            auto *badge = new QLabel(trust == 1 ? tr("\u2713 verified") : tr("\u26a0 unverified"), w);
+            // Green for verified, amber for unverified — the address-verification signal the user wants.
+            badge->setStyleSheet(trust == 1 ? QStringLiteral("color:#4caf7d; font-size:11px;")
+                                            : QStringLiteral("color:#d0a000; font-size:11px;"));
+            h->addWidget(badge);
+        }
+        xf->addRow(name, w);
+    };
+    addrRow(tr("Sell token"), sellIsNative ? tr("native %1").arg(m_nativeSymbol) : m_swapSellAddr,
+            sellIsNative ? -1 : (sellKnown ? 1 : 0));
+    addrRow(tr("Buy token"), buyIsNative ? tr("native %1").arg(m_nativeSymbol) : m_swapBuyAddr,
+            buyIsNative ? -1 : (buyKnown ? 1 : 0));
+    if (isCow) {
+        if (sellIsNative)
+            addrRow(tr("CoW eth-flow"),
+                    QStringLiteral("0x40A50cf069e992AA4536211B23F286eF88752187"), 1);
+        addrRow(tr("GPv2 Settlement"), Wallet::cowSettlement(), 1);
+        if (!sellIsNative)
+            addrRow(tr("Vault Relayer (spender)"), Wallet::cowVaultRelayer(), 1);
+    } else {
+        addrRow(tr("%1 router").arg(routerLabel), routerTo, isKnownRouter(routerTo) ? 1 : 0);
+        if (!sellIsNative)
+            addrRow(tr("Approval spender"), routerSpender, isKnownRouter(routerSpender) ? 1 : 0);
+    }
+    cv->addWidget(contracts);
+
+    auto *tip = new QLabel(isCow
+        ? tr("Tip: try a small amount first. Orders are settled by CoW solvers.")
+        : tr("Tip: try a small amount first. This sends an on-chain swap via %1.").arg(routerLabel),
+        content);
+    tip->setWordWrap(true);
+    tip->setStyleSheet(QStringLiteral("color:#8a8a8a; font-size:11px;"));
+    cv->addWidget(tip);
+    cv->addStretch(1);
+
+    scroll->setWidget(content);
+    root->addWidget(scroll, 1);
+
+    // --- Pinned button bar (outside the scroll). ---
+    auto *btnBar = new QWidget(&dlg);
+    auto *bh = new QHBoxLayout(btnBar);
+    bh->setContentsMargins(16, 8, 16, 12);
+    bh->addStretch(1);
+    auto *rejectBtn = new QPushButton(tr("Reject"), btnBar);
+    rejectBtn->setCursor(Qt::PointingHandCursor);
+    // Native (theme) buttons — no custom green fill; the default button is the primary action.
+    auto *confirmBtn = new QPushButton(tr("Confirm swap"), btnBar);
+    confirmBtn->setDefault(true);
+    confirmBtn->setCursor(Qt::PointingHandCursor);
+    connect(rejectBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
+    connect(confirmBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
+    bh->addWidget(rejectBtn);
+    bh->addWidget(confirmBtn);
+    root->addWidget(btnBar);
+
+    return dlg.exec() == QDialog::Accepted;
+}
+
+bool AeroMainWindow::isKnownToken(const QString &addr) const {
+    return !addr.isEmpty() && verifiedTokenAddresses().contains(addr.toLower());
+}
+
+QString AeroMainWindow::spendingApprovalDialog(const QString &tokenSymbol, const QString &tokenAddr,
+                                               const QString &spenderName, const QString &spenderAddr,
+                                               const QString &exactHuman, const QString &exactWei) {
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Approve spending cap"));
+    dlg.setMinimumWidth(460);
+    auto *root = new QVBoxLayout(&dlg);
+    root->setSpacing(10);
+
+    auto *header = new QLabel(tr("Allow %1 to use your %2?").arg(spenderName, tokenSymbol), &dlg);
+    QFont hf = header->font();
+    hf.setBold(true);
+    hf.setPointSize(hf.pointSize() + 2);
+    header->setFont(hf);
+    header->setWordWrap(true);
+    root->addWidget(header);
+
+    auto *desc = new QLabel(tr("The router settles swaps by pulling the token you sell from your "
+                               "wallet, so it needs a one-time on-chain approval (costs gas). Approve "
+                               "only what this swap needs — a smaller cap limits what could ever be "
+                               "moved."),
+                            &dlg);
+    desc->setWordWrap(true);
+    desc->setStyleSheet(QStringLiteral("color:#8a8a8a;"));
+    root->addWidget(desc);
+
+    // Editable spending cap: exact (recommended) or unlimited — MetaMask-style.
+    auto *capBox = new QGroupBox(tr("Spending cap"), &dlg);
+    auto *cv = new QVBoxLayout(capBox);
+    auto *rbExact = new QRadioButton(
+        tr("This swap only — %1 %2  (recommended)").arg(exactHuman, tokenSymbol), capBox);
+    auto *rbMax = new QRadioButton(tr("Unlimited — don't ask again for %1").arg(tokenSymbol), capBox);
+    rbExact->setChecked(true);
+    cv->addWidget(rbExact);
+    cv->addWidget(rbMax);
+    auto *maxWarn = new QLabel(
+        tr("\u26a0 Unlimited lets the spender move any amount of your %1 in the future.")
+            .arg(tokenSymbol), capBox);
+    maxWarn->setWordWrap(true);
+    maxWarn->setStyleSheet(QStringLiteral("color:#d0a000;"));
+    maxWarn->setVisible(false);
+    cv->addWidget(maxWarn);
+    connect(rbMax, &QRadioButton::toggled, maxWarn, &QLabel::setVisible);
+    root->addWidget(capBox);
+
+    auto *box = new QGroupBox(tr("Details"), &dlg);
+    auto *f = new QFormLayout(box);
+    auto addr = [&](const QString &n, const QString &a, bool known) {
+        auto *w = new QWidget(box);
+        auto *h = new QHBoxLayout(w);
+        h->setContentsMargins(0, 0, 0, 0);
+        auto *l = new QLabel(a, w);
+        l->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        l->setStyleSheet(QStringLiteral("font-family:Consolas,monospace;"));
+        h->addWidget(l, 1);
+        auto *badge = new QLabel(known ? tr("\u2713 verified") : tr("\u26a0 unverified"), w);
+        badge->setStyleSheet(known ? QStringLiteral("color:#4caf7d;")
+                                   : QStringLiteral("color:#d0a000;"));
+        h->addWidget(badge);
+        f->addRow(n, w);
+    };
+    addr(tr("Token"), tokenAddr, isKnownToken(tokenAddr));
+    addr(tr("Spender"), spenderAddr, isKnownRouter(spenderAddr));
+    f->addRow(tr("Network"), new QLabel(chainDefFor(m_chainId).name, box));
+    // Estimated gas cost of THIS one-time ERC-20 approval tx (~55k gas), so it's not a mystery fee.
+    {
+        const double gasPriceWei = m_feeBaseWei + m_feeTipWei;
+        QString feeText;
+        if (gasPriceWei > 0.0) {
+            const double feeNative = 55000.0 * gasPriceWei / 1e18;
+            feeText = QStringLiteral("\u2248 %1 %2").arg(QString::number(feeNative, 'f', 6),
+                                                         m_nativeSymbol);
+            if (m_nativeUsd > 0.0)
+                feeText += QStringLiteral("  (%1)").arg(fiatStr(feeNative * m_nativeUsd));
+        } else {
+            feeText = tr("estimated at approval time");
+        }
+        auto *feeLbl = new QLabel(feeText, box);
+        feeLbl->setToolTip(tr("Gas for the one-time approval transaction — not the swap itself."));
+        f->addRow(tr("Network fee"), feeLbl);
+    }
+    root->addWidget(box);
+
+    auto *note = new QLabel(tr("You can revoke this anytime via Tools \u2192 Revoke Token Approvals."),
+                            &dlg);
+    note->setWordWrap(true);
+    note->setStyleSheet(QStringLiteral("color:#8a8a8a;"));
+    root->addWidget(note);
+
+    auto *bb = new QDialogButtonBox(&dlg);
+    auto *ok = bb->addButton(tr("Approve"), QDialogButtonBox::AcceptRole);
+    bb->addButton(tr("Reject"), QDialogButtonBox::RejectRole);
+    ok->setDefault(true);
+    connect(bb, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    root->addWidget(bb);
+    if (dlg.exec() != QDialog::Accepted)
+        return QString();
+    return rbMax->isChecked() ? QStringLiteral("max") : exactWei;
+}
+
+void AeroMainWindow::onSwapConfirm() {
+    if (!m_wallet || m_swapSelRouter.isEmpty())
+        return;
+    const bool sellIsNative = m_swapSellAddr.isEmpty();
+    const int from = m_swapFrom ? qMax(0, m_swapFrom->currentIndex()) : 0;
+    const quint8 sellDec = sellIsNative ? 18 : m_swapSellDecimals;
+    const QString sellAmountWei = m_wallet->parseUnits(m_swapAmount->text().trimmed(), sellDec);
+
+    // Capture the execution context shared by both the CoW and on-chain-router paths.
+    m_swapExecFrom = static_cast<quint32>(from);
+    m_swapExecSellAddr = m_swapSellAddr;
+    m_swapExecBuyAddr = m_swapBuyAddr;
+    m_swapExecSellAmountWei = sellAmountWei;
+    m_swapExecNative = sellIsNative;
+    m_swapExecSlippageBps = swapSlippageBps(); // lock the slippage for this swap
+    m_swapBuiltTo.clear();
+    m_swapAwaitingApprove = false; // fresh attempt
+    m_swapApprovePolls = 0;
+    m_swapConfirmBtn->setEnabled(false);
+
+    if (m_swapSelKind == QLatin1String("signed-order")) {
+        // CoW: fetch a fresh full quote, then onSwapQuoteReady shows the confirm + executes.
+        m_swapCowExecuting = true;
+        m_swapStatus->setText(tr("Getting a fresh CoW quote…"));
+        const QString buyParam = m_swapBuyAddr.isEmpty() ? Wallet::buyEthSentinel() : m_swapBuyAddr;
+        m_wallet->swapQuote(m_swapExecFrom, m_swapSellAddr, buyParam, sellAmountWei, sellIsNative);
+    } else {
+        // On-chain router: build fresh calldata, then onRouterBuilt shows the confirm + executes.
+        m_swapStatus->setText(tr("Building %1 transaction…").arg(m_swapSelLabel));
+        m_wallet->routerBuild(m_swapSelRouter, m_swapExecFrom, m_swapSellAddr, m_swapBuyAddr,
+                              sellAmountWei, sellIsNative,
+                              sellIsNative ? 18 : m_swapSellDecimals,
+                              m_swapBuyAddr.isEmpty() ? 18 : m_swapBuyDecimals, swapSlippageBps());
+    }
+}
+
+void AeroMainWindow::onRouterBuilt(const QString &json, const QString &error) {
+    if (m_swapSelKind != QLatin1String("onchain"))
+        return;
+    if (!error.isEmpty() || json.isEmpty()) {
+        m_swapStatus->setText(tr("Couldn't build the swap: %1").arg(error));
+        m_swapConfirmBtn->setEnabled(true);
+        return;
+    }
+    const QJsonObject o = QJsonDocument::fromJson(json.toUtf8()).object();
+    m_swapBuiltTo = o.value(QStringLiteral("to")).toString();
+    m_swapBuiltData = o.value(QStringLiteral("data")).toString();
+    m_swapBuiltValue = o.value(QStringLiteral("value")).toString();
+    m_swapBuiltSpender = o.value(QStringLiteral("spender")).toString();
+    m_swapBuiltMinBuy = o.value(QStringLiteral("min_buy_amount")).toString();
+    const QString buyAmountStr = o.value(QStringLiteral("buy_amount")).toString();
+    if (m_swapBuiltTo.isEmpty() || m_swapBuiltData.isEmpty()) {
+        m_swapStatus->setText(tr("Couldn't build the swap: empty transaction."));
+        m_swapConfirmBtn->setEnabled(true);
+        return;
+    }
+
+    const bool sellIsNative = m_swapExecNative;
+    const bool buyIsNative = m_swapExecBuyAddr.isEmpty();
+    const quint8 sellDec = sellIsNative ? 18 : m_swapSellDecimals;
+    const quint8 buyDec = buyIsNative ? 18 : m_swapBuyDecimals;
+    const double sellH = m_swapAmount->text().trimmed().toDouble();
+    const double buyH = buyAmountStr.toDouble() / std::pow(10.0, buyDec);
+    const double sellUsd = m_swapLlamaSellUsd > 0.0 ? sellH * m_swapLlamaSellUsd : 0.0;
+    const double buyUsd = m_swapLlamaBuyUsd > 0.0 ? buyH * m_swapLlamaBuyUsd : 0.0;
+    const double refOut = (m_swapLlamaSellUsd > 0.0 && m_swapLlamaBuyUsd > 0.0)
+                              ? sellH * m_swapLlamaSellUsd / m_swapLlamaBuyUsd : 0.0;
+    const double diffPct = refOut > 0.0 ? (buyH - refOut) / refOut * 100.0 : 0.0;
+    Q_UNUSED(sellDec);
+    // On-chain fee = estimated gas: show it in native + USD. feeH is the native-coin amount.
+    const double feeUsd = m_swapSelGasUsd;
+    const double feeH = (m_nativeUsd > 0.0) ? m_swapSelGasUsd / m_nativeUsd : 0.0;
+
+    if (!swapConfirmDialog(sellIsNative, buyIsNative, sellH, buyH, feeH, sellUsd, buyUsd, feeUsd,
+                           refOut, diffPct, 0, m_swapExecFrom, isKnownRouter(m_swapBuiltTo),
+                           m_swapSelRouter, m_swapSelLabel, m_swapBuiltTo, m_swapBuiltSpender)) {
+        m_swapConfirmBtn->setEnabled(true);
+        m_swapBuiltTo.clear();
+        return;
+    }
+
+    if (sellIsNative) {
+        m_swapStatus->setText(tr("Sending swap through %1…").arg(m_swapSelLabel));
+        m_wallet->routerSwap(m_swapExecFrom, m_swapBuiltTo, m_swapBuiltValue, m_swapBuiltData);
+    } else {
+        m_swapStatus->setText(tr("Checking token approval…"));
+        m_wallet->routerAllowance(m_swapExecFrom, m_swapExecSellAddr, m_swapBuiltSpender);
+    }
+}
+
+void AeroMainWindow::onRouterAllowanceReady(const QString &token, const QString &spender,
+                                            const QString &allowanceWei, const QString &error) {
+    // Only act during an on-chain swap awaiting its approval check.
+    if (m_swapSelKind != QLatin1String("onchain") || m_swapBuiltTo.isEmpty() ||
+        token.compare(m_swapExecSellAddr, Qt::CaseInsensitive) != 0 ||
+        spender.compare(m_swapBuiltSpender, Qt::CaseInsensitive) != 0)
+        return;
+    if (!error.isEmpty()) {
+        m_swapStatus->setText(tr("Approval check failed: %1").arg(error));
+        m_swapConfirmBtn->setEnabled(true);
+        resetSwapFlow();
+        return;
+    }
+    auto geq = [](const QString &a, const QString &b) {
+        const QString x = a.isEmpty() ? QStringLiteral("0") : a;
+        const QString y = b.isEmpty() ? QStringLiteral("0") : b;
+        if (x.length() != y.length())
+            return x.length() > y.length();
+        return x >= y;
+    };
+    if (geq(allowanceWei, m_swapExecSellAmountWei)) {
+        m_swapStatus->setText(tr("Sending swap through %1…").arg(m_swapSelLabel));
+        m_wallet->routerSwap(m_swapExecFrom, m_swapBuiltTo, m_swapBuiltValue, m_swapBuiltData);
+    } else {
+        const QString cap = spendingApprovalDialog(
+            m_swapSellSymbol, m_swapExecSellAddr, tr("%1 router").arg(m_swapSelLabel), spender,
+            m_swapAmount->text().trimmed(), m_swapExecSellAmountWei);
+        if (cap.isEmpty()) {
+            m_swapStatus->setText(tr("Approval cancelled."));
+            m_swapBuiltTo.clear();
+            m_swapConfirmBtn->setEnabled(true);
+            return;
+        }
+        m_swapStatus->setText(tr("Approving %1…").arg(m_swapSellSymbol));
+        m_wallet->routerApprove(m_swapExecFrom, m_swapExecSellAddr, spender, cap);
+    }
+}
+
+void AeroMainWindow::onRouterApproved(const QString &txHash, const QString &error) {
+    if (m_swapSelKind != QLatin1String("onchain") || m_swapBuiltTo.isEmpty())
+        return;
+    if (!error.isEmpty() || txHash.isEmpty()) {
+        m_swapStatus->setText(tr("Approval failed: %1").arg(error));
+        m_swapConfirmBtn->setEnabled(true);
+        resetSwapFlow();
+        return;
+    }
+    m_swapStatus->setText(tr("Approved (%1). Sending swap through %2…")
+                              .arg(shortAddr(txHash), m_swapSelLabel));
+    m_wallet->routerSwap(m_swapExecFrom, m_swapBuiltTo, m_swapBuiltValue, m_swapBuiltData);
+}
+
+void AeroMainWindow::onRouterSwapSent(const QString &txHash, const QString &error) {
+    if (m_swapSelKind != QLatin1String("onchain"))
+        return;
+    m_swapBuiltTo.clear();
+    if (!error.isEmpty() || txHash.isEmpty()) {
+        m_swapStatus->setText(tr("Swap failed: %1").arg(error));
+        m_swapConfirmBtn->setEnabled(true);
+        return;
+    }
+    addPendingSwap(txHash); // pending in History immediately (reconciled when the tx is mined)
+    swapInlineDone(tr("Swap sent via %1 — %2 → %3. Tracking in History.")
+                       .arg(m_swapSelLabel, m_swapSellSymbol, m_swapBuySymbol),
+                   explorerTxUrl(txHash), tr("View transaction"));
+    notify(tr("Swap submitted"), tr("%1 → %2 via %3").arg(m_swapSellSymbol, m_swapBuySymbol,
+                                                          m_swapSelLabel));
+}
+
+void AeroMainWindow::onSwapAllowanceReady(const QString &token, const QString &allowanceWei,
+                                          const QString &error) {
+    // Only react while a swap is mid-flight for this token.
+    if (m_swapExecNative || m_swapExecQuote.isEmpty() ||
+        token.compare(m_swapExecSellAddr, Qt::CaseInsensitive) != 0)
+        return;
+    if (!error.isEmpty()) {
+        m_swapStatus->setText(tr("Approval check failed: %1").arg(error));
+        m_swapConfirmBtn->setEnabled(true);
+        resetSwapFlow();
+        return;
+    }
+    // Compare allowance vs needed (both decimal-wei strings — compare as big values via double is
+    // imprecise, so compare lengths then lexically for equal length).
+    auto geq = [](const QString &a, const QString &b) {
+        const QString x = a.isEmpty() ? QStringLiteral("0") : a;
+        const QString y = b.isEmpty() ? QStringLiteral("0") : b;
+        if (x.length() != y.length())
+            return x.length() > y.length();
+        return x >= y;
+    };
+    const bool sufficient = geq(allowanceWei, m_swapExecSellAmountWei);
+
+    // If we're polling after an approve, CoW's order-book rejects the order until the approve tx is
+    // actually mined (it checks the on-chain allowance). Wait here until it's sufficient, then submit.
+    if (m_swapAwaitingApprove) {
+        if (sufficient) {
+            m_swapAwaitingApprove = false;
+            m_swapStatus->setText(tr("Approval confirmed. Signing and submitting order…"));
+            m_wallet->swapSubmit(m_swapExecFrom, m_swapExecQuote, m_swapExecSlippageBps);
+        } else if (++m_swapApprovePolls <= 15) {
+            m_swapStatus->setText(tr("Waiting for the approval to confirm on-chain… (%1)")
+                                      .arg(m_swapApprovePolls));
+            QTimer::singleShot(8000, this, [this]() {
+                if (m_wallet && m_swapAwaitingApprove && !m_swapExecQuote.isEmpty())
+                    m_wallet->swapAllowance(m_swapExecFrom, m_swapExecSellAddr);
+            });
+        } else {
+            m_swapAwaitingApprove = false;
+            m_swapStatus->setText(tr("Approval hasn't confirmed yet. Once it does, press Confirm "
+                                     "Swap again."));
+            m_swapConfirmBtn->setEnabled(true);
+        }
+        return;
+    }
+
+    if (sufficient) {
+        m_swapStatus->setText(tr("Signing and submitting order…"));
+        m_wallet->swapSubmit(m_swapExecFrom, m_swapExecQuote, m_swapExecSlippageBps);
+    } else {
+        // MetaMask-style spending-cap approval before the on-chain approve tx. Defaults to the exact
+        // amount this swap needs; the user can opt into unlimited.
+        const QString cap = spendingApprovalDialog(
+            m_swapSellSymbol, m_swapExecSellAddr, tr("CoW Vault Relayer"), Wallet::cowVaultRelayer(),
+            m_swapAmount->text().trimmed(), m_swapExecSellAmountWei);
+        if (cap.isEmpty()) {
+            m_swapStatus->setText(tr("Approval cancelled."));
+            m_swapExecQuote.clear();
+            m_swapConfirmBtn->setEnabled(true);
+            return;
+        }
+        m_swapStatus->setText(cap == QLatin1String("max")
+            ? tr("Approving unlimited %1 for the CoW Vault Relayer…").arg(m_swapSellSymbol)
+            : tr("Approving %1 %2 for the CoW Vault Relayer…").arg(m_swapAmount->text().trimmed(),
+                                                                   m_swapSellSymbol));
+        m_wallet->swapApprove(m_swapExecFrom, m_swapExecSellAddr, cap);
+    }
+}
+
+void AeroMainWindow::onSwapApproved(const QString &txHash, const QString &error) {
+    if (m_swapExecNative || m_swapExecQuote.isEmpty())
+        return;
+    if (!error.isEmpty() || txHash.isEmpty()) {
+        m_swapStatus->setText(tr("Approval failed: %1").arg(error));
+        m_swapConfirmBtn->setEnabled(true);
+        resetSwapFlow();
+        return;
+    }
+    // The approve is only BROADCAST here — CoW needs it MINED before it will accept the order
+    // (otherwise: "order owner must give allowance to VaultRelayer"). Poll the on-chain allowance
+    // and submit once it's live.
+    m_swapAwaitingApprove = true;
+    m_swapApprovePolls = 0;
+    m_swapStatus->setText(tr("Approval sent (%1). Waiting for it to confirm on-chain…")
+                              .arg(shortAddr(txHash)));
+    QTimer::singleShot(8000, this, [this]() {
+        if (m_wallet && m_swapAwaitingApprove && !m_swapExecQuote.isEmpty())
+            m_wallet->swapAllowance(m_swapExecFrom, m_swapExecSellAddr);
+    });
+}
+
+void AeroMainWindow::onSwapSubmitted(const QString &orderUid, const QString &error) {
+    m_swapAwaitingApprove = false;
+    if (!error.isEmpty() || orderUid.isEmpty()) {
+        m_swapStatus->setText(tr("Order failed: %1").arg(error));
+        m_swapConfirmBtn->setEnabled(true);
+        resetSwapFlow();
+        return;
+    }
+    m_swapExecQuote.clear();
+    addPendingSwap(orderUid); // show it as pending in History right away (reconciled via cow_orders)
+    const QString url = QStringLiteral("https://explorer.cow.fi/orders/%1").arg(orderUid);
+    swapInlineDone(tr("Order placed — %1 → %2. Tracking in History.")
+                       .arg(m_swapSellSymbol, m_swapBuySymbol),
+                   url, tr("Track on CoW Explorer"));
+    notify(tr("Swap submitted"), tr("%1 → %2 order placed.").arg(m_swapSellSymbol, m_swapBuySymbol));
+}
+
+void AeroMainWindow::onSwapEthFlowSent(const QString &txHash, const QString &error) {
+    if (!m_swapExecNative)
+        return;
+    m_swapExecQuote.clear();
+    if (!error.isEmpty() || txHash.isEmpty()) {
+        m_swapStatus->setText(tr("eth-flow order failed: %1").arg(error));
+        m_swapConfirmBtn->setEnabled(true);
+        return;
+    }
+    swapInlineDone(tr("Swap sent — %1 → %2. Tracking in History.")
+                       .arg(m_swapSellSymbol, m_swapBuySymbol),
+                   explorerTxUrl(txHash), tr("View transaction"));
+    notify(tr("Swap submitted"), tr("%1 → %2 order sent.").arg(m_swapSellSymbol, m_swapBuySymbol));
+}
+
+// Well-known token-approval spenders to scan for. These are Ethereum-mainnet router/permit
+// addresses; on other chains an allowance() call to a non-existent spender simply returns 0 and is
+// filtered out, so listing them is harmless. Users can add any token+spender manually.
+struct SpenderDef { QString name, address; };
+static const QList<SpenderDef> &curatedSpenders() {
+    static const QList<SpenderDef> defs = {
+        {QStringLiteral("CoW Vault Relayer"), QStringLiteral("0xC92E8bdf79f0507f65a392b0ab4667716BFE0110")},
+        {QStringLiteral("Uniswap V2 Router"), QStringLiteral("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D")},
+        {QStringLiteral("Uniswap Universal Router"), QStringLiteral("0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD")},
+        {QStringLiteral("Permit2"), QStringLiteral("0x000000000022D473030F116dDEE9F6B43aC78BA3")},
+        {QStringLiteral("1inch Aggregation Router v5"), QStringLiteral("0x1111111254EEB25477B68fb85Ed929f73A960582")},
+        {QStringLiteral("0x Exchange Proxy"), QStringLiteral("0xDef1C0ded9bec7F1a1670819833240f027b25EfF")},
+    };
+    return defs;
+}
+
+void AeroMainWindow::showRevokeApprovals() {
+    if (!m_wallet)
+        return;
+    if (m_wallet->isWatchOnly()) {
+        QMessageBox::information(this, tr("Revoke Approvals"),
+                                 tr("This is a watch-only wallet; it can't send revoke transactions."));
+        return;
+    }
+
+    auto *dlg = new QDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowTitle(tr("Revoke Token Approvals"));
+    dlg->resize(740, 480);
+    auto *v = new QVBoxLayout(dlg);
+    v->setSpacing(8);
+
+    auto *info = new QLabel(
+        tr("Approvals let a contract (a \u201cspender\u201d) move your tokens. This lists who can "
+           "move which token for the selected account on %1 \u2014 revoke any you no longer trust.")
+            .arg(chainDefFor(m_chainId).name),
+        dlg);
+    info->setWordWrap(true);
+    info->setStyleSheet(QStringLiteral("color:#8a8a8a;"));
+    v->addWidget(info);
+
+    auto *topRow = new QHBoxLayout();
+    topRow->addWidget(new QLabel(tr("Account:"), dlg));
+    auto *acct = new QComboBox(dlg);
+    acct->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    const quint32 n = m_wallet->numAccounts();
+    for (quint32 i = 0; i < n; ++i)
+        acct->addItem(tokenIcon(m_nativeSymbol), accountLabel(i));
+    acct->setCurrentIndex(qMin<int>(m_account, n > 0 ? n - 1 : 0));
+    topRow->addWidget(acct, 1);
+    auto *scanBtn = new QPushButton(tr("Rescan"), dlg);
+    topRow->addWidget(scanBtn);
+    v->addLayout(topRow);
+
+    // Manual entry.
+    auto *manRow = new QHBoxLayout();
+    auto *manToken = new QLineEdit(dlg);
+    manToken->setPlaceholderText(tr("Token 0x…"));
+    auto *manSpender = new QLineEdit(dlg);
+    manSpender->setPlaceholderText(tr("Spender 0x…"));
+    auto *manCheck = new QPushButton(tr("Check"), dlg);
+    manRow->addWidget(manToken, 2);
+    manRow->addWidget(manSpender, 2);
+    manRow->addWidget(manCheck);
+    v->addLayout(manRow);
+
+    auto *table = new QTableWidget(dlg);
+    table->setColumnCount(4);
+    table->setHorizontalHeaderLabels({tr("Token"), tr("Spender"), tr("Allowance"), QString()});
+    table->horizontalHeader()->setStretchLastSection(false);
+    table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setSelectionMode(QAbstractItemView::NoSelection);
+    v->addWidget(table, 1);
+
+    auto *status = new QLabel(dlg);
+    status->setWordWrap(true);
+    v->addWidget(status);
+
+    // Address -> friendly label (symbol for tokens, name for spenders).
+    auto *symbolFor = new QHash<QString, QString>();
+    for (const TokenInfo &t : m_wallet->tokens())
+        symbolFor->insert(t.address.toLower(), t.symbol);
+    for (const TokenInfo &t : curatedTopTokens(m_chainId))
+        symbolFor->insert(t.address.toLower(), t.symbol);
+    auto *spenderName = new QHash<QString, QString>();
+    for (const SpenderDef &s : curatedSpenders())
+        spenderName->insert(s.address.toLower(), s.name);
+    // Pending queue for "Revoke All" (each revoke is a separate tx, sent sequentially so nonces
+    // don't collide — the next fires only after the previous is broadcast).
+    auto *revokeQueue = new QList<QPair<QString, QString>>();
+    connect(dlg, &QObject::destroyed, [symbolFor, spenderName, revokeQueue]() {
+        delete symbolFor;
+        delete spenderName;
+        delete revokeQueue;
+    });
+    // A friendly, shortened allowance label ("Unlimited" for effectively-max approvals).
+    auto allowanceLabel = [](const QString &wei) -> QString {
+        if (wei.length() >= 30) // ~1e30+ base units => practically unlimited
+            return tr("Unlimited");
+        return wei;
+    };
+
+    // Adds/updates one row with a Revoke button.
+    auto addRow = [=](const QString &token, const QString &spender, const QString &wei) {
+        const int r = table->rowCount();
+        table->insertRow(r);
+        const QString tsym = symbolFor->value(token.toLower(), shortAddr(token));
+        const QString sname = spenderName->value(spender.toLower(), shortAddr(spender));
+        auto *tItem = new QTableWidgetItem(tsym);
+        tItem->setToolTip(token);
+        auto *sItem = new QTableWidgetItem(sname);
+        sItem->setToolTip(spender);
+        table->setItem(r, 0, tItem);
+        table->setItem(r, 1, sItem);
+        table->setItem(r, 2, new QTableWidgetItem(allowanceLabel(wei)));
+        auto *revoke = new QPushButton(tr("Revoke"), table);
+        table->setCellWidget(r, 3, revoke);
+        const quint32 idx = static_cast<quint32>(acct->currentIndex());
+        connect(revoke, &QPushButton::clicked, dlg, [=]() {
+            if (QMessageBox::question(dlg, tr("Revoke"),
+                                      tr("Revoke %1's approval for %2?").arg(sname, tsym))
+                != QMessageBox::Yes)
+                return;
+            revoke->setEnabled(false);
+            revoke->setText(tr("Revoking…"));
+            m_wallet->revokeApproval(idx, token, spender);
+        });
+    };
+
+    connect(m_wallet, &Wallet::tokenAllowancesReady, dlg,
+            [=](const QString &json, const QString &error) {
+                scanBtn->setEnabled(true);
+                scanBtn->setText(tr("Scan"));
+                if (!error.isEmpty()) {
+                    status->setText(tr("Scan failed: %1").arg(error));
+                    return;
+                }
+                const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8())
+                                           .object().value(QStringLiteral("allowances")).toArray();
+                for (const QJsonValue &vv : arr) {
+                    const QJsonObject o = vv.toObject();
+                    addRow(o.value(QStringLiteral("token")).toString(),
+                           o.value(QStringLiteral("spender")).toString(),
+                           o.value(QStringLiteral("allowance")).toString());
+                }
+                status->setText(arr.isEmpty() ? tr("No outstanding approvals found.")
+                                              : tr("Found %1 approval(s).").arg(arr.size()));
+            });
+
+    connect(m_wallet, &Wallet::approvalRevoked, dlg,
+            [=](const QString &token, const QString &spender, const QString &txHash,
+                const QString &error) {
+                Q_UNUSED(token);
+                Q_UNUSED(spender);
+                if (!error.isEmpty() || txHash.isEmpty()) {
+                    status->setText(tr("Revoke failed: %1").arg(error));
+                    revokeQueue->clear(); // stop the batch on any failure
+                    for (int r = 0; r < table->rowCount(); ++r)
+                        if (auto *b = qobject_cast<QPushButton *>(table->cellWidget(r, 3))) {
+                            b->setEnabled(true);
+                            b->setText(tr("Revoke"));
+                        }
+                    return;
+                }
+                // If a "Revoke All" batch is running, fire the next one now that this was broadcast.
+                if (!revokeQueue->isEmpty()) {
+                    const QPair<QString, QString> next = revokeQueue->takeFirst();
+                    status->setText(tr("Revoke sent (%1). %2 more…")
+                                        .arg(shortAddr(txHash)).arg(revokeQueue->size() + 1));
+                    m_wallet->revokeApproval(static_cast<quint32>(acct->currentIndex()), next.first,
+                                             next.second);
+                } else {
+                    status->setText(tr("Revoke sent (%1). Rescan to confirm.").arg(shortAddr(txHash)));
+                }
+            });
+
+    auto runScan = [=]() {
+        const quint32 fromIndex = static_cast<quint32>(acct->currentIndex());
+        table->setRowCount(0);
+        QSet<QString> tokenSet;
+        auto addTok = [&](const QString &a) {
+            if (!a.isEmpty()) tokenSet.insert(a);
+        };
+        for (const TokenInfo &t : m_wallet->tokens())
+            addTok(t.address);
+        for (const TokenInfo &t : curatedTopTokens(m_chainId))
+            addTok(t.address);
+        if (!chainDefFor(m_chainId).wrappedNative.isEmpty())
+            addTok(chainDefFor(m_chainId).wrappedNative);
+        if (m_historyModel)
+            for (int r = 0; r < m_historyModel->rowCount(); ++r) {
+                const HistoryItem h = m_historyModel->itemAt(r);
+                addTok(h.token);
+            }
+        QJsonArray tokens;
+        for (const QString &t : tokenSet)
+            tokens.append(t);
+        QJsonArray spenders;
+        for (const SpenderDef &s : curatedSpenders())
+            spenders.append(s.address);
+        if (tokens.isEmpty()) {
+            status->setText(tr("No tokens to scan (add tokens or use manual check)."));
+            return;
+        }
+        scanBtn->setEnabled(false);
+        scanBtn->setText(tr("Scanning…"));
+        status->setText(tr("Scanning %1 token(s) × %2 spender(s)…")
+                            .arg(tokens.size()).arg(spenders.size()));
+        m_wallet->tokenAllowances(fromIndex, QString::fromUtf8(QJsonDocument(tokens).toJson(
+                                                 QJsonDocument::Compact)),
+                                  QString::fromUtf8(QJsonDocument(spenders).toJson(
+                                      QJsonDocument::Compact)));
+    };
+    connect(scanBtn, &QPushButton::clicked, dlg, runScan);
+    // Switching account re-scans for that account's approvals.
+    connect(acct, &QComboBox::currentIndexChanged, dlg, [runScan](int) { runScan(); });
+
+    connect(manCheck, &QPushButton::clicked, dlg, [=]() {
+        const QString tk = manToken->text().trimmed();
+        const QString sp = manSpender->text().trimmed();
+        if (tk.size() != 42 || sp.size() != 42) {
+            status->setText(tr("Enter a valid token and spender address."));
+            return;
+        }
+        QJsonArray tokens{tk};
+        QJsonArray spenders{sp};
+        status->setText(tr("Checking…"));
+        m_wallet->tokenAllowances(static_cast<quint32>(acct->currentIndex()),
+                                  QString::fromUtf8(QJsonDocument(tokens).toJson(QJsonDocument::Compact)),
+                                  QString::fromUtf8(QJsonDocument(spenders).toJson(QJsonDocument::Compact)));
+    });
+
+    auto *btnRow = new QHBoxLayout();
+    auto *revokeAllBtn = new QPushButton(tr("Revoke All"), dlg);
+    revokeAllBtn->setToolTip(tr("Send a revoke transaction for every approval listed above."));
+    connect(revokeAllBtn, &QPushButton::clicked, dlg, [=]() {
+        const int rows = table->rowCount();
+        if (rows == 0) {
+            status->setText(tr("Nothing to revoke."));
+            return;
+        }
+        if (QMessageBox::question(
+                dlg, tr("Revoke All"),
+                tr("Revoke all %1 approval(s) for this account? This sends %1 transaction(s) "
+                   "(you pay gas for each).").arg(rows)) != QMessageBox::Yes)
+            return;
+        revokeQueue->clear();
+        for (int r = 0; r < rows; ++r) {
+            const QString token = table->item(r, 0)->toolTip();   // full address (tooltip)
+            const QString spender = table->item(r, 1)->toolTip();
+            revokeQueue->append({token, spender});
+            if (auto *b = qobject_cast<QPushButton *>(table->cellWidget(r, 3))) {
+                b->setEnabled(false);
+                b->setText(tr("Queued…"));
+            }
+        }
+        const QPair<QString, QString> first = revokeQueue->takeFirst();
+        status->setText(tr("Revoking all %1… (1 of %1)").arg(rows));
+        m_wallet->revokeApproval(static_cast<quint32>(acct->currentIndex()), first.first,
+                                 first.second);
+    });
+    btnRow->addWidget(revokeAllBtn);
+    btnRow->addStretch(1);
+    auto *closeBtn = new QPushButton(tr("Close"), dlg);
+    connect(closeBtn, &QPushButton::clicked, dlg, &QDialog::accept);
+    btnRow->addWidget(closeBtn);
+    v->addLayout(btnRow);
+
+    dlg->show();
+    runScan();
 }
 
 // Load a QPixmap from raw image bytes; returns a null pixmap if the format isn't supported.
@@ -1216,6 +3035,8 @@ void AeroMainWindow::setupMenu() {
             &AeroMainWindow::onSignUnsigned);
     connect(ui.menuTools->addAction(tr("Send to Many…")), &QAction::triggered, this,
             &AeroMainWindow::onSendMany);
+    connect(ui.menuTools->addAction(tr("Revoke Token Approvals…")), &QAction::triggered, this,
+            &AeroMainWindow::showRevokeApprovals);
     ui.menuTools->addSeparator();
     m_speedUpAction = ui.menuTools->addAction(tr("Speed Up Last Transaction"));
     m_cancelTxAction = ui.menuTools->addAction(tr("Cancel Last Transaction"));
@@ -1468,9 +3289,26 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     }
     connect(m_wallet, &Wallet::unsignedTxReady, this, &AeroMainWindow::onUnsignedTxReady);
     connect(m_wallet, &Wallet::manySent, this, &AeroMainWindow::onManySent);
+    // CoW swap signals.
+    connect(m_wallet, &Wallet::swapQuoteReady, this, &AeroMainWindow::onSwapQuoteReady);
+    connect(m_wallet, &Wallet::defillamaPricesReady, this, &AeroMainWindow::onDefillamaPricesReady);
+    connect(m_wallet, &Wallet::swapAllowanceReady, this, &AeroMainWindow::onSwapAllowanceReady);
+    connect(m_wallet, &Wallet::swapApproved, this, &AeroMainWindow::onSwapApproved);
+    connect(m_wallet, &Wallet::swapSubmitted, this, &AeroMainWindow::onSwapSubmitted);
+    connect(m_wallet, &Wallet::swapEthFlowSent, this, &AeroMainWindow::onSwapEthFlowSent);
+    // Multi-router aggregator signals.
+    connect(m_wallet, &Wallet::swapQuotesReady, this, &AeroMainWindow::onSwapQuotesReady);
+    connect(m_wallet, &Wallet::routerBuilt, this, &AeroMainWindow::onRouterBuilt);
+    connect(m_wallet, &Wallet::routerAllowanceReady, this, &AeroMainWindow::onRouterAllowanceReady);
+    connect(m_wallet, &Wallet::routerApproved, this, &AeroMainWindow::onRouterApproved);
+    connect(m_wallet, &Wallet::routerSwapSent, this, &AeroMainWindow::onRouterSwapSent);
     // Event-driven history: after a batched balance refresh, only re-pull the (heavy) history if a
     // balance actually changed. This keeps steady-state bandwidth to the cheap balance batch.
     connect(m_wallet, &Wallet::allBalancesRefreshed, this, [this]() {
+        if (m_swapPage && ui.tabWidget->indexOf(m_swapPage) >= 0) {
+            updateSwapAvailable(); // keep the Swap "Available" line current
+            updateSwapPayUsd();
+        }
         if (m_balancesChanged) {
             m_balancesChanged = false;
             refreshHistoryView();
@@ -1502,8 +3340,15 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
 
     rebuildAccountCombos();
     populateSendCurrencies();
-    selectAddressRow(0);
+    // Reopen at the account last selected for THIS wallet (persisted per-wallet), not always #0.
+    quint32 savedAcct = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
+                            .value(selectedAccountKey(m_wallet->walletPath()), 0).toUInt();
+    if (savedAcct >= m_wallet->numAccounts())
+        savedAcct = 0;
+    m_account = savedAcct;
+    selectAddressRow(savedAcct); // selects the Receive row (fires onAccountChanged if visible)
     updateReceive();
+    updateSwapTabEnabled(); // Swap tab depends on chain (CoW) + watch-only status
 
     autoConnect();
 
@@ -1530,8 +3375,20 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     // Fees are only polled per-block while the Send tab is open (see onBlockNumber), so refresh
     // them once when the user switches to Send to make sure the estimate is current.
     connect(ui.tabWidget, &QTabWidget::currentChanged, this, [this](int) {
-        if (m_wallet && ui.tabWidget->currentWidget() == ui.tabSend)
+        if (!m_wallet)
+            return;
+        QWidget *w = ui.tabWidget->currentWidget();
+        // Carry the account selected in Receive (the "active" account) into Send / Swap so it's
+        // already chosen as "From" when you switch tabs — no re-picking needed.
+        if (w == ui.tabSend) {
+            if (m_fromCombo && static_cast<int>(m_account) < m_fromCombo->count())
+                m_fromCombo->setCurrentIndex(static_cast<int>(m_account));
             m_wallet->refreshFees();
+        } else if (w == m_swapPage) {
+            if (m_swapFrom && static_cast<int>(m_account) < m_swapFrom->count())
+                m_swapFrom->setCurrentIndex(static_cast<int>(m_account));
+            m_wallet->refreshFees(); // populate gas price for route net-after-gas + approval fee est.
+        }
     });
 }
 
@@ -1661,6 +3518,26 @@ void AeroMainWindow::switchChain(quint64 chainId) {
     setSendAsset(m_nativeSymbol, QString(), 18);
     updateAmountUnit();
 
+    // Reset the Swap tab for the new chain (native sell asset, clear buy/quote) and show/hide it
+    // depending on whether CoW supports this chain.
+    m_swapSellSymbol = m_nativeSymbol;
+    m_swapSellAddr.clear();
+    m_swapSellDecimals = 18;
+    m_swapBuySymbol.clear();
+    m_swapBuyAddr.clear();
+    m_swapQuoteJson.clear();
+    m_swapSelRouter.clear();
+    m_swapUserPickedRouter = false;
+    resetSwapFlow(); // switching chains abandons any in-flight swap
+    if (m_swapSellButton) m_swapSellButton->setText(m_nativeSymbol + QStringLiteral("  \u25be"));
+    if (m_swapBuyButton) m_swapBuyButton->setText(tr("Select \u25be"));
+    if (m_swapList) m_swapList->clear();
+    if (m_swapReceive) m_swapReceive->setText(QStringLiteral("—"));
+    if (m_swapRate) m_swapRate->clear();
+    if (m_swapStatus) m_swapStatus->clear();
+    if (m_swapConfirmBtn) m_swapConfirmBtn->setEnabled(false);
+    updateSwapTabEnabled();
+
     // Update the Home native ticker label + any native-symbol labels.
     relabelNative();
 
@@ -1758,7 +3635,21 @@ void AeroMainWindow::refreshAllBalances() {
     // ONE batched request fetches native + all tracked-token balances for every account, instead of
     // firing numAccounts × (1 + numTokens) independent Tor calls (which trickled in one-by-one and
     // could overwhelm Tor so nothing loaded). Results arrive via the usual per-account signals.
-    m_wallet->refreshAllBalances(m_wallet->numAccounts());
+    //
+    // Include the CURRENT chain's curated tokens as extras so their balances load proactively (the
+    // Send/Swap pickers show them right away) without permanently tracking cross-chain tokens — the
+    // default tracked list is mainnet-only, so on other chains the real tokens otherwise showed no
+    // balance until individually selected.
+    QJsonArray extra;
+    for (const TokenInfo &t : curatedTopTokens(m_chainId)) {
+        QJsonObject o;
+        o[QStringLiteral("address")] = t.address;
+        o[QStringLiteral("symbol")] = t.symbol;
+        o[QStringLiteral("decimals")] = static_cast<int>(t.decimals);
+        extra.append(o);
+    }
+    const QString extraJson = QString::fromUtf8(QJsonDocument(extra).toJson(QJsonDocument::Compact));
+    m_wallet->refreshAllBalances(m_wallet->numAccounts(), extraJson);
 }
 
 void AeroMainWindow::updateUsed(quint32 index) {
@@ -1926,7 +3817,10 @@ void AeroMainWindow::updateAvailable() {
 void AeroMainWindow::onAvailableBalance(quint32 index, const QString &token,
                                          const QString &formatted, const QString &symbol) {
     // Accumulate per-account token balances for the combined Home total (token != "" == ERC20).
-    if (!token.isEmpty()) {
+    // An empty `formatted` means the read FAILED (a genuine zero comes through as "0"); ignore it so
+    // a transient Tor/RPC hiccup can't flicker the cached balance to 0 and fire a spurious
+    // "payment received" on the next good read.
+    if (!token.isEmpty() && !formatted.isEmpty()) {
         const QString key = QStringLiteral("%1|%2").arg(index).arg(token);
         const double newBal = formatted.toDouble();
         const double oldBal = m_tokenRawByKey.value(key, -1.0);
@@ -1983,6 +3877,15 @@ void AeroMainWindow::rebuildAccountCombos() {
             m_fromCombo->addItem(tokenIcon(m_nativeSymbol), accountLabel(i));
         m_fromCombo->setCurrentIndex(prev >= 0 && prev < static_cast<int>(n) ? prev : 0);
     }
+    // Swap's "From" selector mirrors the Send one.
+    if (m_swapFrom) {
+        QSignalBlocker block(m_swapFrom);
+        const int prev = m_swapFrom->currentIndex();
+        m_swapFrom->clear();
+        for (quint32 i = 0; i < n; ++i)
+            m_swapFrom->addItem(tokenIcon(m_nativeSymbol), accountLabel(i));
+        m_swapFrom->setCurrentIndex(prev >= 0 && prev < static_cast<int>(n) ? prev : 0);
+    }
     if (m_addressModel)
         m_addressModel->refresh();
     rebuildHistoryCombo();
@@ -2036,6 +3939,11 @@ void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, c
         QSignalBlocker block(m_fromCombo);
         m_fromCombo->setItemText(static_cast<int>(index), accountLabel(index));
     }
+    // Same for the Swap tab's "From account" selector, so its dropdown shows balances too.
+    if (m_swapFrom && static_cast<int>(index) < m_swapFrom->count()) {
+        QSignalBlocker block(m_swapFrom);
+        m_swapFrom->setItemText(static_cast<int>(index), accountLabel(index));
+    }
     if (index == m_account) {
         showCachedBalance(m_account); // bottom-left status balance (native + tokens), from the batch
         updateReceive();              // refresh the balance shown under the QR
@@ -2078,6 +3986,9 @@ void AeroMainWindow::updateReceive() {
 void AeroMainWindow::onAccountChanged(int index) {
     if (index < 0 || !m_wallet) return;
     m_account = static_cast<quint32>(index);
+    // Remember this account (per-wallet) so the next open reopens here, not at #0.
+    QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
+        .setValue(selectedAccountKey(m_wallet->walletPath()), m_account);
     showCachedBalance(m_account); // instant bottom-left balance from cache (Feather-style)
     updateReceive();
     onRefresh();
@@ -2561,7 +4472,7 @@ void AeroMainWindow::showTokenSettings() {
     };
 
     // Curated top tokens that aren't already tracked by the wallet.
-    for (const TokenInfo &t : curatedTopTokens())
+    for (const TokenInfo &t : curatedTopTokens(m_chainId))
         if (!trackedAddrs.contains(t.address.toLower()))
             addRow(t.address, t.symbol, t.decimals, Curated, !disabled.contains(t.address.toLower()));
     // Wallet-tracked tokens (the defaults + anything imported) — always shown, checked.
@@ -3122,6 +5033,7 @@ void AeroMainWindow::onEthUsdPrice(double usdPerEth) {
     recomputeHomeTotal(); // native valuation uses the chain-aware price
     updateFeeEstimate();  // fee is also shown in USD
     updateHistoryPricing(); // dust filter values incoming transfers in USD
+    updateSwapPayUsd();    // Swap "You pay" USD (native fallback uses this price)
 }
 
 QString AeroMainWindow::fiatStr(double usd) const {
@@ -3156,7 +5068,7 @@ QSet<QString> AeroMainWindow::verifiedTokenAddresses() const {
     for (const QString &a : s.value(QStringLiteral("tokens/disabled")).toStringList())
         disabled.insert(a.toLower());
     QSet<QString> out;
-    for (const TokenInfo &t : curatedTopTokens())
+    for (const TokenInfo &t : curatedTopTokens(m_chainId))
         if (!disabled.contains(t.address.toLower()))
             out.insert(t.address.toLower());
     if (m_wallet) // balance-tracked tokens (the defaults + anything the user imported) are trusted
@@ -3402,7 +5314,7 @@ void AeroMainWindow::openTokenPicker() {
     };
     for (const TokenInfo &t : m_wallet->tokens())   // tracked (metadata source)
         addAsset(t.symbol, t.address, t.decimals);
-    for (const TokenInfo &t : curatedTopTokens())   // verified curated (metadata source)
+    for (const TokenInfo &t : curatedTopTokens(m_chainId))   // verified curated (metadata source)
         addAsset(t.symbol, t.address, t.decimals);
 
     // Held balance for an asset at the current "From" account ("" => ETH). -1 == unknown.

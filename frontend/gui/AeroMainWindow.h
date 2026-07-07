@@ -29,12 +29,15 @@ class QButtonGroup;
 class QToolButton;
 class QHBoxLayout;
 class QLineEdit;
+class QDoubleSpinBox;
 class QTimer;
 class QSystemTrayIcon;
 class QAction;
 class QSortFilterProxyModel;
 class QListWidget;
 class QTableWidget;
+class QTreeWidget;
+class QScrollArea;
 
 class AeroMainWindow : public QMainWindow
 {
@@ -93,6 +96,20 @@ private slots:
     void onFeeModeChanged();
     void updateFeeEstimate();
     void updateAvailable();
+    // Swap (multi-router) tab.
+    void onSwapConfirm();
+    void onSwapQuoteReady(const QString &quoteJson, const QString &error);
+    void onSwapQuotesReady(const QString &json, const QString &error);      // comparison list
+    void onRouterBuilt(const QString &json, const QString &error);          // chosen on-chain router
+    void onRouterAllowanceReady(const QString &token, const QString &spender,
+                                const QString &allowanceWei, const QString &error);
+    void onRouterApproved(const QString &txHash, const QString &error);
+    void onRouterSwapSent(const QString &txHash, const QString &error);
+    void onDefillamaPricesReady(const QString &json, const QString &error);
+    void onSwapAllowanceReady(const QString &token, const QString &allowanceWei, const QString &error);
+    void onSwapApproved(const QString &txHash, const QString &error);
+    void onSwapSubmitted(const QString &orderUid, const QString &error);
+    void onSwapEthFlowSent(const QString &txHash, const QString &error);
 
 private:
     void setupTabs();
@@ -128,6 +145,39 @@ private:
     void loadLiquidityCache();             // restore persisted liquidity decisions
     void setupNftTab();                    // build the NFTs tab (hidden unless enabled)
     void setNftTabEnabled(bool on);        // show/hide the NFTs tab (Settings toggle)
+    void setupSwapTab();                   // build the Swap (CoW Protocol) tab
+    void openSwapPicker(bool sell);        // asset picker for the sell (true) / buy (false) slot
+    void setSwapAsset(bool sell, const QString &symbol, const QString &address, quint8 decimals);
+    void refreshSwapQuote();               // (re)fetch a CoW quote for the current sell/buy/amount
+    void resetSwapFlow();                  // clear "swap in flight" state (unblocks the re-quote guard)
+    void updateSwapTabEnabled();           // show/hide + enable Swap per chain (CoW) + watch-only
+    void updateSwapAvailable();            // Swap: refresh the "Available: X" line for the sell asset
+    double swapAvailable() const;          // cached balance of the selected sell asset (From account)
+    void updateSwapPayUsd();               // Swap: refresh the "≈ $X" USD value under "You pay"
+    void showRevokeApprovals();            // Tools -> Revoke Token Approvals dialog
+    // MetaMask-style detailed confirmation for a swap. Returns true if the user confirms.
+    // `cowVerified` reflects CoW's own `verified` quote flag (surfaced as a security badge).
+    // For on-chain routers, `routerId`/`routerLabel`/`routerTo`/`routerSpender` describe the router
+    // contract + approval target; for CoW pass routerId "cow" and empty to/spender.
+    bool swapConfirmDialog(bool sellIsNative, bool buyIsNative, double sellH, double buyH,
+                           double feeH, double sellUsd, double buyUsd, double feeUsd, double refOut,
+                           double diffPct, qint64 validTo, quint32 fromIndex, bool cowVerified,
+                           const QString &routerId, const QString &routerLabel,
+                           const QString &routerTo, const QString &routerSpender);
+    // True if `addr` is a known aggregator router/proxy (for the verified badge).
+    bool isKnownRouter(const QString &addr) const;
+    // Inline swap result on the Swap tab (no popup) + History refresh; optional explorer/CoW link.
+    void swapInlineDone(const QString &summary, const QString &url = QString(),
+                        const QString &linkText = QString());
+    void addPendingSwap(const QString &id); // optimistic "pending" swap row in History (any network)
+    quint32 swapSlippageBps() const; // parse the Swap slippage selector
+    // MetaMask-style spending-cap approval prompt with an editable cap (exact vs unlimited). Returns
+    // the chosen cap as decimal-wei, "max" for unlimited, or an empty string if the user rejects.
+    QString spendingApprovalDialog(const QString &tokenSymbol, const QString &tokenAddr,
+                                   const QString &spenderName, const QString &spenderAddr,
+                                   const QString &exactHuman, const QString &exactWei);
+    // True if `addr` is on the local verified/known-token allow-list (used for security badges).
+    bool isKnownToken(const QString &addr) const;
     void refreshNfts();                    // fetch owned NFT collections for the current account
     void displayNfts();                    // (re)render m_nftCache honoring the spam toggle
     void setupMenu();                      // wire the menu bar actions; hide dead ones
@@ -245,6 +295,56 @@ private:
     AddressModel *m_addressModel = nullptr;    // Receive: the address list
     QWidget *m_nftTab = nullptr;               // NFTs tab
     QListWidget *m_nftList = nullptr;          // NFT collection grid
+
+    // ##### Swap (multi-router) tab #####
+    QWidget *m_swapTab = nullptr;              // scrollable content (widgets parented here)
+    QScrollArea *m_swapScroll = nullptr;       // scroll viewport for the content
+    QWidget *m_swapPage = nullptr;             // tab page: scroll on top + pinned Confirm bar below
+    QComboBox *m_swapFrom = nullptr;           // account the swap sells from
+    QToolButton *m_swapSellButton = nullptr;   // sell-asset picker
+    QToolButton *m_swapBuyButton = nullptr;    // buy-asset picker
+    QLineEdit *m_swapAmount = nullptr;         // sell amount (human units)
+    QLabel *m_swapReceive = nullptr;           // (unused legacy single-line receive)
+    QLabel *m_swapRate = nullptr;              // rate line + DefiLlama cross-check
+    QLabel *m_swapStatus = nullptr;            // quote/error status
+    QPushButton *m_swapConfirmBtn = nullptr;
+    QTimer *m_swapQuoteTimer = nullptr;        // debounce + live-refresh the quote
+    QTreeWidget *m_swapList = nullptr;         // router comparison table (best-first, columns)
+    QComboBox *m_swapSlippage = nullptr;       // slippage mode: Auto / preset / Custom
+    QDoubleSpinBox *m_swapSlipCustom = nullptr; // manual slippage % (shown when Custom)
+    QLabel *m_swapSlipNote = nullptr;          // shows the effective slippage for the trade
+    QLabel *m_swapAvailLabel = nullptr;        // "Available: X SYM" for the selected sell asset
+    QLabel *m_swapPayUsd = nullptr;            // "≈ $X" USD value of the pay amount
+    // Selected router (from the comparison list).
+    QString m_swapSelRouter;                   // "cow" | "kyberswap" | ...
+    QString m_swapSelKind;                     // "signed-order" | "onchain"
+    QString m_swapSelLabel;
+    QString m_swapSelBuyAmount;                // expected out (wei) for the selected router
+    double m_swapSelGasUsd = 0.0;              // selected router's estimated gas cost (USD)
+    bool m_swapCowExecuting = false;           // onSwapQuoteReady should proceed to CoW confirm+exec
+    bool m_swapAwaitingApprove = false;        // CoW: waiting for the approve tx to confirm on-chain
+    int m_swapApprovePolls = 0;                // CoW: allowance re-check attempts after approving
+    // Built on-chain tx (from routerBuild), used across confirm -> allowance -> approve -> swap.
+    QString m_swapBuiltTo, m_swapBuiltData, m_swapBuiltValue, m_swapBuiltSpender, m_swapBuiltMinBuy;
+    QString m_swapSellSymbol = QStringLiteral("ETH");
+    QString m_swapSellAddr;                    // "" == native
+    quint8 m_swapSellDecimals = 18;
+    QString m_swapBuySymbol;
+    QString m_swapBuyAddr;                     // "" == native (BUY_ETH sentinel when quoting)
+    quint8 m_swapBuyDecimals = 18;
+    QString m_swapQuoteJson;                   // last successful quote (drives Confirm)
+    bool m_swapPickerSell = true;              // which slot the open picker writes to
+    bool m_swapUserPickedRouter = false;       // user manually chose a route (don't snap to best on refresh)
+    double m_swapLlamaSellUsd = 0.0;           // DefiLlama sell-token USD (cross-check)
+    double m_swapLlamaBuyUsd = 0.0;            // DefiLlama buy-token USD (cross-check)
+    // Pending execution context captured at Confirm time (used across the approve->submit chain).
+    quint32 m_swapExecFrom = 0;
+    QString m_swapExecQuote;
+    QString m_swapExecSellAddr;                // token being sold (for allowance/approve)
+    QString m_swapExecBuyAddr;                 // token being bought (eth-flow buyToken)
+    QString m_swapExecSellAmountWei;           // needed allowance
+    bool m_swapExecNative = false;             // native-ETH sell -> eth-flow
+    quint32 m_swapExecSlippageBps = 50;        // slippage captured at Confirm (applied to CoW min-buy)
     QTableWidget *m_contactsTable = nullptr;   // Contacts address book
     QJsonObject m_meta;                        // in-memory per-wallet metadata mirror (persisted encrypted)
     bool m_metaLoading = false;                // guard so applying metadata to the UI doesn't re-persist

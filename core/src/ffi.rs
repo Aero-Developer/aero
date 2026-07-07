@@ -643,8 +643,14 @@ pub extern "C" fn aero_wallet_eth_balance(w: *mut Wallet, index: u32) -> *mut c_
 /// native_symbol, tokens: [ { address, symbol, decimals, raw, formatted } ] } ] }`.
 /// Caller frees the string.
 #[no_mangle]
-pub extern "C" fn aero_wallet_all_balances(w: *mut Wallet, num_accounts: u32) -> *mut c_char {
-    block_json(w, |w| RUNTIME.block_on(w.all_balances(num_accounts)))
+pub extern "C" fn aero_wallet_all_balances(
+    w: *mut Wallet,
+    num_accounts: u32,
+    extra_tokens_json: *const c_char,
+) -> *mut c_char {
+    // Empty/NULL extras is fine (tracked tokens only).
+    let extras = from_cstr(extra_tokens_json).unwrap_or_default();
+    block_json(w, |w| RUNTIME.block_on(w.all_balances(num_accounts, &extras)))
 }
 
 /// ERC20 balance as JSON `BalanceInfo`. Caller frees the string.
@@ -984,6 +990,301 @@ pub extern "C" fn aero_wallet_cancel_tx(
     block_json(w, |w| RUNTIME.block_on(w.cancel_transaction(from_index, nonce, fee)))
 }
 
+// ---------- CoW Protocol swaps ----------
+
+/// Fetch a CoW swap quote as JSON (the order fields live under `quote`). `sell_is_native` sells the
+/// chain's wrapped-native token; pass the BUY_ETH sentinel as `buy_token` to receive native ETH.
+/// Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_swap_quote(
+    w: *mut Wallet,
+    from_index: u32,
+    sell_token: *const c_char,
+    buy_token: *const c_char,
+    sell_amount_wei: *const c_char,
+    sell_is_native: bool,
+) -> *mut c_char {
+    let (Some(sell), Some(buy), Some(amount)) = (
+        from_cstr(sell_token),
+        from_cstr(buy_token),
+        from_cstr(sell_amount_wei),
+    ) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| {
+        RUNTIME.block_on(w.swap_quote(from_index, &sell, &buy, &amount, sell_is_native))
+    })
+}
+
+/// Current allowance of `token` (account `from_index`) to the CoW Vault Relayer, as a decimal-wei
+/// string ("0" on error). Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_swap_allowance(
+    w: *mut Wallet,
+    from_index: u32,
+    token: *const c_char,
+) -> *mut c_char {
+    clear_error();
+    let Some(w) = (unsafe { w.as_ref() }) else {
+        set_error("null wallet");
+        return ptr::null_mut();
+    };
+    let Some(token) = from_cstr(token) else {
+        set_error("null token");
+        return ptr::null_mut();
+    };
+    match RUNTIME.block_on(w.swap_allowance(from_index, &token)) {
+        Ok(a) => to_cstr(&a.to_string()),
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Approve the CoW Vault Relayer to spend `token`. `amount` is the decimal-wei cap; "max" (or empty)
+/// approves an unlimited allowance. Returns JSON `SendResult`.
+#[no_mangle]
+pub extern "C" fn aero_wallet_swap_approve(
+    w: *mut Wallet,
+    from_index: u32,
+    token: *const c_char,
+    amount: *const c_char,
+) -> *mut c_char {
+    let Some(token) = from_cstr(token) else {
+        set_error("null token");
+        return ptr::null_mut();
+    };
+    let amount = from_cstr(amount).unwrap_or_default();
+    block_json(w, |w| RUNTIME.block_on(w.swap_approve(from_index, &token, &amount)))
+}
+
+/// Sign (EIP-712) and submit the order from a CoW quote JSON. Returns the order UID string. Null on
+/// error. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_swap_submit(
+    w: *mut Wallet,
+    from_index: u32,
+    quote_json: *const c_char,
+    slippage_bps: u32,
+) -> *mut c_char {
+    clear_error();
+    let Some(w) = (unsafe { w.as_ref() }) else {
+        set_error("null wallet");
+        return ptr::null_mut();
+    };
+    let Some(quote) = from_cstr(quote_json) else {
+        set_error("null quote");
+        return ptr::null_mut();
+    };
+    match RUNTIME.block_on(w.swap_submit(from_index, &quote, slippage_bps)) {
+        Ok(uid) => to_cstr(&uid),
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Sell native ETH via CoW eth-flow (on-chain tx). `quote_json` from a quote taken with
+/// `sell_is_native = true`; `buy_token` is the ERC-20 to receive. Returns JSON `SendResult`.
+#[no_mangle]
+pub extern "C" fn aero_wallet_swap_eth_flow(
+    w: *mut Wallet,
+    from_index: u32,
+    quote_json: *const c_char,
+    buy_token: *const c_char,
+    slippage_bps: u32,
+) -> *mut c_char {
+    let (Some(quote), Some(buy)) = (from_cstr(quote_json), from_cstr(buy_token)) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| {
+        RUNTIME.block_on(w.swap_eth_flow(from_index, &quote, &buy, slippage_bps))
+    })
+}
+
+/// Batched allowance scan. `tokens_json`/`spenders_json` are JSON arrays of addresses. Returns JSON
+/// `{ "allowances": [ {token, spender, allowance}, … ] }` (non-zero only). Caller frees.
+#[no_mangle]
+pub extern "C" fn aero_wallet_token_allowances(
+    w: *mut Wallet,
+    from_index: u32,
+    tokens_json: *const c_char,
+    spenders_json: *const c_char,
+) -> *mut c_char {
+    let (Some(tokens), Some(spenders)) = (from_cstr(tokens_json), from_cstr(spenders_json)) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| {
+        RUNTIME.block_on(w.token_allowances(from_index, &tokens, &spenders))
+    })
+}
+
+/// Revoke an ERC-20 approval (`approve(spender, 0)`). Returns JSON `SendResult`. Caller frees.
+#[no_mangle]
+pub extern "C" fn aero_wallet_revoke_approval(
+    w: *mut Wallet,
+    from_index: u32,
+    token: *const c_char,
+    spender: *const c_char,
+) -> *mut c_char {
+    let (Some(token), Some(spender)) = (from_cstr(token), from_cstr(spender)) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| {
+        RUNTIME.block_on(w.revoke_approval(from_index, &token, &spender))
+    })
+}
+
+/// DefiLlama current prices for a comma-separated coin-key list. Returns the raw JSON. Caller frees.
+#[no_mangle]
+pub extern "C" fn aero_wallet_defillama_prices(
+    w: *mut Wallet,
+    coins_csv: *const c_char,
+) -> *mut c_char {
+    let Some(coins) = from_cstr(coins_csv) else {
+        set_error("null coins");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| RUNTIME.block_on(w.defillama_prices(&coins)))
+}
+
+// ---------- Multi-router swap aggregator ----------
+
+/// Fetch quotes from every keyless router supported on the current chain (parallel, over Tor).
+/// `sell`/`buy` are token addresses; empty = native coin. Returns JSON `{ "quotes": [...] }`,
+/// best-first. Caller frees the string.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn aero_wallet_swap_quotes(
+    w: *mut Wallet,
+    from_index: u32,
+    sell: *const c_char,
+    buy: *const c_char,
+    sell_amount_wei: *const c_char,
+    sell_is_native: bool,
+    sell_decimals: u8,
+    buy_decimals: u8,
+    slippage_bps: u32,
+) -> *mut c_char {
+    let (Some(sell), Some(buy), Some(amount)) =
+        (from_cstr(sell), from_cstr(buy), from_cstr(sell_amount_wei))
+    else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| {
+        RUNTIME.block_on(w.swap_quotes(
+            from_index, &sell, &buy, &amount, sell_is_native, sell_decimals, buy_decimals,
+            slippage_bps,
+        ))
+    })
+}
+
+/// Build the executable transaction for a chosen on-chain router (fresh calldata). Returns JSON
+/// `{to, data, value, spender, buy_amount, min_buy_amount}`. Caller frees the string.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn aero_wallet_router_build(
+    w: *mut Wallet,
+    router_id: *const c_char,
+    from_index: u32,
+    sell: *const c_char,
+    buy: *const c_char,
+    sell_amount_wei: *const c_char,
+    sell_is_native: bool,
+    sell_decimals: u8,
+    buy_decimals: u8,
+    slippage_bps: u32,
+) -> *mut c_char {
+    let (Some(router_id), Some(sell), Some(buy), Some(amount)) = (
+        from_cstr(router_id),
+        from_cstr(sell),
+        from_cstr(buy),
+        from_cstr(sell_amount_wei),
+    ) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| {
+        RUNTIME.block_on(w.router_build(
+            &router_id, from_index, &sell, &buy, &amount, sell_is_native, sell_decimals,
+            buy_decimals, slippage_bps,
+        ))
+    })
+}
+
+/// Approve `spender` to spend `token`. `amount` is decimal-wei; "max"/empty = unlimited. Returns
+/// JSON `SendResult`. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_router_approve(
+    w: *mut Wallet,
+    from_index: u32,
+    token: *const c_char,
+    spender: *const c_char,
+    amount: *const c_char,
+) -> *mut c_char {
+    let (Some(token), Some(spender)) = (from_cstr(token), from_cstr(spender)) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    let amount = from_cstr(amount).unwrap_or_default();
+    block_json(w, |w| {
+        RUNTIME.block_on(w.router_approve(from_index, &token, &spender, &amount))
+    })
+}
+
+/// Current allowance of `token` (account `from_index`) to an arbitrary `spender`, as decimal-wei
+/// ("0" on error). Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_router_allowance(
+    w: *mut Wallet,
+    from_index: u32,
+    token: *const c_char,
+    spender: *const c_char,
+) -> *mut c_char {
+    clear_error();
+    let Some(w) = (unsafe { w.as_ref() }) else {
+        set_error("null wallet");
+        return ptr::null_mut();
+    };
+    let (Some(token), Some(spender)) = (from_cstr(token), from_cstr(spender)) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    match RUNTIME.block_on(w.router_allowance(from_index, &token, &spender)) {
+        Ok(a) => to_cstr(&a.to_string()),
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Send an arbitrary-calldata swap tx (`to`/`value`/`data` from `aero_wallet_router_build`). Returns
+/// JSON `SendResult`. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_router_swap(
+    w: *mut Wallet,
+    from_index: u32,
+    to: *const c_char,
+    value_wei: *const c_char,
+    data_hex: *const c_char,
+) -> *mut c_char {
+    let (Some(to), Some(value), Some(data)) =
+        (from_cstr(to), from_cstr(value_wei), from_cstr(data_hex))
+    else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| RUNTIME.block_on(w.router_swap(from_index, &to, &value, &data)))
+}
+
 /// ERC20 transfer history as a JSON array of `HistoryItem`. `from_block` is a hex block number
 /// or "earliest"/"latest". Caller frees the string.
 #[no_mangle]
@@ -1007,6 +1308,13 @@ pub extern "C" fn aero_wallet_erc20_history(
 #[no_mangle]
 pub extern "C" fn aero_wallet_account_history(w: *mut Wallet, index: u32) -> *mut c_char {
     block_json(w, |w| RUNTIME.block_on(w.account_history(index)))
+}
+
+/// CoW Protocol swap orders (pending + historical) for `index` from CoW's order-book API over Tor,
+/// as a JSON array of swap `HistoryItem`s (with `status`). Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_cow_orders(w: *mut Wallet, index: u32) -> *mut c_char {
+    block_json(w, |w| RUNTIME.block_on(w.cow_orders(index)))
 }
 
 /// Scan every common Ethereum derivation scheme for balances (Electrum-style multi-path recovery),

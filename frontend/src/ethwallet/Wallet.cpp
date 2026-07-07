@@ -253,13 +253,14 @@ void Wallet::fetchAvailable(quint32 index, const QString &token) {
     });
 }
 
-void Wallet::refreshAllBalances(quint32 numAccounts) {
+void Wallet::refreshAllBalances(quint32 numAccounts, const QString &extraTokensJson) {
     if (numAccounts == 0) numAccounts = 1;
-    QtConcurrent::run(&m_netPool, [this, numAccounts]() {
+    QtConcurrent::run(&m_netPool, [this, numAccounts, extraTokensJson]() {
         QString json;
         {
             QReadLocker lock(&m_coreLock);
-            char *j = aero_wallet_all_balances(m_core, numAccounts);
+            char *j = aero_wallet_all_balances(m_core, numAccounts,
+                                               extraTokensJson.toUtf8().constData());
             if (j) json = takeString(j);
         }
         QMetaObject::invokeMethod(this, [this, json]() {
@@ -270,12 +271,20 @@ void Wallet::refreshAllBalances(quint32 numAccounts) {
                 const quint32 idx = static_cast<quint32>(a.value(QStringLiteral("index")).toDouble());
                 const QString nativeSym = a.value(QStringLiteral("native_symbol")).toString();
                 const QString nativeFmt = a.value(QStringLiteral("native_formatted")).toString();
-                // Native balance: drives Home total, AddressModel, notifications, status bar...
-                emit accountBalanceUpdated(idx, nativeFmt, nativeSym);
-                // ...and the Send "available" label when the native asset is selected (token == "").
-                emit availableBalance(idx, QString(), nativeFmt, nativeSym);
+                // Only propagate reads that actually succeeded. A failed RPC read (native_ok=false)
+                // is skipped so the UI keeps its cached balance instead of flickering to 0 and
+                // firing a spurious "payment received" on the next good read. (Default true keeps
+                // back-compat with an older core.)
+                if (a.value(QStringLiteral("native_ok")).toBool(true)) {
+                    // Native balance: drives Home total, AddressModel, notifications, status bar...
+                    emit accountBalanceUpdated(idx, nativeFmt, nativeSym);
+                    // ...and the Send "available" label when the native asset is selected (token "").
+                    emit availableBalance(idx, QString(), nativeFmt, nativeSym);
+                }
                 for (const QJsonValue &tv : a.value(QStringLiteral("tokens")).toArray()) {
                     const QJsonObject t = tv.toObject();
+                    if (!t.value(QStringLiteral("ok")).toBool(true))
+                        continue; // failed token read -> keep cached value
                     emit availableBalance(idx, t.value(QStringLiteral("address")).toString(),
                                           t.value(QStringLiteral("formatted")).toString(),
                                           t.value(QStringLiteral("symbol")).toString());
@@ -386,6 +395,10 @@ static void parseHistoryArray(const QString &json, QVector<HistoryItem> &out) {
         h.timestamp = static_cast<quint64>(o.value("timestamp").toDouble());
         h.fee = o.value("fee").toString();
         h.failed = o.value("failed").toBool();
+        h.kind = o.value("kind").toString();
+        h.buySymbol = o.value("buy_symbol").toString();
+        h.buyFormatted = o.value("buy_formatted").toString();
+        h.status = o.value("status").toString();
         out.append(h);
     }
 }
@@ -399,9 +412,34 @@ void Wallet::refreshHistory(quint32 accountIndex, const QString &fromBlock) {
         char *j = aero_wallet_account_history(m_core, accountIndex);
         if (j)
             parseHistoryArray(takeString(j), items);
+        // Merge CoW Protocol swaps (pending + historical) for this account: they aren't on-chain
+        // transfers, so the explorer never lists them.
+        mergeCowOrders(accountIndex, items);
+        std::sort(items.begin(), items.end(),
+                  [](const HistoryItem &a, const HistoryItem &b) { return a.timestamp > b.timestamp; });
         QMetaObject::invokeMethod(this, [this, items]() { emit historyRefreshed(items); },
                                   Qt::QueuedConnection);
     });
+}
+
+// Fetch CoW Protocol orders for `accountIndex` and append de-duplicated swap rows to `items`.
+// Must be called with m_coreLock held (read). Silently no-ops on non-CoW chains / errors.
+void Wallet::mergeCowOrders(quint32 accountIndex, QVector<HistoryItem> &items) {
+    char *c = aero_wallet_cow_orders(m_core, accountIndex);
+    if (!c)
+        return;
+    QVector<HistoryItem> cow;
+    parseHistoryArray(takeString(c), cow);
+    QSet<QString> haveUid;
+    for (const HistoryItem &h : items)
+        if (h.kind == QLatin1String("swap"))
+            haveUid.insert(h.txHash);
+    for (const HistoryItem &h : cow) {
+        if (haveUid.contains(h.txHash))
+            continue;
+        haveUid.insert(h.txHash);
+        items.append(h);
+    }
 }
 
 void Wallet::refreshHistoryAll(quint32 numAccounts) {
@@ -415,6 +453,7 @@ void Wallet::refreshHistoryAll(quint32 numAccounts) {
                 continue;
             QVector<HistoryItem> part;
             parseHistoryArray(takeString(j), part);
+            mergeCowOrders(a, part); // CoW swaps for this account (off-chain; not in the explorer)
             for (const HistoryItem &h : part) {
                 // Dedup across accounts (e.g. an internal transfer between two of the user's own
                 // addresses would otherwise appear once per side).
@@ -427,7 +466,7 @@ void Wallet::refreshHistoryAll(quint32 numAccounts) {
             }
         }
         std::sort(items.begin(), items.end(),
-                  [](const HistoryItem &a, const HistoryItem &b) { return a.block > b.block; });
+                  [](const HistoryItem &a, const HistoryItem &b) { return a.timestamp > b.timestamp; });
         QMetaObject::invokeMethod(this, [this, items]() { emit historyRefreshed(items); },
                                   Qt::QueuedConnection);
     });
@@ -802,4 +841,233 @@ QString Wallet::signUnsigned(const QString &json) {
 
 QString Wallet::parseUnits(const QString &amount, quint8 decimals) {
     return takeString(aero_parse_units(amount.toUtf8().constData(), decimals));
+}
+
+// ---------------------------------------------------------------------------------------------
+// CoW Protocol swaps. All run on the bounded net pool. The Rust methods borrow the wallet as
+// `&self` (they sign with a borrowed key; no struct mutation), so a shared read lock is correct —
+// same as commitTransaction.
+
+void Wallet::swapQuote(quint32 fromIndex, const QString &sellToken, const QString &buyToken,
+                       const QString &sellAmountWei, bool sellIsNative) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, sellToken, buyToken, sellAmountWei,
+                                   sellIsNative]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_swap_quote(m_core, fromIndex, sellToken.toUtf8().constData(),
+                                           buyToken.toUtf8().constData(),
+                                           sellAmountWei.toUtf8().constData(), sellIsNative);
+        QString json, err;
+        if (res)
+            json = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, json, err]() { emit swapQuoteReady(json, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::swapAllowance(quint32 fromIndex, const QString &token) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, token]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_swap_allowance(m_core, fromIndex, token.toUtf8().constData());
+        QString wei, err;
+        if (res)
+            wei = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, token, wei, err]() {
+            emit swapAllowanceReady(token, wei, err);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Wallet::swapApprove(quint32 fromIndex, const QString &token, const QString &amountWei) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, token, amountWei]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_swap_approve(m_core, fromIndex, token.toUtf8().constData(),
+                                             amountWei.toUtf8().constData());
+        QString txHash, err;
+        if (res)
+            txHash = QJsonDocument::fromJson(takeString(res).toUtf8()).object()
+                         .value("tx_hash").toString();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, txHash, err]() { emit swapApproved(txHash, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::swapSubmit(quint32 fromIndex, const QString &quoteJson, quint32 slippageBps) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, quoteJson, slippageBps]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_swap_submit(m_core, fromIndex, quoteJson.toUtf8().constData(),
+                                            slippageBps);
+        QString uid, err;
+        if (res)
+            uid = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, uid, err]() { emit swapSubmitted(uid, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::swapEthFlow(quint32 fromIndex, const QString &quoteJson, const QString &buyToken,
+                         quint32 slippageBps) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, quoteJson, buyToken, slippageBps]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_swap_eth_flow(m_core, fromIndex, quoteJson.toUtf8().constData(),
+                                              buyToken.toUtf8().constData(), slippageBps);
+        QString txHash, err;
+        if (res)
+            txHash = QJsonDocument::fromJson(takeString(res).toUtf8()).object()
+                         .value("tx_hash").toString();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, txHash, err]() { emit swapEthFlowSent(txHash, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::tokenAllowances(quint32 fromIndex, const QString &tokensJson,
+                             const QString &spendersJson) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, tokensJson, spendersJson]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_token_allowances(m_core, fromIndex, tokensJson.toUtf8().constData(),
+                                                 spendersJson.toUtf8().constData());
+        QString json, err;
+        if (res)
+            json = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, json, err]() { emit tokenAllowancesReady(json, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::revokeApproval(quint32 fromIndex, const QString &token, const QString &spender) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, token, spender]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_revoke_approval(m_core, fromIndex, token.toUtf8().constData(),
+                                                spender.toUtf8().constData());
+        QString txHash, err;
+        if (res)
+            txHash = QJsonDocument::fromJson(takeString(res).toUtf8()).object()
+                         .value("tx_hash").toString();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, token, spender, txHash, err]() {
+            emit approvalRevoked(token, spender, txHash, err);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Wallet::defillamaPrices(const QString &coinsCsv) {
+    QtConcurrent::run(&m_netPool, [this, coinsCsv]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_defillama_prices(m_core, coinsCsv.toUtf8().constData());
+        QString json, err;
+        if (res)
+            json = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, json, err]() { emit defillamaPricesReady(json, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Multi-router swap aggregator. All borrow the wallet as &self (sign with a borrowed key), so a
+// shared read lock is correct — same as commitTransaction.
+
+void Wallet::swapQuotes(quint32 fromIndex, const QString &sell, const QString &buy,
+                        const QString &sellAmountWei, bool sellIsNative, quint8 sellDecimals,
+                        quint8 buyDecimals, quint32 slippageBps) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, sell, buy, sellAmountWei, sellIsNative,
+                                   sellDecimals, buyDecimals, slippageBps]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_swap_quotes(m_core, fromIndex, sell.toUtf8().constData(),
+                                            buy.toUtf8().constData(),
+                                            sellAmountWei.toUtf8().constData(), sellIsNative,
+                                            sellDecimals, buyDecimals, slippageBps);
+        QString json, err;
+        if (res)
+            json = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, json, err]() { emit swapQuotesReady(json, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::routerBuild(const QString &routerId, quint32 fromIndex, const QString &sell,
+                         const QString &buy, const QString &sellAmountWei, bool sellIsNative,
+                         quint8 sellDecimals, quint8 buyDecimals, quint32 slippageBps) {
+    QtConcurrent::run(&m_netPool, [this, routerId, fromIndex, sell, buy, sellAmountWei, sellIsNative,
+                                   sellDecimals, buyDecimals, slippageBps]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_router_build(m_core, routerId.toUtf8().constData(), fromIndex,
+                                             sell.toUtf8().constData(), buy.toUtf8().constData(),
+                                             sellAmountWei.toUtf8().constData(), sellIsNative,
+                                             sellDecimals, buyDecimals, slippageBps);
+        QString json, err;
+        if (res)
+            json = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, json, err]() { emit routerBuilt(json, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::routerAllowance(quint32 fromIndex, const QString &token, const QString &spender) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, token, spender]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_router_allowance(m_core, fromIndex, token.toUtf8().constData(),
+                                                 spender.toUtf8().constData());
+        QString wei, err;
+        if (res)
+            wei = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, token, spender, wei, err]() {
+            emit routerAllowanceReady(token, spender, wei, err);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Wallet::routerApprove(quint32 fromIndex, const QString &token, const QString &spender,
+                           const QString &amountWei) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, token, spender, amountWei]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_router_approve(m_core, fromIndex, token.toUtf8().constData(),
+                                               spender.toUtf8().constData(),
+                                               amountWei.toUtf8().constData());
+        QString txHash, err;
+        if (res)
+            txHash = QJsonDocument::fromJson(takeString(res).toUtf8()).object()
+                         .value("tx_hash").toString();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, txHash, err]() { emit routerApproved(txHash, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::routerSwap(quint32 fromIndex, const QString &to, const QString &valueWei,
+                        const QString &dataHex) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, to, valueWei, dataHex]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_router_swap(m_core, fromIndex, to.toUtf8().constData(),
+                                            valueWei.toUtf8().constData(),
+                                            dataHex.toUtf8().constData());
+        QString txHash, err;
+        if (res)
+            txHash = QJsonDocument::fromJson(takeString(res).toUtf8()).object()
+                         .value("tx_hash").toString();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, txHash, err]() { emit routerSwapSent(txHash, err); },
+                                  Qt::QueuedConnection);
+    });
 }

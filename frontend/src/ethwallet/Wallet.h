@@ -62,6 +62,11 @@ struct HistoryItem {
     quint64 timestamp = 0; // unix seconds (0 if unknown)
     QString fee;           // gas fee in wei (empty if unknown)
     bool failed = false;   // reverted / errored transaction
+    // Swap rows (kind == "swap"): sell side reuses symbol/formatted/token above.
+    QString kind;          // "" for a normal transfer, "swap" for a swap
+    QString buySymbol;     // asset received
+    QString buyFormatted;  // human amount received
+    QString status;        // "pending" | "done" | "failed"
 };
 
 struct NftCollection {
@@ -147,7 +152,9 @@ public:
     // RPC request. Emits accountBalanceUpdated() + availableBalance() per account/token (reusing
     // the same handlers as the single-balance path) and allBalancesRefreshed() when done. This
     // replaces per-account/per-token fan-out so everything loads together in one Tor round-trip.
-    void refreshAllBalances(quint32 numAccounts);
+    // `extraTokensJson` (optional) is a JSON array [{address,symbol,decimals}] of tokens to include
+    // in the read (e.g. the current chain's curated tokens) so pickers show balances immediately.
+    void refreshAllBalances(quint32 numAccounts, const QString &extraTokensJson = QString());
 
     // Async: emits balanceUpdated() / refreshed() when done.
     void refresh(quint32 accountIndex);
@@ -239,6 +246,55 @@ public:
     void buildUnsigned(const PendingEthTx &tx);
     QString signUnsigned(const QString &json);
 
+    // ##### CoW Protocol swaps (all async over Tor) #####
+    // Fetch a swap quote. sellIsNative sells the chain's wrapped-native token; pass BUY_ETH sentinel
+    // as buyToken to receive native ETH. Emits swapQuoteReady(quoteJson, error).
+    void swapQuote(quint32 fromIndex, const QString &sellToken, const QString &buyToken,
+                   const QString &sellAmountWei, bool sellIsNative);
+    // Current allowance of `token` to the CoW Vault Relayer (decimal-wei); emits swapAllowanceReady().
+    void swapAllowance(quint32 fromIndex, const QString &token);
+    // Approve the CoW Vault Relayer for `token`. `amountWei` is the decimal-wei cap; "max" (or empty)
+    // approves unlimited. Emits swapApproved(txHash, error).
+    void swapApprove(quint32 fromIndex, const QString &token, const QString &amountWei);
+    // Sign (EIP-712) + submit the order from a quote JSON; slippageBps lowers the order's minimum
+    // buy so it can fill. Emits swapSubmitted(orderUid, error).
+    void swapSubmit(quint32 fromIndex, const QString &quoteJson, quint32 slippageBps);
+    // Sell native ETH via eth-flow (on-chain tx); emits swapEthFlowSent(txHash, error).
+    void swapEthFlow(quint32 fromIndex, const QString &quoteJson, const QString &buyToken,
+                     quint32 slippageBps);
+    // Batched allowance scan over (tokens x spenders); emits tokenAllowancesReady(json, error).
+    void tokenAllowances(quint32 fromIndex, const QString &tokensJson, const QString &spendersJson);
+    // Revoke an approval (approve(spender,0)); emits approvalRevoked(token, spender, txHash, error).
+    void revokeApproval(quint32 fromIndex, const QString &token, const QString &spender);
+    // DefiLlama current prices for a comma-separated coin-key list; emits defillamaPricesReady().
+    void defillamaPrices(const QString &coinsCsv);
+
+    // ##### Multi-router swap aggregator #####
+    // Fetch quotes from every keyless router on the current chain; emits swapQuotesReady(json,err).
+    void swapQuotes(quint32 fromIndex, const QString &sell, const QString &buy,
+                    const QString &sellAmountWei, bool sellIsNative, quint8 sellDecimals,
+                    quint8 buyDecimals, quint32 slippageBps);
+    // Build the executable tx for a chosen on-chain router; emits routerBuilt(json,err) with
+    // {to,data,value,spender,buy_amount,min_buy_amount}.
+    void routerBuild(const QString &routerId, quint32 fromIndex, const QString &sell,
+                     const QString &buy, const QString &sellAmountWei, bool sellIsNative,
+                     quint8 sellDecimals, quint8 buyDecimals, quint32 slippageBps);
+    // Current allowance of `token` to `spender` (decimal-wei); emits routerAllowanceReady().
+    void routerAllowance(quint32 fromIndex, const QString &token, const QString &spender);
+    // Approve `spender` for `token` (amountWei cap; "max"/empty = unlimited); emits routerApproved().
+    void routerApprove(quint32 fromIndex, const QString &token, const QString &spender,
+                       const QString &amountWei);
+    // Send an arbitrary-calldata swap tx; emits routerSwapSent(txHash,err).
+    void routerSwap(quint32 fromIndex, const QString &to, const QString &valueWei,
+                    const QString &dataHex);
+
+    // The CoW BUY_ETH sentinel (used as buyToken to receive native ETH).
+    static QString buyEthSentinel() { return QStringLiteral("0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"); }
+    // The CoW Vault Relayer (approval target) — same on every supported chain.
+    static QString cowVaultRelayer() { return QStringLiteral("0xC92E8bdf79f0507f65a392b0ab4667716BFE0110"); }
+    // The GPv2 Settlement contract (EIP-712 verifying contract) — shown in the confirm dialog.
+    static QString cowSettlement() { return QStringLiteral("0x9008D19f58AAbD9eD0D60971565AA8510560ab41"); }
+
     // Utility: convert human amount -> base units for `decimals`.
     static QString parseUnits(const QString &amount, quint8 decimals);
 
@@ -278,8 +334,28 @@ signals:
     // Emitted once after a batched refreshAllBalances() has dispatched all per-account signals.
     void allBalancesRefreshed();
 
+    // ##### CoW swap signals #####
+    void swapQuoteReady(const QString &quoteJson, const QString &error);
+    void swapAllowanceReady(const QString &token, const QString &allowanceWei, const QString &error);
+    void swapApproved(const QString &txHash, const QString &error);
+    void swapSubmitted(const QString &orderUid, const QString &error);
+    void swapEthFlowSent(const QString &txHash, const QString &error);
+    void tokenAllowancesReady(const QString &json, const QString &error);
+    void approvalRevoked(const QString &token, const QString &spender, const QString &txHash,
+                         const QString &error);
+    void defillamaPricesReady(const QString &json, const QString &error);
+    // Multi-router aggregator.
+    void swapQuotesReady(const QString &json, const QString &error);
+    void routerBuilt(const QString &json, const QString &error);
+    void routerAllowanceReady(const QString &token, const QString &spender,
+                              const QString &allowanceWei, const QString &error);
+    void routerApproved(const QString &txHash, const QString &error);
+    void routerSwapSent(const QString &txHash, const QString &error);
+
 private:
     QString takeLastError() const;
+    // Append CoW Protocol swap rows for `accountIndex` to `items` (deduped). Call with m_coreLock held.
+    void mergeCowOrders(quint32 accountIndex, QVector<HistoryItem> &items);
 
     AeroWallet *m_core = nullptr;
     Status m_status = Status_Ok;

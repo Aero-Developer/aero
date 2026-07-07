@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "HistoryModel.h"
 
+#include <algorithm>
+
 #include <QBrush>
 #include <QColor>
 #include <QDateTime>
@@ -31,6 +33,26 @@ bool HistoryModel::isSpamToken(const HistoryItem &h) const {
     return !m_knownTokens.contains(h.token.toLower());
 }
 
+// Cap a full-precision decimal string to a readable number of places (tokens routinely report 18
+// decimals, e.g. "16.916374757470879836"). Shows up to 4 places (8 for sub-0.0001 dust) and trims
+// trailing zeros so amounts read cleanly in the table.
+static QString capAmount(const QString &raw) {
+    bool ok = false;
+    const double v = raw.toDouble(&ok);
+    if (!ok)
+        return raw;
+    const double a = qAbs(v);
+    const int dec = (a != 0.0 && a < 0.0001) ? 8 : 4;
+    QString s = QString::number(v, 'f', dec);
+    if (s.contains(QLatin1Char('.'))) {
+        while (s.endsWith(QLatin1Char('0')))
+            s.chop(1);
+        if (s.endsWith(QLatin1Char('.')))
+            s.chop(1);
+    }
+    return s;
+}
+
 // Zero-value incoming transfers are the classic address-poisoning pattern (dust/$0 from look-alike
 // addresses). These are not real payments and are hidden along with spam tokens.
 static bool isPoisoning(const HistoryItem &h) {
@@ -38,6 +60,8 @@ static bool isPoisoning(const HistoryItem &h) {
 }
 
 bool HistoryModel::isHiddenSpam(const HistoryItem &h) const {
+    if (h.kind == QLatin1String("swap"))
+        return false; // swaps are user-initiated, never spam
     if (isPoisoning(h) || isSpamToken(h))
         return true;
     // Dust filter: hide incoming transfers worth less than the configured USD threshold. Only
@@ -169,6 +193,12 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
     if (role == Qt::ForegroundRole) {
         if (h.failed)
             return QBrush(QColor(0x80, 0x80, 0x80)); // grey out failed (reverted) txs
+        if (h.kind == QLatin1String("swap")) {
+            // Pending swaps are muted; otherwise use the default text colour (no red/green).
+            if (h.status == QLatin1String("pending"))
+                return QBrush(QColor(0xE5, 0xA5, 0x2E)); // amber = awaiting fill
+            return {};
+        }
         // Feather-style: outgoing amounts in red, incoming in white.
         if (index.column() == Column_Amount || index.column() == Column_Value)
             return QBrush(h.direction == QLatin1String("out") ? QColor(0xE0, 0x6C, 0x75)
@@ -221,9 +251,19 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
                 return h.block == 0 ? tr("pending") : QString::number(h.block);
             return QDateTime::fromSecsSinceEpoch(static_cast<qint64>(h.timestamp))
                 .toString(QStringLiteral("yyyy-MM-dd HH:mm"));
-        case Column_Direction:    return h.failed ? tr("Failed")
-                                                  : (h.direction == "in" ? tr("Received") : tr("Sent"));
-        case Column_Amount:       return QStringLiteral("%1 %2").arg(h.formatted, h.symbol);
+        case Column_Direction:
+            if (h.kind == QLatin1String("swap")) {
+                if (h.status == QLatin1String("pending")) return tr("Swap · pending");
+                if (h.status == QLatin1String("failed") || h.failed) return tr("Swap · failed");
+                return tr("Swap");
+            }
+            return h.failed ? tr("Failed")
+                            : (h.direction == "in" ? tr("Received") : tr("Sent"));
+        case Column_Amount:
+            if (h.kind == QLatin1String("swap"))
+                return QStringLiteral("%1 %2 \u2192 %3 %4")
+                    .arg(capAmount(h.formatted), h.symbol, capAmount(h.buyFormatted), h.buySymbol);
+            return QStringLiteral("%1 %2").arg(capAmount(h.formatted), h.symbol);
         case Column_Value: {
             const double price = unitPriceFor(h);
             if (price <= 0.0)
@@ -252,8 +292,39 @@ QVariant HistoryModel::headerData(int section, Qt::Orientation orientation, int 
 }
 
 void HistoryModel::onHistoryRefreshed(const QVector<HistoryItem> &items) {
-    m_allItems = items;
+    m_fetched = items;
+    rebuildAll();
+}
+
+// Compose the unfiltered list as [optimistic pending swaps] + [fetched history], dropping any
+// pending swap that has since appeared in fetched data (matched by tx hash / CoW order uid).
+void HistoryModel::rebuildAll() {
+    if (!m_localSwaps.isEmpty()) {
+        QSet<QString> fetchedIds;
+        for (const HistoryItem &h : m_fetched)
+            if (!h.txHash.isEmpty())
+                fetchedIds.insert(h.txHash.toLower());
+        m_localSwaps.erase(std::remove_if(m_localSwaps.begin(), m_localSwaps.end(),
+                                          [&](const HistoryItem &h) {
+                                              return fetchedIds.contains(h.txHash.toLower());
+                                          }),
+                           m_localSwaps.end());
+    }
+    m_allItems = m_localSwaps; // pending swaps on top
+    m_allItems += m_fetched;
     rebuildVisible();
+}
+
+void HistoryModel::addLocalSwap(const HistoryItem &h) {
+    // Replace an existing pending entry with the same id, else prepend a new one.
+    for (HistoryItem &e : m_localSwaps)
+        if (!h.txHash.isEmpty() && e.txHash == h.txHash) {
+            e = h;
+            rebuildAll();
+            return;
+        }
+    m_localSwaps.prepend(h);
+    rebuildAll();
 }
 
 void HistoryModel::addLocalSend(const QString &txHash, const QString &to,

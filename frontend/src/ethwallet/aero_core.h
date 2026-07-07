@@ -234,7 +234,8 @@ char *aero_wallet_eth_balance(AeroWallet *w,
  * Caller frees the string.
  */
 char *aero_wallet_all_balances(AeroWallet *w,
-                               uint32_t num_accounts);
+                               uint32_t num_accounts,
+                               const char *extra_tokens_json);
 
 /**
  * ERC20 balance as JSON `BalanceInfo`. Caller frees the string.
@@ -375,6 +376,136 @@ char *aero_wallet_cancel_tx(AeroWallet *w,
                             const char *max_priority_wei);
 
 /**
+ * Fetch a CoW swap quote as JSON (the order fields live under `quote`). `sell_is_native` sells the
+ * chain's wrapped-native token; pass the BUY_ETH sentinel as `buy_token` to receive native ETH.
+ * Caller frees the string.
+ */
+char *aero_wallet_swap_quote(AeroWallet *w,
+                             uint32_t from_index,
+                             const char *sell_token,
+                             const char *buy_token,
+                             const char *sell_amount_wei,
+                             bool sell_is_native);
+
+/**
+ * Current allowance of `token` (account `from_index`) to the CoW Vault Relayer, as a decimal-wei
+ * string ("0" on error). Caller frees the string.
+ */
+char *aero_wallet_swap_allowance(AeroWallet *w,
+                                 uint32_t from_index,
+                                 const char *token);
+
+/**
+ * Approve the CoW Vault Relayer to spend `token`. `amount` is the decimal-wei cap; "max" (or empty)
+ * approves an unlimited allowance. Returns JSON `SendResult`.
+ */
+char *aero_wallet_swap_approve(AeroWallet *w,
+                               uint32_t from_index,
+                               const char *token,
+                               const char *amount);
+
+/**
+ * Sign (EIP-712) and submit the order from a CoW quote JSON. Returns the order UID string. Null on
+ * error. Caller frees the string.
+ */
+char *aero_wallet_swap_submit(AeroWallet *w,
+                              uint32_t from_index,
+                              const char *quote_json,
+                              uint32_t slippage_bps);
+
+/**
+ * Sell native ETH via CoW eth-flow (on-chain tx). `quote_json` from a quote taken with
+ * `sell_is_native = true`; `buy_token` is the ERC-20 to receive. Returns JSON `SendResult`.
+ */
+char *aero_wallet_swap_eth_flow(AeroWallet *w,
+                                uint32_t from_index,
+                                const char *quote_json,
+                                const char *buy_token,
+                                uint32_t slippage_bps);
+
+/**
+ * Batched allowance scan. `tokens_json`/`spenders_json` are JSON arrays of addresses. Returns JSON
+ * `{ "allowances": [ {token, spender, allowance}, … ] }` (non-zero only). Caller frees.
+ */
+char *aero_wallet_token_allowances(AeroWallet *w,
+                                   uint32_t from_index,
+                                   const char *tokens_json,
+                                   const char *spenders_json);
+
+/**
+ * Revoke an ERC-20 approval (`approve(spender, 0)`). Returns JSON `SendResult`. Caller frees.
+ */
+char *aero_wallet_revoke_approval(AeroWallet *w,
+                                  uint32_t from_index,
+                                  const char *token,
+                                  const char *spender);
+
+/**
+ * DefiLlama current prices for a comma-separated coin-key list. Returns the raw JSON. Caller frees.
+ */
+char *aero_wallet_defillama_prices(AeroWallet *w,
+                                   const char *coins_csv);
+
+/**
+ * Fetch quotes from every keyless router supported on the current chain (parallel, over Tor).
+ * `sell`/`buy` are token addresses; empty = native coin. Returns JSON `{ "quotes": [...] }`,
+ * best-first. Caller frees the string.
+ */
+char *aero_wallet_swap_quotes(AeroWallet *w,
+                              uint32_t from_index,
+                              const char *sell,
+                              const char *buy,
+                              const char *sell_amount_wei,
+                              bool sell_is_native,
+                              uint8_t sell_decimals,
+                              uint8_t buy_decimals,
+                              uint32_t slippage_bps);
+
+/**
+ * Build the executable transaction for a chosen on-chain router (fresh calldata). Returns JSON
+ * `{to, data, value, spender, buy_amount, min_buy_amount}`. Caller frees the string.
+ */
+char *aero_wallet_router_build(AeroWallet *w,
+                               const char *router_id,
+                               uint32_t from_index,
+                               const char *sell,
+                               const char *buy,
+                               const char *sell_amount_wei,
+                               bool sell_is_native,
+                               uint8_t sell_decimals,
+                               uint8_t buy_decimals,
+                               uint32_t slippage_bps);
+
+/**
+ * Approve `spender` to spend `token`. `amount` is decimal-wei; "max"/empty = unlimited. Returns
+ * JSON `SendResult`. Caller frees the string.
+ */
+char *aero_wallet_router_approve(AeroWallet *w,
+                                 uint32_t from_index,
+                                 const char *token,
+                                 const char *spender,
+                                 const char *amount);
+
+/**
+ * Current allowance of `token` (account `from_index`) to an arbitrary `spender`, as decimal-wei
+ * ("0" on error). Caller frees the string.
+ */
+char *aero_wallet_router_allowance(AeroWallet *w,
+                                   uint32_t from_index,
+                                   const char *token,
+                                   const char *spender);
+
+/**
+ * Send an arbitrary-calldata swap tx (`to`/`value`/`data` from `aero_wallet_router_build`). Returns
+ * JSON `SendResult`. Caller frees the string.
+ */
+char *aero_wallet_router_swap(AeroWallet *w,
+                              uint32_t from_index,
+                              const char *to,
+                              const char *value_wei,
+                              const char *data_hex);
+
+/**
  * ERC20 transfer history as a JSON array of `HistoryItem`. `from_block` is a hex block number
  * or "earliest"/"latest". Caller frees the string.
  */
@@ -389,6 +520,13 @@ char *aero_wallet_erc20_history(AeroWallet *w,
  */
 char *aero_wallet_account_history(AeroWallet *w,
                                   uint32_t index);
+
+/**
+ * CoW Protocol swap orders (pending + historical) for `index` from CoW's order-book API over Tor,
+ * as a JSON array of swap `HistoryItem`s (with `status`). Caller frees the string.
+ */
+char *aero_wallet_cow_orders(AeroWallet *w,
+                             uint32_t index);
 
 /**
  * Scan every common Ethereum derivation scheme for balances (Electrum-style multi-path recovery),

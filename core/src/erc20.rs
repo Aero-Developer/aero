@@ -16,6 +16,8 @@ sol! {
         function symbol() external view returns (string);
         function name() external view returns (string);
         function transfer(address to, uint256 amount) external returns (bool);
+        function approve(address spender, uint256 amount) external returns (bool);
+        function allowance(address owner, address spender) external view returns (uint256);
         event Transfer(address indexed from, address indexed to, uint256 value);
     }
 }
@@ -44,6 +46,16 @@ pub fn encode_symbol() -> Vec<u8> {
 /// ABI-encoded calldata for `transfer(to, amount)`.
 pub fn encode_transfer(to: Address, amount: U256) -> Vec<u8> {
     IERC20::transferCall { to, amount }.abi_encode()
+}
+
+/// ABI-encoded calldata for `approve(spender, amount)` (amount 0 revokes an allowance).
+pub fn encode_approve(spender: Address, amount: U256) -> Vec<u8> {
+    IERC20::approveCall { spender, amount }.abi_encode()
+}
+
+/// ABI-encoded calldata for `allowance(owner, spender)`.
+pub fn encode_allowance(owner: Address, spender: Address) -> Vec<u8> {
+    IERC20::allowanceCall { owner, spender }.abi_encode()
 }
 
 /// Decode a `uint256` return value (e.g. from `balanceOf`).

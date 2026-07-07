@@ -63,6 +63,11 @@ public slots:
     void addLocalSend(const QString &txHash, const QString &to, const QString &amountFormatted,
                       const QString &symbol);
 
+    // Optimistically show a just-placed swap as "pending" immediately (on any network, incl. on-chain
+    // router swaps that only reach the explorer once mined). It's reconciled away when the real row
+    // (CoW order by uid, or the mined tx) appears in fetched history.
+    void addLocalSwap(const HistoryItem &h);
+
     // Contract addresses (lower-case) of tokens the user actually tracks. Incoming transfers of any
     // *other* ERC-20 are treated as unsolicited spam/airdrops and hidden.
     void setKnownTokens(const QSet<QString> &tokens);
@@ -89,7 +94,10 @@ private:
     bool isSpamToken(const HistoryItem &h) const;
     bool isHiddenSpam(const HistoryItem &h) const; // rows removed when m_hideSpam is on
     void rebuildVisible();                         // recompute m_items from m_allItems
+    void rebuildAll();                             // compose m_allItems = pending swaps + fetched
 
+    QVector<HistoryItem> m_fetched;    // last fetched (on-chain + CoW) history
+    QVector<HistoryItem> m_localSwaps; // optimistic pending swaps until they appear in m_fetched
     QVector<HistoryItem> m_allItems; // full unfiltered history (+ local sends)
     QVector<HistoryItem> m_items;    // visible rows (m_allItems minus hidden spam)
     QSet<QString> m_knownTokens;

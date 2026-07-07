@@ -6,11 +6,14 @@ use std::str::FromStr;
 
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
 use alloy::eips::eip2718::Encodable2718;
-use alloy::primitives::{Address, Bytes, TxKind, U256};
+use alloy::primitives::{Address, Bytes, TxKind, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::SignerSync;
+use alloy::sol;
+use alloy::sol_types::{eip712_domain, SolCall, SolStruct};
 use serde::Serialize;
 
+use crate::chains;
 use crate::chains::chain_info;
 use crate::erc20;
 use crate::error::{CoreError, Result};
@@ -18,6 +21,86 @@ use crate::hardware::{self, HwKind};
 use crate::keys::{SeedPhrase, WordCount};
 use crate::keystore::{self, AccountEntry, HwDescriptor, TokenRef, WalletSecrets};
 use crate::provider::{ProviderConfig, RpcProvider};
+
+// ---- CoW Protocol swap constants + types ---------------------------------------------------
+// Same addresses on every chain CoW is deployed to.
+const COW_SETTLEMENT: &str = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"; // EIP-712 verifyingContract
+const COW_VAULT_RELAYER: &str = "0xC92E8bdf79f0507f65a392b0ab4667716BFE0110"; // approval target
+/// Sentinel used in `buyToken` to receive native ETH (CoW unwraps WETH for you).
+pub const COW_BUY_ETH: &str = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+
+// ---- Multi-router (keyless) swap aggregator ------------------------------------------------
+const KYBER_API: &str = "https://aggregator-api.kyberswap.com";
+const ODOS_API: &str = "https://api.odos.xyz";
+const PARASWAP_API: &str = "https://apiv5.paraswap.io";
+const OPENOCEAN_API: &str = "https://open-api.openocean.finance";
+/// Native-token sentinel used by KyberSwap / Paraswap / OpenOcean.
+const EVM_NATIVE_SENTINEL: &str = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
+/// Odos represents the native coin with the zero address.
+const ODOS_NATIVE: &str = "0x0000000000000000000000000000000000000000";
+
+/// A router quote/route normalized so the UI is router-agnostic.
+#[derive(serde::Serialize, Clone, Default)]
+pub struct RouterQuote {
+    pub router_id: String,   // "cow" | "kyberswap" | "odos" | "paraswap" | "openocean"
+    pub label: String,       // display name
+    pub buy_amount: String,  // expected out, in buy-token base units (wei)
+    pub gas_usd: f64,        // router-reported gas cost (USD), 0 if unknown/gasless
+    pub gas_estimate: String, // gas units (best-effort), "0" if unknown/gasless
+    pub spender: String,     // approval target ("" if unknown until build)
+    pub to: String,          // tx target ("" for CoW signed order / unknown until build)
+    pub kind: String,        // "signed-order" | "onchain"
+}
+
+/// Read a JSON value that may be a numeric string or a number as a plain decimal string.
+fn json_num_str(v: &serde_json::Value) -> String {
+    if let Some(s) = v.as_str() {
+        s.to_string()
+    } else if v.is_number() {
+        v.to_string()
+    } else {
+        String::new()
+    }
+}
+
+sol! {
+    // GPv2Order.Data as the EIP-712 typed struct CoW signs. The struct MUST be named `Order` so the
+    // EIP-712 type hash matches CoW's. `kind`/`sellTokenBalance`/`buyTokenBalance` hash as strings.
+    #[allow(missing_docs)]
+    struct Order {
+        address sellToken;
+        address buyToken;
+        address receiver;
+        uint256 sellAmount;
+        uint256 buyAmount;
+        uint32 validTo;
+        bytes32 appData;
+        uint256 feeAmount;
+        string kind;
+        bool partiallyFillable;
+        string sellTokenBalance;
+        string buyTokenBalance;
+    }
+
+    // CoW eth-flow: sell native ETH by depositing it into the eth-flow contract, which wraps +
+    // places the order on your behalf.
+    #[allow(missing_docs)]
+    struct EthFlowData {
+        address buyToken;
+        address receiver;
+        uint256 sellAmount;
+        uint256 buyAmount;
+        bytes32 appData;
+        uint256 feeAmount;
+        uint32 validTo;
+        bool partiallyFillable;
+        int64 quoteId;
+    }
+    #[allow(missing_docs)]
+    interface IEthFlow {
+        function createOrder(EthFlowData order) external payable returns (bytes32);
+    }
+}
 
 /// A balance reported for display.
 #[derive(Serialize)]
@@ -61,6 +144,15 @@ pub struct HistoryItem {
     pub timestamp: u64,     // unix seconds (0 if unknown)
     pub fee: String,        // gas fee in wei, decimal string ("" if unknown)
     pub failed: bool,       // reverted / errored transaction
+    // ---- Swap rows (kind == "swap") ----
+    #[serde(default)]
+    pub kind: String, // "" for a normal transfer, "swap" for a swap row
+    #[serde(default)]
+    pub buy_symbol: String, // swap: symbol received (sell side reuses `symbol`/`formatted`/`token`)
+    #[serde(default)]
+    pub buy_formatted: String, // swap: human amount received
+    #[serde(default)]
+    pub status: String, // swap: "pending" | "done" | "failed"
 }
 
 /// An owned NFT collection (ERC-721 / ERC-1155), as reported by the block explorer.
@@ -545,7 +637,11 @@ impl Wallet {
     ///
     /// Returns `{ "native_symbol": "...", "accounts": [ { index, native_raw, native_formatted,
     /// native_symbol, tokens: [ { address, symbol, decimals, raw, formatted } ] } ] }`.
-    pub async fn all_balances(&self, num_accounts: u32) -> Result<serde_json::Value> {
+    /// `extra_tokens_json` (may be empty) is a JSON array `[{address,symbol,decimals}]` of additional
+    /// tokens to include in the balance read — e.g. the current chain's curated tokens — so the
+    /// Send/Swap pickers show balances immediately without the user having to permanently track each
+    /// token. Extras are fetched, never persisted.
+    pub async fn all_balances(&self, num_accounts: u32, extra_tokens_json: &str) -> Result<serde_json::Value> {
         let provider = self.provider()?;
         let native_symbol = chain_info(provider.chain_id()).native_symbol.to_string();
         let n = num_accounts.max(1);
@@ -560,14 +656,35 @@ impl Wallet {
             }
         }
 
-        // Tracked tokens with a valid address, keeping their cached symbol/decimals so we don't
-        // spend extra calls resolving metadata.
-        let tokens: Vec<(&TokenRef, Address)> = self
-            .secrets
-            .tokens
-            .iter()
-            .filter_map(|t| parse_address(&t.address).ok().map(|a| (t, a)))
-            .collect();
+        // Tracked tokens PLUS caller-supplied extras (current chain's curated tokens), deduped by
+        // address. Owned (address, symbol, decimals, parsed) so extras needn't be persisted.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut tokens: Vec<(String, String, u8, Address)> = Vec::new();
+        for t in &self.secrets.tokens {
+            if let Ok(a) = parse_address(&t.address) {
+                if seen.insert(t.address.to_lowercase()) {
+                    tokens.push((t.address.clone(), t.symbol.clone(), t.decimals, a));
+                }
+            }
+        }
+        if !extra_tokens_json.trim().is_empty() {
+            if let Ok(serde_json::Value::Array(arr)) =
+                serde_json::from_str::<serde_json::Value>(extra_tokens_json)
+            {
+                for e in arr {
+                    let address =
+                        e.get("address").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                    let symbol =
+                        e.get("symbol").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                    let decimals = e.get("decimals").and_then(|x| x.as_u64()).unwrap_or(18) as u8;
+                    if let Ok(a) = parse_address(&address) {
+                        if seen.insert(address.to_lowercase()) {
+                            tokens.push((address, symbol, decimals, a));
+                        }
+                    }
+                }
+            }
+        }
         let per_addr = 1 + tokens.len();
 
         // Chunk accounts so each batch stays comfortably under public-RPC limits (~40 calls).
@@ -582,7 +699,7 @@ impl Wallet {
                     "eth_getBalance".to_string(),
                     serde_json::json!([a.to_string(), "latest"]),
                 ));
-                for (_, taddr) in &tokens {
+                for (_, _, _, taddr) in &tokens {
                     let data = format!("0x{}", hex::encode(erc20::encode_balance_of(*a)));
                     calls.push((
                         "eth_call".to_string(),
@@ -594,23 +711,28 @@ impl Wallet {
 
             for (p, (idx, _)) in group.iter().enumerate() {
                 let base = p * per_addr;
-                let wei = results
-                    .get(base)
-                    .and_then(|v| parse_hex_u256(v).ok())
-                    .unwrap_or(U256::ZERO);
+                // A failed/absent RPC read (Value::Null) must NOT be reported as a real 0 balance —
+                // otherwise a transient Tor/RPC hiccup makes the balance flicker to 0 and the next
+                // successful read looks like an incoming payment. Mark it not-ok so the UI keeps its
+                // cached value instead of clobbering it (and spamming "received" notifications).
+                let native_res = results.get(base).and_then(|v| parse_hex_u256(v).ok());
+                let native_ok = native_res.is_some();
+                let wei = native_res.unwrap_or(U256::ZERO);
                 let mut toks_json: Vec<serde_json::Value> = Vec::with_capacity(tokens.len());
-                for (j, (tref, _)) in tokens.iter().enumerate() {
-                    let bal = results
+                for (j, (taddr_s, tsym, tdec, _)) in tokens.iter().enumerate() {
+                    let tok_res = results
                         .get(base + 1 + j)
                         .and_then(|v| hex_bytes(v).ok())
-                        .and_then(|b| erc20::decode_u256(&b))
-                        .unwrap_or(U256::ZERO);
+                        .and_then(|b| erc20::decode_u256(&b));
+                    let ok = tok_res.is_some();
+                    let bal = tok_res.unwrap_or(U256::ZERO);
                     toks_json.push(serde_json::json!({
-                        "address": tref.address,
-                        "symbol": tref.symbol,
-                        "decimals": tref.decimals,
+                        "address": taddr_s,
+                        "symbol": tsym,
+                        "decimals": tdec,
                         "raw": bal.to_string(),
-                        "formatted": format_units(bal, tref.decimals),
+                        "formatted": format_units(bal, *tdec),
+                        "ok": ok,
                     }));
                 }
                 accounts_json.push(serde_json::json!({
@@ -618,6 +740,7 @@ impl Wallet {
                     "native_raw": wei.to_string(),
                     "native_formatted": format_units(wei, 18),
                     "native_symbol": native_symbol,
+                    "native_ok": native_ok,
                     "tokens": toks_json,
                 }));
             }
@@ -1308,6 +1431,731 @@ impl Wallet {
         .await
     }
 
+    // ---------- CoW Protocol swaps ----------
+
+    /// Fetch a CoW Protocol sell-order quote. `sell_is_native` uses the chain's wrapped-native token
+    /// as the sellToken; pass `COW_BUY_ETH` as `buy_token` to receive native ETH. Returns the raw
+    /// CoW quote response (the order fields live under `quote`).
+    pub async fn swap_quote(
+        &self,
+        from_index: u32,
+        sell_token: &str,
+        buy_token: &str,
+        sell_amount_wei: &str,
+        sell_is_native: bool,
+    ) -> Result<serde_json::Value> {
+        let info = chain_info(self.provider()?.chain_id());
+        let cow = info
+            .cow_network
+            .ok_or_else(|| CoreError::rpc("swaps are not available on this network".to_string()))?;
+        let from = self.address(from_index)?;
+        let sell = if sell_is_native {
+            parse_address(info.wrapped_native)?.to_checksum(None)
+        } else {
+            parse_address(sell_token)?.to_checksum(None)
+        };
+        let buy = if buy_token.eq_ignore_ascii_case(COW_BUY_ETH) {
+            COW_BUY_ETH.to_string()
+        } else {
+            parse_address(buy_token)?.to_checksum(None)
+        };
+        let body = serde_json::json!({
+            "sellToken": sell,
+            "buyToken": buy,
+            "from": from,
+            "receiver": from,
+            "kind": "sell",
+            "sellAmountBeforeFee": sell_amount_wei,
+            "signingScheme": "eip712",
+            "priceQuality": "optimal",
+        });
+        let url = format!("https://api.cow.fi/{cow}/api/v1/quote");
+        let resp = self.provider()?.http_post_json(&url, &body).await?;
+        if resp.get("quote").is_none() {
+            let msg = resp
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("quote unavailable");
+            return Err(CoreError::rpc(format!("CoW quote: {msg}")));
+        }
+        Ok(resp)
+    }
+
+    /// Current allowance of `token` from account `from_index` to the CoW Vault Relayer.
+    pub async fn swap_allowance(&self, from_index: u32, token: &str) -> Result<U256> {
+        self.router_allowance(from_index, token, COW_VAULT_RELAYER).await
+    }
+
+    /// Current allowance of `token` from account `from_index` to an arbitrary `spender`.
+    pub async fn router_allowance(&self, from_index: u32, token: &str, spender: &str) -> Result<U256> {
+        let owner = parse_address(&self.address(from_index)?)?;
+        let spender = parse_address(spender)?;
+        let token_addr = parse_address(token)?.to_string();
+        let data = format!("0x{}", hex::encode(erc20::encode_allowance(owner, spender)));
+        let ret = self.provider()?.eth_call(&token_addr, &data).await?;
+        Ok(erc20::decode_u256(&hex_bytes(&ret)?).unwrap_or(U256::ZERO))
+    }
+
+    /// Approve the CoW Vault Relayer to spend `token` from account `from_index`. `amount` is the
+    /// decimal-wei cap to approve; pass "max" (or empty) for an unlimited allowance. Prefer an exact
+    /// per-swap amount so a compromised relayer/token can't drain more than the current order.
+    pub async fn swap_approve(
+        &self,
+        from_index: u32,
+        token: &str,
+        amount: &str,
+    ) -> Result<SendResult> {
+        self.router_approve(from_index, token, COW_VAULT_RELAYER, amount)
+            .await
+    }
+
+    /// Approve `spender` to spend `token` from account `from_index`. `amount` is the decimal-wei cap;
+    /// "max" (or empty) approves an unlimited allowance. Used for both the CoW Vault Relayer and the
+    /// on-chain aggregator routers/proxies.
+    pub async fn router_approve(
+        &self,
+        from_index: u32,
+        token: &str,
+        spender: &str,
+        amount: &str,
+    ) -> Result<SendResult> {
+        let spender_addr = parse_address(spender)?;
+        let token_addr = parse_address(token)?;
+        let cap = if amount.is_empty() || amount.eq_ignore_ascii_case("max") {
+            U256::MAX
+        } else {
+            U256::from_str(amount).map_err(|_| CoreError::Amount("bad approval amount".into()))?
+        };
+        let data = Bytes::from(erc20::encode_approve(spender_addr, cap));
+        self.build_sign_send(from_index, token_addr, U256::ZERO, data, None, None, None)
+            .await
+    }
+
+    /// Send an arbitrary-calldata transaction (used to execute an aggregator router's swap). `data`
+    /// is 0x-prefixed calldata from the router's build/assemble step — used verbatim.
+    pub async fn router_swap(
+        &self,
+        from_index: u32,
+        to: &str,
+        value_wei: &str,
+        data_hex: &str,
+    ) -> Result<SendResult> {
+        let to_addr = parse_address(to)?;
+        let value = U256::from_str(value_wei).unwrap_or(U256::ZERO);
+        let data = Bytes::from(
+            hex::decode(data_hex.trim_start_matches("0x"))
+                .map_err(|_| CoreError::rpc("bad router calldata".to_string()))?,
+        );
+        self.build_sign_send(from_index, to_addr, value, data, None, None, None)
+            .await
+    }
+
+    /// Build the executable transaction for the chosen on-chain router right before sending (fresh
+    /// calldata). Returns `{to, data, value, spender, buy_amount, min_buy_amount}`. Not used for CoW
+    /// (which keeps its signed-order path). `sell`/`buy` empty => native coin.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn router_build(
+        &self,
+        router_id: &str,
+        from_index: u32,
+        sell: &str,
+        buy: &str,
+        sell_amount_wei: &str,
+        sell_is_native: bool,
+        sell_decimals: u8,
+        buy_decimals: u8,
+        slippage_bps: u32,
+    ) -> Result<serde_json::Value> {
+        let chain = self.provider()?.chain_id();
+        let buy_is_native = buy.is_empty();
+        let from = self.address(from_index)?;
+        match router_id {
+            "kyberswap" => {
+                let slug = chains::kyber_slug(chain)
+                    .ok_or_else(|| CoreError::rpc("kyber unsupported".to_string()))?;
+                let tin = if sell_is_native { EVM_NATIVE_SENTINEL } else { sell };
+                let tout = if buy_is_native { EVM_NATIVE_SENTINEL } else { buy };
+                let routes_url = format!(
+                    "{KYBER_API}/{slug}/api/v1/routes?tokenIn={tin}&tokenOut={tout}&amountIn={sell_amount_wei}"
+                );
+                let routes = self.provider()?.http_get_json(&routes_url).await?;
+                let route_summary = routes
+                    .get("data")
+                    .and_then(|d| d.get("routeSummary"))
+                    .cloned()
+                    .ok_or_else(|| CoreError::rpc("kyber: no route".to_string()))?;
+                let body = serde_json::json!({
+                    "routeSummary": route_summary,
+                    "sender": from,
+                    "recipient": from,
+                    "slippageTolerance": slippage_bps,
+                });
+                let b = self
+                    .provider()?
+                    .http_post_json(&format!("{KYBER_API}/{slug}/api/v1/route/build"), &body)
+                    .await?;
+                let d = b
+                    .get("data")
+                    .ok_or_else(|| CoreError::rpc("kyber build: no data".to_string()))?;
+                let data = d.get("data").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let router = d
+                    .get("routerAddress")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let value = if sell_is_native {
+                    d.get("transactionValue")
+                        .map(json_num_str)
+                        .unwrap_or_else(|| sell_amount_wei.to_string())
+                } else {
+                    "0".to_string()
+                };
+                let buy_amount = d.get("amountOut").map(json_num_str).unwrap_or_default();
+                Ok(serde_json::json!({
+                    "to": router, "data": data, "value": value, "spender": router,
+                    "buy_amount": buy_amount, "min_buy_amount": buy_amount,
+                }))
+            }
+            "odos" => {
+                let tin = if sell_is_native { ODOS_NATIVE } else { sell };
+                let tout = if buy_is_native { ODOS_NATIVE } else { buy };
+                let qbody = serde_json::json!({
+                    "chainId": chain,
+                    "inputTokens": [{ "tokenAddress": tin, "amount": sell_amount_wei }],
+                    "outputTokens": [{ "tokenAddress": tout, "proportion": 1 }],
+                    "userAddr": from,
+                    "slippageLimitPercent": (slippage_bps as f64) / 100.0,
+                });
+                let q = self
+                    .provider()?
+                    .http_post_json(&format!("{ODOS_API}/sor/quote/v3"), &qbody)
+                    .await?;
+                let path_id = q
+                    .get("pathId")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| CoreError::rpc("odos: no pathId".to_string()))?;
+                let buy_amount = q
+                    .get("outAmounts")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .map(json_num_str)
+                    .unwrap_or_default();
+                let abody = serde_json::json!({ "userAddr": from, "pathId": path_id, "simulate": false });
+                let a = self
+                    .provider()?
+                    .http_post_json(&format!("{ODOS_API}/sor/assemble"), &abody)
+                    .await?;
+                let tx = a
+                    .get("transaction")
+                    .ok_or_else(|| CoreError::rpc("odos: no tx".to_string()))?;
+                let to = tx.get("to").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let data = tx.get("data").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let value = tx.get("value").map(json_num_str).unwrap_or_else(|| "0".into());
+                Ok(serde_json::json!({
+                    "to": to.clone(), "data": data, "value": value, "spender": to,
+                    "buy_amount": buy_amount, "min_buy_amount": buy_amount,
+                }))
+            }
+            "paraswap" => {
+                let src = if sell_is_native { EVM_NATIVE_SENTINEL } else { sell };
+                let dst = if buy_is_native { EVM_NATIVE_SENTINEL } else { buy };
+                let prices_url = format!(
+                    "{PARASWAP_API}/prices?srcToken={src}&destToken={dst}&amount={sell_amount_wei}\
+                     &srcDecimals={sell_decimals}&destDecimals={buy_decimals}&side=SELL&network={chain}&userAddress={from}"
+                );
+                let p = self.provider()?.http_get_json(&prices_url).await?;
+                let price_route = p
+                    .get("priceRoute")
+                    .cloned()
+                    .ok_or_else(|| CoreError::rpc("paraswap: no route".to_string()))?;
+                let dest_amount = price_route.get("destAmount").map(json_num_str).unwrap_or_default();
+                let spender = price_route
+                    .get("tokenTransferProxy")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let min_dest = {
+                    let d = U256::from_str(&dest_amount).unwrap_or(U256::ZERO);
+                    let bps = U256::from(10_000u64.saturating_sub(slippage_bps as u64));
+                    (d * bps / U256::from(10_000u64)).to_string()
+                };
+                let tbody = serde_json::json!({
+                    "srcToken": src, "destToken": dst, "srcAmount": sell_amount_wei,
+                    "destAmount": min_dest, "priceRoute": price_route, "userAddress": from,
+                    "srcDecimals": sell_decimals, "destDecimals": buy_decimals,
+                });
+                let t = self
+                    .provider()?
+                    .http_post_json(
+                        &format!("{PARASWAP_API}/transactions/{chain}?ignoreChecks=true"),
+                        &tbody,
+                    )
+                    .await?;
+                let to = t.get("to").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let data = t.get("data").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let value = t.get("value").map(json_num_str).unwrap_or_else(|| "0".into());
+                Ok(serde_json::json!({
+                    "to": to, "data": data, "value": value, "spender": spender,
+                    "buy_amount": dest_amount, "min_buy_amount": min_dest,
+                }))
+            }
+            "openocean" => {
+                let slug = chains::openocean_slug(chain)
+                    .ok_or_else(|| CoreError::rpc("openocean unsupported".to_string()))?;
+                let tin = if sell_is_native { EVM_NATIVE_SENTINEL } else { sell };
+                let tout = if buy_is_native { EVM_NATIVE_SENTINEL } else { buy };
+                let human = format_units(
+                    U256::from_str(sell_amount_wei)
+                        .map_err(|_| CoreError::Amount("bad amount".into()))?,
+                    sell_decimals,
+                );
+                let slippage_pct = (slippage_bps as f64) / 100.0;
+                let url = format!(
+                    "{OPENOCEAN_API}/v3/{slug}/swap_quote?inTokenAddress={tin}&outTokenAddress={tout}\
+                     &amount={human}&gasPrice=5&slippage={slippage_pct}&account={from}"
+                );
+                let r = self.provider()?.http_get_json(&url).await?;
+                let d = r
+                    .get("data")
+                    .ok_or_else(|| CoreError::rpc("openocean: no data".to_string()))?;
+                let to = d.get("to").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let data = d.get("data").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let value = d.get("value").map(json_num_str).unwrap_or_else(|| "0".into());
+                let buy_amount = d.get("outAmount").map(json_num_str).unwrap_or_default();
+                let min_buy = d
+                    .get("minOutAmount")
+                    .map(json_num_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| buy_amount.clone());
+                Ok(serde_json::json!({
+                    "to": to.clone(), "data": data, "value": value, "spender": to,
+                    "buy_amount": buy_amount, "min_buy_amount": min_buy,
+                }))
+            }
+            other => Err(CoreError::rpc(format!("unknown router {other}"))),
+        }
+    }
+
+    /// Sign (EIP-712) and submit the order described by a CoW quote response JSON. Returns the CoW
+    /// order UID. `slippage_bps` lowers the order's minimum `buyAmount` so it can actually fill (an
+    /// order signed at the exact quoted price sits open until the market moves back and often never
+    /// completes).
+    pub async fn swap_submit(&self, from_index: u32, quote_json: &str, slippage_bps: u32) -> Result<String> {
+        let resp: serde_json::Value = serde_json::from_str(quote_json)
+            .map_err(|e| CoreError::rpc(format!("bad quote json: {e}")))?;
+        let q = resp
+            .get("quote")
+            .ok_or_else(|| CoreError::rpc("quote missing".to_string()))?;
+        let chain_id = self.provider()?.chain_id();
+        let cow = chain_info(chain_id)
+            .cow_network
+            .ok_or_else(|| CoreError::rpc("swaps unavailable".to_string()))?;
+
+        let s = |k: &str| q.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let sell_token_s = s("sellToken");
+        let buy_token_s = s("buyToken");
+        let receiver_s = {
+            let r = s("receiver");
+            if r.is_empty() { "0x0000000000000000000000000000000000000000".to_string() } else { r }
+        };
+        let app_data_s = s("appData");
+        let kind = if s("kind").is_empty() { "sell".to_string() } else { s("kind") };
+        let sell_bal = if s("sellTokenBalance").is_empty() { "erc20".to_string() } else { s("sellTokenBalance") };
+        let buy_bal = if s("buyTokenBalance").is_empty() { "erc20".to_string() } else { s("buyTokenBalance") };
+        let partially = q.get("partiallyFillable").and_then(|v| v.as_bool()).unwrap_or(false);
+        // Guard validTo: the quote's expiry may be near-term (and the approve step can eat minutes),
+        // so ensure at least ~20 minutes out.
+        let quote_valid_to = q.get("validTo").and_then(|v| v.as_u64()).unwrap_or(0);
+        let min_valid_to = now_unix().saturating_add(20 * 60);
+        let valid_to = quote_valid_to.max(min_valid_to) as u32;
+        // CoW's current protocol requires orders with feeAmount = 0; the network fee is taken from
+        // the traded amount by solvers. So we sell the FULL amount (quote.sellAmount + quote.feeAmount)
+        // and set feeAmount to zero. (Signing/submitting the quote's fee verbatim => "Fee must be
+        // zero".)
+        let quoted_sell = U256::from_str(&s("sellAmount")).unwrap_or(U256::ZERO);
+        let quoted_fee = U256::from_str(&s("feeAmount")).unwrap_or(U256::ZERO);
+        let sell_amount = quoted_sell.saturating_add(quoted_fee);
+        // Apply slippage to the minimum buy — this is what makes the order fillable.
+        let quoted_buy = U256::from_str(&s("buyAmount")).unwrap_or(U256::ZERO);
+        let bps = U256::from(10_000u64.saturating_sub(slippage_bps.min(5_000) as u64));
+        let buy_amount = quoted_buy * bps / U256::from(10_000u64);
+        let fee_amount = U256::ZERO;
+
+        let order = Order {
+            sellToken: parse_address(&sell_token_s)?,
+            buyToken: parse_address(&buy_token_s)?,
+            receiver: parse_address(&receiver_s)?,
+            sellAmount: sell_amount,
+            buyAmount: buy_amount,
+            validTo: valid_to,
+            appData: B256::from_str(app_data_s.trim_start_matches("0x"))
+                .map_err(|e| CoreError::rpc(format!("bad appData: {e}")))?,
+            feeAmount: fee_amount,
+            kind: kind.clone(),
+            partiallyFillable: partially,
+            sellTokenBalance: sell_bal.clone(),
+            buyTokenBalance: buy_bal.clone(),
+        };
+        let domain = eip712_domain! {
+            name: "Gnosis Protocol",
+            version: "v2",
+            chain_id: chain_id,
+            verifying_contract: parse_address(COW_SETTLEMENT)?,
+        };
+        let digest = order.eip712_signing_hash(&domain);
+        let signer = self.local_signer(from_index)?;
+        let sig = signer
+            .sign_hash_sync(&digest)
+            .map_err(|e| CoreError::Signing(format!("sign order: {e}")))?;
+        let signature = format!("0x{}", hex::encode(sig.as_bytes()));
+
+        let from = self.address(from_index)?;
+        let order_body = serde_json::json!({
+            "sellToken": sell_token_s,
+            "buyToken": buy_token_s,
+            "receiver": receiver_s,
+            "sellAmount": sell_amount.to_string(),
+            "buyAmount": buy_amount.to_string(),
+            "validTo": valid_to,
+            "appData": app_data_s,
+            "feeAmount": fee_amount.to_string(),
+            "kind": kind,
+            "partiallyFillable": partially,
+            "sellTokenBalance": sell_bal,
+            "buyTokenBalance": buy_bal,
+            "signingScheme": "eip712",
+            "signature": signature,
+            "from": from,
+        });
+        let url = format!("https://api.cow.fi/{cow}/api/v1/orders");
+        let resp2 = self.provider()?.http_post_json(&url, &order_body).await?;
+        if let Some(uid) = resp2.as_str() {
+            return Ok(uid.to_string());
+        }
+        let msg = resp2
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("order rejected");
+        Err(CoreError::rpc(format!("CoW order: {msg}")))
+    }
+
+    /// Sell native ETH via CoW eth-flow: one on-chain tx to the eth-flow contract that wraps the ETH
+    /// and places the order. Uses the fields from a CoW quote (obtained with the wrapped-native
+    /// sellToken). `buy_token` is the ERC-20 to receive.
+    pub async fn swap_eth_flow(
+        &self,
+        from_index: u32,
+        quote_json: &str,
+        buy_token: &str,
+        slippage_bps: u32,
+    ) -> Result<SendResult> {
+        let info = chain_info(self.provider()?.chain_id());
+        let eth_flow = info
+            .eth_flow
+            .ok_or_else(|| CoreError::rpc("native-ETH swaps unavailable on this network".to_string()))?;
+        let resp: serde_json::Value = serde_json::from_str(quote_json)
+            .map_err(|e| CoreError::rpc(format!("bad quote json: {e}")))?;
+        let q = resp
+            .get("quote")
+            .ok_or_else(|| CoreError::rpc("quote missing".to_string()))?;
+        let s = |k: &str| q.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        // Same fee=0 rule as signed orders: sell the full amount, fee 0. The ETH sent (value) is the
+        // full sell amount, unchanged from quote.sellAmount + quote.feeAmount.
+        let quoted_sell = U256::from_str(&s("sellAmount")).unwrap_or(U256::ZERO);
+        let quoted_fee = U256::from_str(&s("feeAmount")).unwrap_or(U256::ZERO);
+        let sell_amount = quoted_sell.saturating_add(quoted_fee);
+        // Apply slippage to the minimum buy so the order can fill.
+        let quoted_buy = U256::from_str(&s("buyAmount")).unwrap_or(U256::ZERO);
+        let bps = U256::from(10_000u64.saturating_sub(slippage_bps.min(5_000) as u64));
+        let buy_amount = quoted_buy * bps / U256::from(10_000u64);
+        let fee_amount = U256::ZERO;
+        let quote_valid_to = q.get("validTo").and_then(|v| v.as_u64()).unwrap_or(0);
+        let valid_to = quote_valid_to.max(now_unix().saturating_add(20 * 60)) as u32;
+        let quote_id = resp.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let receiver = parse_address(&self.address(from_index)?)?; // must be non-zero for eth-flow
+
+        let order = EthFlowData {
+            buyToken: parse_address(buy_token)?,
+            receiver,
+            sellAmount: sell_amount,
+            buyAmount: buy_amount,
+            appData: B256::from_str(s("appData").trim_start_matches("0x"))
+                .map_err(|e| CoreError::rpc(format!("bad appData: {e}")))?,
+            feeAmount: fee_amount,
+            validTo: valid_to,
+            partiallyFillable: false,
+            quoteId: quote_id,
+        };
+        let calldata = Bytes::from(IEthFlow::createOrderCall { order }.abi_encode());
+        // msg.value = the full sell amount (fee is 0 in the order).
+        let value = sell_amount;
+        self.build_sign_send(from_index, parse_address(eth_flow)?, value, calldata, None, None, None)
+            .await
+    }
+
+    // ---------- Token approvals ----------
+
+    /// Batched `allowance(owner, spender)` reads for every (token, spender) pair. `tokens_json` and
+    /// `spenders_json` are JSON arrays of addresses. Returns only the non-zero allowances so the UI
+    /// can list revokable approvals.
+    pub async fn token_allowances(
+        &self,
+        from_index: u32,
+        tokens_json: &str,
+        spenders_json: &str,
+    ) -> Result<serde_json::Value> {
+        let owner = parse_address(&self.address(from_index)?)?;
+        let tokens: Vec<String> = serde_json::from_str(tokens_json)
+            .map_err(|e| CoreError::rpc(format!("bad tokens list: {e}")))?;
+        let spenders: Vec<String> = serde_json::from_str(spenders_json)
+            .map_err(|e| CoreError::rpc(format!("bad spenders list: {e}")))?;
+        let mut pairs: Vec<(Address, Address)> = Vec::new();
+        for t in &tokens {
+            if let Ok(ta) = parse_address(t) {
+                for s in &spenders {
+                    if let Ok(sa) = parse_address(s) {
+                        pairs.push((ta, sa));
+                    }
+                }
+            }
+        }
+        let provider = self.provider()?;
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for group in pairs.chunks(40) {
+            let mut calls: Vec<(String, serde_json::Value)> = Vec::with_capacity(group.len());
+            for (t, s) in group {
+                let data = format!("0x{}", hex::encode(erc20::encode_allowance(owner, *s)));
+                calls.push((
+                    "eth_call".to_string(),
+                    serde_json::json!([{ "to": t.to_string(), "data": data }, "latest"]),
+                ));
+            }
+            let results = provider.call_batch(&calls).await?;
+            for (p, (t, s)) in group.iter().enumerate() {
+                let a = results
+                    .get(p)
+                    .and_then(|v| hex_bytes(v).ok())
+                    .and_then(|b| erc20::decode_u256(&b))
+                    .unwrap_or(U256::ZERO);
+                if a > U256::ZERO {
+                    out.push(serde_json::json!({
+                        "token": t.to_checksum(None),
+                        "spender": s.to_checksum(None),
+                        "allowance": a.to_string(),
+                    }));
+                }
+            }
+        }
+        Ok(serde_json::json!({ "allowances": out }))
+    }
+
+    /// Revoke an ERC-20 approval by setting the allowance to zero (`approve(spender, 0)`).
+    pub async fn revoke_approval(
+        &self,
+        from_index: u32,
+        token: &str,
+        spender: &str,
+    ) -> Result<SendResult> {
+        let token_addr = parse_address(token)?;
+        let spender_addr = parse_address(spender)?;
+        let data = Bytes::from(erc20::encode_approve(spender_addr, U256::ZERO));
+        self.build_sign_send(from_index, token_addr, U256::ZERO, data, None, None, None)
+            .await
+    }
+
+    /// DefiLlama current prices for a comma-separated list of coin keys
+    /// (e.g. `ethereum:0x…,coingecko:ethereum`). Used to cross-check CoW quote rates.
+    pub async fn defillama_prices(&self, coins_csv: &str) -> Result<serde_json::Value> {
+        let url = format!("https://coins.llama.fi/prices/current/{coins_csv}");
+        self.provider()?.http_get_json(&url).await
+    }
+
+    // ---------- Multi-router swap aggregator (quotes) ----------
+
+    /// Fetch quotes from every keyless router supported on the current chain, in parallel over Tor,
+    /// and return them best-first (largest expected output). `sell`/`buy` are token addresses; an
+    /// empty string means the native coin. Routers that error or don't support the chain are simply
+    /// dropped. Returns `{ "quotes": [RouterQuote, ...] }`.
+    pub async fn swap_quotes(
+        &self,
+        from_index: u32,
+        sell: &str,
+        buy: &str,
+        sell_amount_wei: &str,
+        sell_is_native: bool,
+        sell_decimals: u8,
+        buy_decimals: u8,
+        slippage_bps: u32,
+    ) -> Result<serde_json::Value> {
+        let buy_is_native = buy.is_empty();
+        let (cow, kyber, odos, para, oo) = tokio::join!(
+            self.cow_quote_norm(from_index, sell, buy, sell_amount_wei, sell_is_native, buy_is_native),
+            self.kyber_quote(sell, buy, sell_amount_wei, sell_is_native, buy_is_native),
+            self.odos_quote(from_index, sell, buy, sell_amount_wei, sell_is_native, buy_is_native, slippage_bps),
+            self.paraswap_quote(sell, buy, sell_amount_wei, sell_is_native, buy_is_native, sell_decimals, buy_decimals),
+            self.openocean_quote(sell, buy, sell_amount_wei, sell_is_native, buy_is_native, sell_decimals),
+        );
+        let _ = buy_decimals;
+        let mut quotes: Vec<RouterQuote> = Vec::new();
+        for r in [cow, kyber, odos, para, oo] {
+            if let Ok(q) = r {
+                if !q.buy_amount.is_empty() && q.buy_amount != "0" {
+                    quotes.push(q);
+                }
+            }
+        }
+        quotes.sort_by(|a, b| {
+            let av = U256::from_str(&a.buy_amount).unwrap_or(U256::ZERO);
+            let bv = U256::from_str(&b.buy_amount).unwrap_or(U256::ZERO);
+            bv.cmp(&av)
+        });
+        Ok(serde_json::json!({ "quotes": quotes }))
+    }
+
+    async fn cow_quote_norm(
+        &self,
+        from_index: u32,
+        sell: &str,
+        buy: &str,
+        amount: &str,
+        sell_is_native: bool,
+        buy_is_native: bool,
+    ) -> Result<RouterQuote> {
+        let info = chain_info(self.provider()?.chain_id());
+        if info.cow_network.is_none() {
+            return Err(CoreError::rpc("cow unsupported".to_string()));
+        }
+        // Selling the native coin via CoW needs eth-flow (only where a verified eth-flow contract is
+        // configured, i.e. mainnet). On other CoW chains (e.g. Arbitrum) don't offer a CoW route for
+        // native sells — it would quote but fail to execute. Other routers handle native there.
+        if sell_is_native && info.eth_flow.is_none() {
+            return Err(CoreError::rpc("cow native-sell unavailable on this chain".to_string()));
+        }
+        let buy_param = if buy_is_native { COW_BUY_ETH } else { buy };
+        let resp = self.swap_quote(from_index, sell, buy_param, amount, sell_is_native).await?;
+        let buy_amount = resp
+            .get("quote")
+            .and_then(|q| q.get("buyAmount"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if buy_amount.is_empty() {
+            return Err(CoreError::rpc("cow: empty out".to_string()));
+        }
+        Ok(RouterQuote {
+            router_id: "cow".into(),
+            label: "CoW Protocol".into(),
+            buy_amount,
+            gas_usd: 0.0,
+            gas_estimate: "0".into(),
+            spender: COW_VAULT_RELAYER.into(),
+            to: String::new(),
+            kind: "signed-order".into(),
+        })
+    }
+
+    async fn kyber_quote(
+        &self,
+        sell: &str,
+        buy: &str,
+        amount: &str,
+        sell_is_native: bool,
+        buy_is_native: bool,
+    ) -> Result<RouterQuote> {
+        let slug = chains::kyber_slug(self.provider()?.chain_id())
+            .ok_or_else(|| CoreError::rpc("kyber unsupported".to_string()))?;
+        let tin = if sell_is_native { EVM_NATIVE_SENTINEL } else { sell };
+        let tout = if buy_is_native { EVM_NATIVE_SENTINEL } else { buy };
+        let url = format!(
+            "{KYBER_API}/{slug}/api/v1/routes?tokenIn={tin}&tokenOut={tout}&amountIn={amount}"
+        );
+        let resp = self.provider()?.http_get_json(&url).await?;
+        parse_kyber_quote(&resp)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn odos_quote(
+        &self,
+        from_index: u32,
+        sell: &str,
+        buy: &str,
+        amount: &str,
+        sell_is_native: bool,
+        buy_is_native: bool,
+        slippage_bps: u32,
+    ) -> Result<RouterQuote> {
+        let chain = self.provider()?.chain_id();
+        if !chains::odos_supported(chain) {
+            return Err(CoreError::rpc("odos unsupported".to_string()));
+        }
+        let from = self.address(from_index)?;
+        let tin = if sell_is_native { ODOS_NATIVE } else { sell };
+        let tout = if buy_is_native { ODOS_NATIVE } else { buy };
+        let body = serde_json::json!({
+            "chainId": chain,
+            "inputTokens": [{ "tokenAddress": tin, "amount": amount }],
+            "outputTokens": [{ "tokenAddress": tout, "proportion": 1 }],
+            "userAddr": from,
+            "slippageLimitPercent": (slippage_bps as f64) / 100.0,
+        });
+        let resp = self
+            .provider()?
+            .http_post_json(&format!("{ODOS_API}/sor/quote/v3"), &body)
+            .await?;
+        parse_odos_quote(&resp)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn paraswap_quote(
+        &self,
+        sell: &str,
+        buy: &str,
+        amount: &str,
+        sell_is_native: bool,
+        buy_is_native: bool,
+        sell_decimals: u8,
+        buy_decimals: u8,
+    ) -> Result<RouterQuote> {
+        let chain = self.provider()?.chain_id();
+        if !chains::paraswap_supported(chain) {
+            return Err(CoreError::rpc("paraswap unsupported".to_string()));
+        }
+        let src = if sell_is_native { EVM_NATIVE_SENTINEL } else { sell };
+        let dst = if buy_is_native { EVM_NATIVE_SENTINEL } else { buy };
+        let url = format!(
+            "{PARASWAP_API}/prices?srcToken={src}&destToken={dst}&amount={amount}\
+             &srcDecimals={sell_decimals}&destDecimals={buy_decimals}&side=SELL&network={chain}"
+        );
+        let resp = self.provider()?.http_get_json(&url).await?;
+        parse_paraswap_quote(&resp)
+    }
+
+    async fn openocean_quote(
+        &self,
+        sell: &str,
+        buy: &str,
+        amount_wei: &str,
+        sell_is_native: bool,
+        buy_is_native: bool,
+        sell_decimals: u8,
+    ) -> Result<RouterQuote> {
+        let slug = chains::openocean_slug(self.provider()?.chain_id())
+            .ok_or_else(|| CoreError::rpc("openocean unsupported".to_string()))?;
+        let tin = if sell_is_native { EVM_NATIVE_SENTINEL } else { sell };
+        let tout = if buy_is_native { EVM_NATIVE_SENTINEL } else { buy };
+        // OpenOcean v3 takes a *human* amount and a gwei gas price.
+        let human = format_units(
+            U256::from_str(amount_wei).map_err(|_| CoreError::Amount("bad amount".into()))?,
+            sell_decimals,
+        );
+        let url = format!(
+            "{OPENOCEAN_API}/v3/{slug}/quote?inTokenAddress={tin}&outTokenAddress={tout}\
+             &amount={human}&gasPrice=5"
+        );
+        let resp = self.provider()?.http_get_json(&url).await?;
+        parse_openocean_quote(&resp)
+    }
+
     /// Reconstruct ERC20 transfer history for `token`/`index` from event logs.
     ///
     /// Ethereum has no lightweight source for *native ETH* history (that needs an indexer);
@@ -1442,6 +2290,7 @@ impl Wallet {
                 timestamp: s("timeStamp").parse().unwrap_or(0),
                 fee: (gas_price.saturating_mul(gas_used)).to_string(),
                 failed: s("isError") == "1" || s("txreceipt_status") == "0",
+                ..Default::default()
             });
         }
 
@@ -1464,6 +2313,37 @@ impl Wallet {
                 timestamp: s("timeStamp").parse().unwrap_or(0),
                 fee: String::new(),
                 failed: false,
+                ..Default::default()
+            });
+        }
+
+        // Internal (contract-initiated) native transfers TO the owner — ALL pages. These are the
+        // native leg an EOA receives via a contract: the output of a token->native swap, a WETH
+        // unwrap, a refund, etc. Without them a token->native swap looks like a one-sided "Sent"
+        // (the native the user got back arrives by an internal tx, not the external tx list). Only
+        // inbound value is added; native the owner *sends* is already in the external tx list above.
+        for r in fetch_all_pages(provider, base, "txlistinternal", &owner).await {
+            let s = |k: &str| r.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if s("to").to_lowercase() != owner {
+                continue; // only native received via a contract
+            }
+            let value = U256::from_str(&s("value")).unwrap_or(U256::ZERO);
+            if value.is_zero() {
+                continue; // ignore 0-value internal calls (delegatecall bookkeeping, etc.)
+            }
+            items.push(HistoryItem {
+                direction: "in".to_string(),
+                counterparty: s("from"),
+                amount: value.to_string(),
+                formatted: format_units(value, 18),
+                tx_hash: s("hash"),
+                block: s("blockNumber").parse().unwrap_or(0),
+                token: String::new(),
+                symbol: info.native_symbol.to_string(),
+                timestamp: s("timeStamp").parse().unwrap_or(0),
+                fee: String::new(), // gas is charged on the external tx, not the internal transfer
+                failed: s("isError") == "1",
+                ..Default::default()
             });
         }
 
@@ -1475,8 +2355,82 @@ impl Wallet {
             seen.insert(format!("{}|{}|{}|{}", h.tx_hash, h.token, h.direction, h.amount))
         });
 
-        items.sort_by(|a, b| b.block.cmp(&a.block));
+        // Collapse on-chain swaps into a single "Swap A -> B" row: any tx where the owner both sent
+        // asset A and received asset B (a router swap). CoW settlements are skipped here — they are
+        // surfaced (with richer status) via `cow_orders`.
+        let items = group_swaps(items);
+
         Ok(items)
+    }
+
+    /// Symbol + decimals for a token address from the tracked list; falls back to a short address
+    /// and 18 decimals for unknown tokens.
+    fn token_meta_hint(&self, addr: &str) -> (String, u8) {
+        for t in &self.secrets.tokens {
+            if t.address.eq_ignore_ascii_case(addr) {
+                return (t.symbol.clone(), t.decimals);
+            }
+        }
+        (short_addr_str(addr), 18)
+    }
+
+    /// CoW Protocol swaps for `index` (pending + historical, including months-old) from CoW's
+    /// order-book API over Tor. Returns swap `HistoryItem`s with status. Empty on non-CoW chains.
+    pub async fn cow_orders(&self, index: u32) -> Result<Vec<HistoryItem>> {
+        let provider = self.provider()?;
+        let Some(cow) = chain_info(provider.chain_id()).cow_network else {
+            return Ok(Vec::new());
+        };
+        let owner = self.address(index)?;
+        let url = format!("https://api.cow.fi/{cow}/api/v1/account/{owner}/orders?limit=200");
+        let v = provider.http_get_json(&url).await?;
+        let arr = v.as_array().cloned().unwrap_or_default();
+        let mut out = Vec::with_capacity(arr.len());
+        for o in arr {
+            let g = |k: &str| o.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
+            let status = match g("status").as_str() {
+                "fulfilled" => "done",
+                "open" | "presignaturePending" | "scheduled" | "active" => "pending",
+                _ => "failed", // expired / cancelled
+            }
+            .to_string();
+            let done = status == "done";
+            let take = |exec: &str, quoted: &str| -> String {
+                if done {
+                    let e = g(exec);
+                    if !e.is_empty() && e != "0" {
+                        return e;
+                    }
+                }
+                g(quoted)
+            };
+            let sell_token = g("sellToken");
+            let buy_token = g("buyToken");
+            let sell_raw = take("executedSellAmount", "sellAmount");
+            let buy_raw = take("executedBuyAmount", "buyAmount");
+            let (sell_sym, sell_dec) = self.token_meta_hint(&sell_token);
+            let (buy_sym, buy_dec) = self.token_meta_hint(&buy_token);
+            let sell_amt = U256::from_str(&sell_raw).unwrap_or(U256::ZERO);
+            let buy_amt = U256::from_str(&buy_raw).unwrap_or(U256::ZERO);
+            out.push(HistoryItem {
+                direction: "swap".into(),
+                counterparty: "CoW Protocol".into(),
+                amount: sell_raw,
+                formatted: format_units(sell_amt, sell_dec),
+                tx_hash: g("uid"),
+                block: 0,
+                token: sell_token,
+                symbol: sell_sym,
+                timestamp: parse_iso8601(&g("creationDate")),
+                fee: String::new(),
+                failed: status == "failed",
+                kind: "swap".into(),
+                buy_symbol: buy_sym,
+                buy_formatted: format_units(buy_amt, buy_dec),
+                status,
+            });
+        }
+        Ok(out)
     }
 
     /// Owned NFT collections (ERC-721 + ERC-1155) for `index`, from Blockscout's v2 API over Tor.
@@ -1488,7 +2442,12 @@ impl Wallet {
         };
         let owner = self.address(index)?;
         let url = format!("{bs}/api/v2/addresses/{owner}/nft/collections?type=ERC-721,ERC-1155");
-        let v = provider.http_get_json(&url).await?;
+        // Not every keyless explorer implements the Blockscout v2 NFT endpoint (e.g. the Routescan
+        // Etherscan-compatible API used for Avalanche). Treat any failure/absence as "no NFTs" rather
+        // than surfacing an error.
+        let Ok(v) = provider.http_get_json(&url).await else {
+            return Ok(Vec::new());
+        };
         let mut out = Vec::new();
         if let Some(items) = v.get("items").and_then(|i| i.as_array()) {
             for it in items {
@@ -1817,6 +2776,139 @@ async fn fetch_all_pages(
     out
 }
 
+/// Current unix time in seconds (0 if the clock is before the epoch, which shouldn't happen).
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Short "0x1234…abcd" form of an address for unknown-token display.
+fn short_addr_str(a: &str) -> String {
+    if a.len() >= 12 {
+        format!("{}…{}", &a[..6], &a[a.len() - 4..])
+    } else {
+        a.to_string()
+    }
+}
+
+/// Parse an ISO-8601 UTC timestamp (e.g. "2025-01-16T07:51:51.983474Z") into unix seconds. Returns
+/// 0 if it can't be parsed. Uses Howard Hinnant's days-from-civil algorithm (no chrono dependency).
+fn parse_iso8601(s: &str) -> u64 {
+    if s.len() < 19 {
+        return 0;
+    }
+    let num = |a: usize, z: usize| s.get(a..z).and_then(|p| p.parse::<i64>().ok()).unwrap_or(0);
+    let (y, mo, d, h, mi, se) = (
+        num(0, 4),
+        num(5, 7),
+        num(8, 10),
+        num(11, 13),
+        num(14, 16),
+        num(17, 19),
+    );
+    if mo == 0 || d == 0 {
+        return 0;
+    }
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    (days * 86400 + h * 3600 + mi * 60 + se).max(0) as u64
+}
+
+/// Collapse on-chain swap transactions (owner sent asset A and received asset B in the same tx)
+/// into a single `kind == "swap"` `HistoryItem`. CoW settlement/vault txs are left untouched here —
+/// those are surfaced with richer status via `Wallet::cow_orders` (avoiding duplicate rows).
+fn group_swaps(items: Vec<HistoryItem>) -> Vec<HistoryItem> {
+    use std::collections::HashMap;
+    const COW_SETTLE: &str = "0x9008d19f58aabd9ed0d60971565aa8510560ab41";
+    const COW_VAULT: &str = "0xc92e8bdf79f0507f65a392b0ab4667716bfe0110";
+
+    let mut by_tx: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, it) in items.iter().enumerate() {
+        if !it.tx_hash.is_empty() {
+            by_tx.entry(it.tx_hash.clone()).or_default().push(i);
+        }
+    }
+
+    let mut remove = vec![false; items.len()];
+    let mut swaps: Vec<HistoryItem> = Vec::new();
+    for (_tx, idxs) in by_tx {
+        if idxs.len() < 2 {
+            continue;
+        }
+        // CoW settlements come from cow_orders; don't also synthesize a row here.
+        let is_cow = idxs.iter().any(|&i| {
+            let cp = items[i].counterparty.to_lowercase();
+            cp == COW_SETTLE || cp == COW_VAULT
+        });
+        if is_cow {
+            continue;
+        }
+        // Pick the meaningful sent/received leg: prefer a real token transfer, else a non-zero
+        // native amount (skips the 0-value native "gas only" row of a token swap).
+        let pick = |dir: &str| -> Option<usize> {
+            idxs.iter()
+                .cloned()
+                .find(|&i| items[i].direction == dir && !items[i].token.is_empty() && items[i].amount != "0")
+                .or_else(|| {
+                    idxs.iter()
+                        .cloned()
+                        .find(|&i| items[i].direction == dir && items[i].amount != "0")
+                })
+        };
+        let (Some(so), Some(bi)) = (pick("out"), pick("in")) else {
+            continue;
+        };
+        // Same asset in and out isn't a swap.
+        if items[so].token.eq_ignore_ascii_case(&items[bi].token) && items[so].symbol == items[bi].symbol {
+            continue;
+        }
+        // Fee: the native "out" row of this tx carries the gas cost.
+        let fee = idxs
+            .iter()
+            .cloned()
+            .find(|&i| items[i].token.is_empty() && !items[i].fee.is_empty())
+            .map(|i| items[i].fee.clone())
+            .unwrap_or_else(|| items[so].fee.clone());
+        let failed = items[so].failed || items[bi].failed;
+        swaps.push(HistoryItem {
+            direction: "swap".into(),
+            counterparty: items[so].counterparty.clone(),
+            amount: items[so].amount.clone(),
+            formatted: items[so].formatted.clone(),
+            tx_hash: items[so].tx_hash.clone(),
+            block: items[so].block,
+            token: items[so].token.clone(),
+            symbol: items[so].symbol.clone(),
+            timestamp: items[so].timestamp,
+            fee,
+            failed,
+            kind: "swap".into(),
+            buy_symbol: items[bi].symbol.clone(),
+            buy_formatted: items[bi].formatted.clone(),
+            status: if failed { "failed".into() } else { "done".into() },
+        });
+        for &i in &idxs {
+            remove[i] = true; // fold every transfer of this swap tx into the single row
+        }
+    }
+
+    let mut result: Vec<HistoryItem> = items
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !remove[*i])
+        .map(|(_, h)| h)
+        .collect();
+    result.append(&mut swaps);
+    result.sort_by(|a, b| b.block.cmp(&a.block));
+    result
+}
+
 fn parse_address(s: &str) -> Result<Address> {
     Address::from_str(s.trim()).map_err(|_| CoreError::Address(s.to_string()))
 }
@@ -1861,6 +2953,129 @@ fn hex_bytes(v: &serde_json::Value) -> Result<Vec<u8>> {
 }
 
 /// Format an integer amount with `decimals` into a human-readable decimal string.
+/// Parse a KyberSwap `routes` response into a normalized quote.
+fn parse_kyber_quote(resp: &serde_json::Value) -> Result<RouterQuote> {
+    let data = resp
+        .get("data")
+        .ok_or_else(|| CoreError::rpc("kyber: no data".to_string()))?;
+    let rs = data
+        .get("routeSummary")
+        .ok_or_else(|| CoreError::rpc("kyber: no route".to_string()))?;
+    let buy_amount = rs.get("amountOut").map(json_num_str).unwrap_or_default();
+    if buy_amount.is_empty() {
+        return Err(CoreError::rpc("kyber: empty out".to_string()));
+    }
+    let gas_usd = rs
+        .get("gasUsd")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let gas_estimate = rs.get("gas").map(json_num_str).unwrap_or_else(|| "0".into());
+    let router = data
+        .get("routerAddress")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok(RouterQuote {
+        router_id: "kyberswap".into(),
+        label: "KyberSwap".into(),
+        buy_amount,
+        gas_usd,
+        gas_estimate,
+        spender: router.clone(),
+        to: router,
+        kind: "onchain".into(),
+    })
+}
+
+/// Parse an Odos `/sor/quote` response into a normalized quote.
+fn parse_odos_quote(resp: &serde_json::Value) -> Result<RouterQuote> {
+    let buy_amount = resp
+        .get("outAmounts")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .map(json_num_str)
+        .unwrap_or_default();
+    if buy_amount.is_empty() {
+        return Err(CoreError::rpc("odos: no out".to_string()));
+    }
+    let gas_usd = resp
+        .get("gasEstimateValue")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    Ok(RouterQuote {
+        router_id: "odos".into(),
+        label: "Odos".into(),
+        buy_amount,
+        gas_usd,
+        gas_estimate: "0".into(),
+        spender: String::new(), // resolved at build (transaction.to)
+        to: String::new(),
+        kind: "onchain".into(),
+    })
+}
+
+/// Parse a Paraswap `/prices` response into a normalized quote.
+fn parse_paraswap_quote(resp: &serde_json::Value) -> Result<RouterQuote> {
+    let pr = resp
+        .get("priceRoute")
+        .ok_or_else(|| CoreError::rpc("paraswap: no route".to_string()))?;
+    let buy_amount = pr.get("destAmount").map(json_num_str).unwrap_or_default();
+    if buy_amount.is_empty() {
+        return Err(CoreError::rpc("paraswap: empty out".to_string()));
+    }
+    let gas_usd = pr
+        .get("gasCostUSD")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let spender = pr
+        .get("tokenTransferProxy")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let to = pr
+        .get("contractAddress")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Ok(RouterQuote {
+        router_id: "paraswap".into(),
+        label: "ParaSwap".into(),
+        buy_amount,
+        gas_usd,
+        gas_estimate: "0".into(),
+        spender,
+        to,
+        kind: "onchain".into(),
+    })
+}
+
+/// Parse an OpenOcean `/quote` response into a normalized quote.
+fn parse_openocean_quote(resp: &serde_json::Value) -> Result<RouterQuote> {
+    let data = resp
+        .get("data")
+        .ok_or_else(|| CoreError::rpc("openocean: no data".to_string()))?;
+    let buy_amount = data.get("outAmount").map(json_num_str).unwrap_or_default();
+    if buy_amount.is_empty() {
+        return Err(CoreError::rpc("openocean: empty out".to_string()));
+    }
+    let gas_estimate = data
+        .get("estimatedGas")
+        .map(json_num_str)
+        .unwrap_or_else(|| "0".into());
+    Ok(RouterQuote {
+        router_id: "openocean".into(),
+        label: "OpenOcean".into(),
+        buy_amount,
+        gas_usd: 0.0,
+        gas_estimate,
+        spender: String::new(), // resolved at build
+        to: String::new(),
+        kind: "onchain".into(),
+    })
+}
+
 pub fn format_units(value: U256, decimals: u8) -> String {
     let base = U256::from(10u64).pow(U256::from(decimals as u64));
     let whole = value / base;
@@ -1898,6 +3113,66 @@ pub fn parse_units(amount: &str, decimals: u8) -> Result<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_router_quotes_from_samples() {
+        // KyberSwap routes: data.routeSummary.amountOut + data.routerAddress.
+        let kyber = serde_json::json!({
+            "data": {
+                "routeSummary": { "amountOut": "177656413", "gas": "210000", "gasUsd": "1.23" },
+                "routerAddress": "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5"
+            }
+        });
+        let q = parse_kyber_quote(&kyber).unwrap();
+        assert_eq!(q.router_id, "kyberswap");
+        assert_eq!(q.buy_amount, "177656413");
+        assert_eq!(q.spender, "0x6131B5fae19EA4f9D964eAc0408E4408b66337b5");
+        assert_eq!(q.to, q.spender);
+        assert!((q.gas_usd - 1.23).abs() < 1e-9);
+
+        // Odos quote: outAmounts[0] (string) + gasEstimateValue.
+        let odos = serde_json::json!({ "outAmounts": ["177700000"], "gasEstimateValue": 2.5 });
+        let q = parse_odos_quote(&odos).unwrap();
+        assert_eq!(q.router_id, "odos");
+        assert_eq!(q.buy_amount, "177700000");
+        assert!((q.gas_usd - 2.5).abs() < 1e-9);
+
+        // Paraswap prices: priceRoute.destAmount + tokenTransferProxy (spender) + contractAddress (to).
+        let para = serde_json::json!({
+            "priceRoute": {
+                "destAmount": "177731275",
+                "gasCostUSD": "0.046660",
+                "tokenTransferProxy": "0x216b4b4ba9f3e719726886d34a177484278bfcae",
+                "contractAddress": "0xDEF171Fe48CF0115B1d80b88dc8eAB59176FEe57"
+            }
+        });
+        let q = parse_paraswap_quote(&para).unwrap();
+        assert_eq!(q.router_id, "paraswap");
+        assert_eq!(q.buy_amount, "177731275");
+        assert_eq!(q.spender, "0x216b4b4ba9f3e719726886d34a177484278bfcae");
+        assert_eq!(q.to, "0xDEF171Fe48CF0115B1d80b88dc8eAB59176FEe57");
+
+        // OpenOcean quote: data.outAmount + estimatedGas.
+        let oo = serde_json::json!({ "data": { "outAmount": "177706794", "estimatedGas": 210487 } });
+        let q = parse_openocean_quote(&oo).unwrap();
+        assert_eq!(q.router_id, "openocean");
+        assert_eq!(q.buy_amount, "177706794");
+        assert_eq!(q.gas_estimate, "210487");
+
+        // Missing output is an error (router gets dropped from the comparison).
+        assert!(parse_kyber_quote(&serde_json::json!({ "data": { "routeSummary": {} } })).is_err());
+    }
+
+    #[test]
+    fn cow_order_type_hash_matches() {
+        // Must equal GPv2Order.TYPE_HASH from @cowprotocol/contracts. If our struct name, field
+        // order, or types differ, the type hash changes and CoW rejects every signature.
+        let th = alloy::primitives::keccak256(Order::eip712_encode_type().as_bytes());
+        assert_eq!(
+            format!("0x{}", hex::encode(th)),
+            "0xd5a25ba2e97094ad7d83dc28a6572da797d6b3e7fc6663bd93efb789fc17e489"
+        );
+    }
 
     #[test]
     fn addresses_are_deterministic() {

@@ -69,7 +69,7 @@ fn main() {
                 timeout_secs: 60,
             })
             .unwrap();
-            let v = rt.block_on(w.all_balances(num)).unwrap();
+            let v = rt.block_on(w.all_balances(num, "")).unwrap();
             println!("{}", serde_json::to_string_pretty(&v).unwrap());
         }
         "savetest" => {

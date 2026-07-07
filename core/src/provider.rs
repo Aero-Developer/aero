@@ -136,6 +136,28 @@ impl RpcProvider {
             .map_err(|e| CoreError::rpc(format!("bad json ({status}): {e}")))
     }
 
+    /// POST a JSON body (over the same Tor client) and return the parsed JSON response. The body is
+    /// returned even for non-2xx statuses so callers (e.g. the CoW order-book API) can read the
+    /// structured error object.
+    pub async fn http_post_json(&self, url: &str, body: &Value) -> Result<Value> {
+        let resp = self
+            .http
+            .post(url)
+            .header("content-type", "application/json")
+            .header("accept", "application/json")
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| CoreError::rpc(format!("http post failed: {e}")))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| CoreError::rpc(format!("http post read failed ({status}): {e}")))?;
+        serde_json::from_str(&text)
+            .map_err(|e| CoreError::rpc(format!("bad json ({status}): {e}")))
+    }
+
     /// Perform a single JSON-RPC call. Tries each endpoint once on transport failure.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({
