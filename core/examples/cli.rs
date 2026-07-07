@@ -72,6 +72,15 @@ fn main() {
             let v = rt.block_on(w.all_balances(num)).unwrap();
             println!("{}", serde_json::to_string_pretty(&v).unwrap());
         }
+        "savetest" => {
+            let path = args[1].clone();
+            let pw = args.get(2).cloned().unwrap_or_default();
+            let w = Wallet::restore("test test test test test test test test test test test junk")
+                .unwrap();
+            w.save(&path, &pw).unwrap();
+            let reopened = Wallet::open(&path, &pw).unwrap();
+            println!("saved+reopened ok; addr0 = {}", reopened.address(0).unwrap());
+        }
         "nativeprice" => {
             let chain_id: u64 = args[1].parse().unwrap();
             let rpc = args[2].clone();

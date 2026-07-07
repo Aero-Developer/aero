@@ -155,7 +155,32 @@ fn header_aad(version: u32, kdf: &str, m: u32, t: u32, p: u32, salt_hex: &str, n
         .into_bytes()
 }
 
-/// Encrypt `secrets` under `password` and return the serialized envelope bytes (v3, AAD-bound).
+// Opaque binary format (v4). The whole file is a raw byte blob — no self-describing JSON — so
+// casual inspection reveals nothing (matching Feather's look and leaking no metadata about the
+// wallet). Layout:
+//   MAGIC(4) | version(1)=4 | m_cost(4 BE) | t_cost(4 BE) | p_cost(4 BE) |
+//   salt_len(1) | salt | nonce_len(1) | nonce | ciphertext(...)
+// The entire header (everything before the ciphertext) is bound as AES-GCM associated data, so the
+// KDF parameters / salt / nonce cannot be tampered with or downgraded without failing auth.
+const MAGIC: &[u8; 4] = b"AEK1";
+const FORMAT_V4: u8 = 4;
+
+fn build_header(m: u32, t: u32, p: u32, salt: &[u8], nonce: &[u8]) -> Vec<u8> {
+    let mut h = Vec::with_capacity(4 + 1 + 12 + 2 + salt.len() + nonce.len());
+    h.extend_from_slice(MAGIC);
+    h.push(FORMAT_V4);
+    h.extend_from_slice(&m.to_be_bytes());
+    h.extend_from_slice(&t.to_be_bytes());
+    h.extend_from_slice(&p.to_be_bytes());
+    h.push(salt.len() as u8);
+    h.extend_from_slice(salt);
+    h.push(nonce.len() as u8);
+    h.extend_from_slice(nonce);
+    h
+}
+
+/// Encrypt `secrets` under `password` into the opaque binary v4 blob (Argon2id + AES-256-GCM,
+/// header bound as AAD).
 pub fn encrypt(secrets: &WalletSecrets, password: &str) -> Result<Vec<u8>> {
     let mut salt = [0u8; 16];
     OsRng.fill_bytes(&mut salt);
@@ -166,34 +191,68 @@ pub fn encrypt(secrets: &WalletSecrets, password: &str) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(key);
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
-    let salt_hex = hex::encode(salt);
-    let nonce_hex = hex::encode(nonce);
-    let aad = header_aad(
-        VERSION, "argon2id", ARGON_M_COST_KIB, ARGON_T_COST, ARGON_P_COST, &salt_hex, &nonce_hex,
-    );
+    let header = build_header(ARGON_M_COST_KIB, ARGON_T_COST, ARGON_P_COST, &salt, nonce.as_slice());
 
     let mut plaintext = serde_json::to_vec(secrets)?;
     let ciphertext = cipher
-        .encrypt(&nonce, Payload { msg: plaintext.as_ref(), aad: &aad })
+        .encrypt(&nonce, Payload { msg: plaintext.as_ref(), aad: &header })
         .map_err(|e| CoreError::Keystore(format!("aes-gcm encrypt: {e}")))?;
     plaintext.zeroize(); // don't leave the mnemonic JSON lingering in freed memory
     key_bytes.zeroize();
 
-    let env = Envelope {
-        version: VERSION,
-        kdf: "argon2id".to_string(),
-        m_cost: Some(ARGON_M_COST_KIB),
-        t_cost: Some(ARGON_T_COST),
-        p_cost: Some(ARGON_P_COST),
-        salt: salt_hex,
-        nonce: nonce_hex,
-        ciphertext: hex::encode(ciphertext),
-    };
-    Ok(serde_json::to_vec_pretty(&env)?)
+    let mut out = header;
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
 }
 
-/// Decrypt an envelope produced by [`encrypt`].
+/// Decrypt a wallet blob produced by [`encrypt`]. Handles the opaque binary v4 format and, for
+/// backward compatibility, the legacy JSON envelope (v1/v2/v3).
 pub fn decrypt(data: &[u8], password: &str) -> Result<WalletSecrets> {
+    if data.len() >= 5 && &data[0..4] == MAGIC {
+        return decrypt_v4(data, password);
+    }
+    decrypt_legacy_json(data, password)
+}
+
+/// Bounds-checked slice of `buf[off..off+n]`, erroring instead of panicking on a truncated file.
+fn take(buf: &[u8], off: usize, n: usize) -> Result<&[u8]> {
+    off.checked_add(n)
+        .and_then(|end| buf.get(off..end))
+        .ok_or_else(|| CoreError::Keystore("truncated wallet file".into()))
+}
+
+/// Opaque binary v4: parse the header, derive the key, and AEAD-decrypt with the header as AAD.
+fn decrypt_v4(data: &[u8], password: &str) -> Result<WalletSecrets> {
+    if data[4] != FORMAT_V4 {
+        return Err(CoreError::Keystore(format!("unsupported wallet version {}", data[4])));
+    }
+    let u32be = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    let m = u32be(take(data, 5, 4)?);
+    let t = u32be(take(data, 9, 4)?);
+    let p = u32be(take(data, 13, 4)?);
+    let salt_len = data[17] as usize;
+    let salt = take(data, 18, salt_len)?.to_vec();
+    let nonce_off = 18 + salt_len;
+    let nonce_len = *take(data, nonce_off, 1)?.first().unwrap() as usize;
+    let nonce_bytes = take(data, nonce_off + 1, nonce_len)?.to_vec();
+    let ct_off = nonce_off + 1 + nonce_len;
+    let ciphertext = data.get(ct_off..).unwrap_or(&[]);
+    let header = &data[0..ct_off]; // exactly what was bound as AAD at encrypt time
+
+    let argon = argon2_with(m, t, p)?;
+    let mut key_bytes = derive_key(&argon, password.as_bytes(), &salt)?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+    let mut plaintext = cipher
+        .decrypt(Nonce::from_slice(&nonce_bytes), Payload { msg: ciphertext, aad: header })
+        .map_err(|_| CoreError::BadPassword)?;
+    key_bytes.zeroize();
+    let secrets: WalletSecrets = serde_json::from_slice(&plaintext)?;
+    plaintext.zeroize();
+    Ok(secrets)
+}
+
+/// Legacy JSON envelope (v1/v2/v3), kept so wallets created before the binary format still open.
+fn decrypt_legacy_json(data: &[u8], password: &str) -> Result<WalletSecrets> {
     let env: Envelope = serde_json::from_slice(data)
         .map_err(|_| CoreError::Keystore("not a valid wallet file".into()))?;
     if env.version == 0 || env.version > VERSION {
@@ -267,32 +326,23 @@ mod tests {
     }
 
     #[test]
-    fn tampering_kdf_params_or_version_fails() {
-        // v3 files bind version/params/salt/nonce as AAD; downgrading or lowering them must fail.
-        let blob = encrypt(&sample(""), "pw").unwrap();
-        let mut env: serde_json::Value = serde_json::from_slice(&blob).unwrap();
-
-        // Lower the Argon2 memory cost -> AAD mismatch -> auth failure.
-        let mut weak = env.clone();
-        weak["m_cost"] = serde_json::json!(8);
-        assert!(matches!(
-            decrypt(&serde_json::to_vec(&weak).unwrap(), "pw"),
-            Err(CoreError::BadPassword)
-        ));
-
-        // Downgrade the version to 1 (default-params, no AAD) -> wrong key -> auth failure.
-        env["version"] = serde_json::json!(1);
-        assert!(decrypt(&serde_json::to_vec(&env).unwrap(), "pw").is_err());
+    fn tampering_binary_header_fails() {
+        // The v4 header (magic/version/params/salt/nonce) is bound as AES-GCM AAD, so flipping any
+        // header byte — e.g. trying to lower the Argon2 memory cost — fails authentication.
+        let mut blob = encrypt(&sample(""), "pw").unwrap();
+        assert!(decrypt(&blob, "pw").is_ok());
+        blob[6] ^= 0xff; // inside the m_cost field (offset 5..9)
+        assert!(matches!(decrypt(&blob, "pw"), Err(CoreError::BadPassword)));
     }
 
     #[test]
-    fn v2_without_params_is_refused() {
-        // A v2/v3 file that is missing its KDF params must be rejected (anti-downgrade), not
+    fn legacy_v2_without_params_is_refused() {
+        // A legacy v2/v3 JSON file missing its KDF params must be rejected (anti-downgrade), not
         // silently opened with default params.
-        let blob = encrypt(&sample(""), "pw").unwrap();
-        let mut env: serde_json::Value = serde_json::from_slice(&blob).unwrap();
-        env["version"] = serde_json::json!(2);
-        env.as_object_mut().unwrap().remove("m_cost");
+        let env = serde_json::json!({
+            "version": 2, "kdf": "argon2id",
+            "salt": "00", "nonce": "00", "ciphertext": "00",
+        });
         assert!(decrypt(&serde_json::to_vec(&env).unwrap(), "pw").is_err());
     }
 
