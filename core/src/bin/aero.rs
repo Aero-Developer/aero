@@ -219,7 +219,7 @@ fn send_eth(rt: &tokio::runtime::Runtime, w: &Wallet, account: u32) {
     if !confirm(&format!("  send {} ETH to {}?", amount.trim(), to.trim())) {
         return;
     }
-    match rt.block_on(w.send_eth(account, to.trim(), &wei, None)) {
+    match rt.block_on(w.send_eth(account, to.trim(), &wei, None, None)) {
         Ok(r) => println!("  broadcast! tx: {}", r.tx_hash),
         Err(e) => println!("  {e}"),
     }
@@ -240,7 +240,7 @@ fn send_erc20(rt: &tokio::runtime::Runtime, w: &Wallet, account: u32) {
     if !confirm(&format!("  send {} tokens to {}?", amount.trim(), to.trim())) {
         return;
     }
-    match rt.block_on(w.send_erc20(account, token.trim(), to.trim(), &units, None)) {
+    match rt.block_on(w.send_erc20(account, token.trim(), to.trim(), &units, None, None)) {
         Ok(r) => println!("  broadcast! tx: {}", r.tx_hash),
         Err(e) => println!("  {e}"),
     }

@@ -1099,6 +1099,13 @@ void AeroMainWindow::setupMenu() {
     ui.menuTools->clear();
     connect(ui.menuTools->addAction(tr("Sign / Verify Message…")), &QAction::triggered, this,
             &AeroMainWindow::onSignVerifyMessage);
+    ui.menuTools->addSeparator();
+    m_speedUpAction = ui.menuTools->addAction(tr("Speed Up Last Transaction"));
+    m_cancelTxAction = ui.menuTools->addAction(tr("Cancel Last Transaction"));
+    m_speedUpAction->setEnabled(false); // enabled once a tx is sent this session
+    m_cancelTxAction->setEnabled(false);
+    connect(m_speedUpAction, &QAction::triggered, this, &AeroMainWindow::onSpeedUpLast);
+    connect(m_cancelTxAction, &QAction::triggered, this, &AeroMainWindow::onCancelLast);
 
     // --- Help: keep About; the rest have no Aero targets. ---
     connect(ui.actionAbout, &QAction::triggered, this, [this]() {
@@ -1305,6 +1312,7 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     connect(m_wallet, &Wallet::feesUpdated, this, &AeroMainWindow::onFeesUpdated);
     connect(m_wallet, &Wallet::transactionCreated, this, &AeroMainWindow::onTransactionCreated);
     connect(m_wallet, &Wallet::transactionCommitted, this, &AeroMainWindow::onTransactionCommitted);
+    connect(m_wallet, &Wallet::transactionSent, this, &AeroMainWindow::onTransactionSent);
     connect(m_wallet, &Wallet::fundedScanned, this, &AeroMainWindow::onFundedScanned);
     connect(m_wallet, &Wallet::tokenLiquidity, this, &AeroMainWindow::onTokenLiquidity);
     connect(m_wallet, &Wallet::nftsRefreshed, this, &AeroMainWindow::onNftsRefreshed);
@@ -2681,6 +2689,51 @@ void AeroMainWindow::onSignVerifyMessage() {
     });
 
     dlg.exec();
+}
+
+void AeroMainWindow::onTransactionSent(const PendingEthTx &tx, const QString &txHash) {
+    Q_UNUSED(txHash);
+    m_lastSent = tx; // carries the nonce it was broadcast at
+    m_hasPending = true;
+    if (m_speedUpAction) m_speedUpAction->setEnabled(true);
+    if (m_cancelTxAction) m_cancelTxAction->setEnabled(true);
+}
+
+// A generous replacement fee (wei) computed from current market fees, so it reliably out-bids a
+// stuck low-fee transaction (nodes require a replacement to pay meaningfully more gas).
+QPair<QString, QString> AeroMainWindow::bumpedFeeWei() const {
+    const double base = m_feeBaseWei > 0 ? m_feeBaseWei : 2e9;
+    const double tip = m_feeTipWei > 0 ? m_feeTipWei : 1e9;
+    const double priority = qMax(tip * 2.0, 2e9);   // at least ~2 gwei tip
+    const double maxFee = base * 3.0 + priority;     // generous cap to ensure the replacement wins
+    return {QString::number(maxFee, 'f', 0), QString::number(priority, 'f', 0)};
+}
+
+void AeroMainWindow::onSpeedUpLast() {
+    if (!m_wallet || !m_hasPending) return;
+    if (QMessageBox::question(
+            this, tr("Speed up transaction"),
+            tr("Rebroadcast the last transaction at the same nonce with a higher fee so it confirms "
+               "faster?"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes) != QMessageBox::Yes)
+        return;
+    PendingEthTx tx = m_lastSent; // same recipient/value/token and (crucially) the same nonce
+    const QPair<QString, QString> fee = bumpedFeeWei();
+    tx.fee.maxFee = fee.first;
+    tx.fee.maxPriorityFee = fee.second;
+    m_wallet->commitTransaction(tx); // result surfaces via onTransactionCommitted
+}
+
+void AeroMainWindow::onCancelLast() {
+    if (!m_wallet || !m_hasPending) return;
+    if (QMessageBox::question(
+            this, tr("Cancel transaction"),
+            tr("Attempt to cancel the last pending transaction by replacing it with a 0-value "
+               "transfer to yourself (at a higher fee)? This only works if it hasn't confirmed yet."),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+        return;
+    const QPair<QString, QString> fee = bumpedFeeWei();
+    m_wallet->cancelTransaction(m_lastSent.fromIndex, m_lastSent.nonce, fee.first, fee.second);
 }
 
 void AeroMainWindow::onShowSeed() {

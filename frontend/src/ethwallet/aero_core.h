@@ -300,10 +300,11 @@ char *aero_wallet_send_eth(AeroWallet *w,
                            const char *to,
                            const char *amount_wei,
                            const char *max_fee_wei,
-                           const char *max_priority_wei);
+                           const char *max_priority_wei,
+                           uint64_t nonce);
 
 /**
- * Send an ERC20 token; returns JSON `SendResult`. Fee args as in `aero_wallet_send_eth`.
+ * Send an ERC20 token; returns JSON `SendResult`. Fee/nonce args as in `aero_wallet_send_eth`.
  */
 char *aero_wallet_send_erc20(AeroWallet *w,
                              uint32_t from_index,
@@ -311,7 +312,18 @@ char *aero_wallet_send_erc20(AeroWallet *w,
                              const char *to,
                              const char *amount_units,
                              const char *max_fee_wei,
-                             const char *max_priority_wei);
+                             const char *max_priority_wei,
+                             uint64_t nonce);
+
+/**
+ * Cancel a pending tx by broadcasting a 0-value self-send at `nonce` with a (bumped) fee. Returns
+ * JSON `SendResult`. Caller frees the string.
+ */
+char *aero_wallet_cancel_tx(AeroWallet *w,
+                            uint32_t from_index,
+                            uint64_t nonce,
+                            const char *max_fee_wei,
+                            const char *max_priority_wei);
 
 /**
  * ERC20 transfer history as a JSON array of `HistoryItem`. `from_block` is a hex block number

@@ -823,16 +823,18 @@ pub extern "C" fn aero_wallet_send_eth(
     amount_wei: *const c_char,
     max_fee_wei: *const c_char,
     max_priority_wei: *const c_char,
+    nonce: u64, // u64::MAX = automatic; a specific value replaces a pending tx (speed-up)
 ) -> *mut c_char {
     let (Some(to), Some(amount)) = (from_cstr(to), from_cstr(amount_wei)) else {
         set_error("null to/amount");
         return ptr::null_mut();
     };
     let fee = parse_fee_override(max_fee_wei, max_priority_wei);
-    block_json(w, |w| RUNTIME.block_on(w.send_eth(from_index, &to, &amount, fee)))
+    let nonce_ov = (nonce != u64::MAX).then_some(nonce);
+    block_json(w, |w| RUNTIME.block_on(w.send_eth(from_index, &to, &amount, fee, nonce_ov)))
 }
 
-/// Send an ERC20 token; returns JSON `SendResult`. Fee args as in `aero_wallet_send_eth`.
+/// Send an ERC20 token; returns JSON `SendResult`. Fee/nonce args as in `aero_wallet_send_eth`.
 #[no_mangle]
 pub extern "C" fn aero_wallet_send_erc20(
     w: *mut Wallet,
@@ -842,6 +844,7 @@ pub extern "C" fn aero_wallet_send_erc20(
     amount_units: *const c_char,
     max_fee_wei: *const c_char,
     max_priority_wei: *const c_char,
+    nonce: u64, // u64::MAX = automatic; a specific value replaces a pending tx (speed-up)
 ) -> *mut c_char {
     let (Some(token), Some(to), Some(amount)) =
         (from_cstr(token), from_cstr(to), from_cstr(amount_units))
@@ -850,9 +853,24 @@ pub extern "C" fn aero_wallet_send_erc20(
         return ptr::null_mut();
     };
     let fee = parse_fee_override(max_fee_wei, max_priority_wei);
+    let nonce_ov = (nonce != u64::MAX).then_some(nonce);
     block_json(w, |w| {
-        RUNTIME.block_on(w.send_erc20(from_index, &token, &to, &amount, fee))
+        RUNTIME.block_on(w.send_erc20(from_index, &token, &to, &amount, fee, nonce_ov))
     })
+}
+
+/// Cancel a pending tx by broadcasting a 0-value self-send at `nonce` with a (bumped) fee. Returns
+/// JSON `SendResult`. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_cancel_tx(
+    w: *mut Wallet,
+    from_index: u32,
+    nonce: u64,
+    max_fee_wei: *const c_char,
+    max_priority_wei: *const c_char,
+) -> *mut c_char {
+    let fee = parse_fee_override(max_fee_wei, max_priority_wei);
+    block_json(w, |w| RUNTIME.block_on(w.cancel_transaction(from_index, nonce, fee)))
 }
 
 /// ERC20 transfer history as a JSON array of `HistoryItem`. `from_block` is a hex block number

@@ -45,6 +45,9 @@ struct PendingEthTx {
     QString amountUnits; // for ERC20 sends
     quint32 fromIndex = 0;
     FeeInfo fee;
+    // Nonce to broadcast at. ~0 (default) = automatic; set to an existing pending tx's nonce to
+    // replace it (speed-up: same tx + higher fee).
+    quint64 nonce = ~Q_UINT64_C(0);
 };
 
 struct HistoryItem {
@@ -205,8 +208,15 @@ public:
 
     // Async: fetch a fresh fee suggestion (base fee + priority tip, decimal wei); emits feesUpdated().
     void refreshFees();
-    // Signs + broadcasts; emits transactionCommitted().
+    // Signs + broadcasts; emits transactionCommitted() (and transactionSent() on success).
+    // To speed up a stuck tx, re-call this with the same PendingEthTx but tx.nonce set to the
+    // pending nonce and a higher fee — it replaces the original.
     void commitTransaction(const PendingEthTx &tx);
+
+    // Cancel a pending tx: broadcast a 0-value self-send at `nonce` with a bumped fee (wei strings).
+    // Emits transactionCommitted().
+    void cancelTransaction(quint32 fromIndex, quint64 nonce, const QString &maxFeeWei,
+                           const QString &maxPriorityWei);
 
     // Utility: convert human amount -> base units for `decimals`.
     static QString parseUnits(const QString &amount, quint8 decimals);
@@ -220,6 +230,9 @@ signals:
     // UI can prompt "confirm on your device". Cleared by transactionCommitted.
     void signingOnDevice();
     void transactionCommitted(bool success, const QString &txHash, const QString &error);
+    // Emitted after a successful broadcast with the sent tx (including the nonce it used), so the UI
+    // can offer speed-up/cancel on it.
+    void transactionSent(const PendingEthTx &tx, const QString &txHash);
     void historyRefreshed(const QVector<HistoryItem> &items);
     void fundedScanned(const QList<quint32> &indices);
     void tokenLiquidity(const QString &tokenAddress, double usd);

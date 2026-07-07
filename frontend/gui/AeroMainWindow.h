@@ -57,6 +57,9 @@ private slots:
     void onChangePassword();
     void onShowSeed();
     void onSignVerifyMessage(); // Tools -> Sign / Verify Message (EIP-191 personal_sign)
+    void onTransactionSent(const PendingEthTx &tx, const QString &txHash); // remember for speed/cancel
+    void onSpeedUpLast(); // rebroadcast the last tx at the same nonce with a higher fee
+    void onCancelLast();  // replace the last pending tx with a 0-value self-send (higher fee)
     void onFundedScanned(const QList<quint32> &indices);
     void onTokenLiquidity(const QString &tokenAddress, double usd);
     void onFiatRate(const QString &currency, double rate);
@@ -129,6 +132,7 @@ private:
     void loadFundedSet();                  // restore persisted funded indices for this wallet
     void saveFundedSet();                  // persist funded indices + a "scanned" marker
     QPair<QString, QString> chosenFeeWei() const; // (maxFee, priority) wei; empty = automatic
+    QPair<QString, QString> bumpedFeeWei() const; // generous fee (wei) to replace a stuck tx
     QString accountLabel(quint32 index) const;
     void updateReceive();
     void ensureMinAddresses(quint32 count);
@@ -188,6 +192,11 @@ private:
     QString m_nativeSymbol = QStringLiteral("ETH");
     QToolButton *m_networkButton = nullptr; // status-bar network selector
     QMessageBox *m_deviceDialog = nullptr;  // "confirm on your device" prompt during hardware signing
+    // Last broadcast tx this session, for Tools -> Speed Up / Cancel (replacement reuses its nonce).
+    PendingEthTx m_lastSent;
+    bool m_hasPending = false;
+    QAction *m_speedUpAction = nullptr;
+    QAction *m_cancelTxAction = nullptr;
     bool m_hideBalances = false;          // Appearance: mask balances for privacy
     QString m_fiatCurrency = QStringLiteral("USD"); // display fiat (Settings)
     QString m_fiatSymbol = QStringLiteral("$");

@@ -643,23 +643,49 @@ void Wallet::commitTransaction(const PendingEthTx &tx) {
         if (tx.token.isEmpty()) {
             res = aero_wallet_send_eth(m_core, tx.fromIndex, tx.to.toUtf8().constData(),
                                         tx.amountWei.toUtf8().constData(),
-                                        maxFee.constData(), maxPriority.constData());
+                                        maxFee.constData(), maxPriority.constData(), tx.nonce);
         } else {
             res = aero_wallet_send_erc20(m_core, tx.fromIndex, tx.token.toUtf8().constData(),
                                           tx.to.toUtf8().constData(),
                                           tx.amountUnits.toUtf8().constData(),
-                                          maxFee.constData(), maxPriority.constData());
+                                          maxFee.constData(), maxPriority.constData(), tx.nonce);
         }
 
         bool success = res != nullptr;
         QString txHash, err;
+        quint64 nonce = ~Q_UINT64_C(0);
         if (success) {
             const QJsonObject o = QJsonDocument::fromJson(takeString(res).toUtf8()).object();
             txHash = o.value("tx_hash").toString();
+            nonce = static_cast<quint64>(o.value("nonce").toDouble());
         } else {
             err = takeLastError();
         }
 
+        PendingEthTx sent = tx;
+        sent.nonce = nonce;
+        QMetaObject::invokeMethod(this, [this, success, txHash, err, sent]() {
+            if (success)
+                emit transactionSent(sent, txHash); // record for speed-up/cancel (carries nonce)
+            emit transactionCommitted(success, txHash, err);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Wallet::cancelTransaction(quint32 fromIndex, quint64 nonce, const QString &maxFeeWei,
+                               const QString &maxPriorityWei) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, nonce, maxFeeWei, maxPriorityWei]() {
+        QReadLocker lock(&m_coreLock);
+        const QByteArray mf = maxFeeWei.toUtf8();
+        const QByteArray mp = maxPriorityWei.toUtf8();
+        char *res = aero_wallet_cancel_tx(m_core, fromIndex, nonce, mf.constData(), mp.constData());
+        bool success = res != nullptr;
+        QString txHash, err;
+        if (success)
+            txHash = QJsonDocument::fromJson(takeString(res).toUtf8()).object()
+                         .value("tx_hash").toString();
+        else
+            err = takeLastError();
         QMetaObject::invokeMethod(this, [this, success, txHash, err]() {
             emit transactionCommitted(success, txHash, err);
         }, Qt::QueuedConnection);

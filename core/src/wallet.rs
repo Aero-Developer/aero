@@ -42,6 +42,9 @@ pub struct FeeSuggestion {
 #[derive(Serialize)]
 pub struct SendResult {
     pub tx_hash: String,
+    /// Nonce the transaction was broadcast at — needed to later speed-up or cancel it (a replacement
+    /// reuses the same nonce with higher gas).
+    pub nonce: u64,
 }
 
 /// A single transfer in the account history (native ETH or ERC20).
@@ -1041,11 +1044,12 @@ impl Wallet {
         to: &str,
         amount_wei: &str,
         fee: Option<(u128, u128)>,
+        nonce_override: Option<u64>,
     ) -> Result<SendResult> {
         let value = U256::from_str(amount_wei)
             .map_err(|_| CoreError::Amount(format!("invalid wei amount: {amount_wei}")))?;
         let to_addr = parse_address(to)?;
-        self.build_sign_send(from_index, to_addr, value, Bytes::new(), None, fee)
+        self.build_sign_send(from_index, to_addr, value, Bytes::new(), None, fee, nonce_override)
             .await
     }
 
@@ -1057,6 +1061,7 @@ impl Wallet {
         to: &str,
         amount_units: &str,
         fee: Option<(u128, u128)>,
+        nonce_override: Option<u64>,
     ) -> Result<SendResult> {
         let amount = U256::from_str(amount_units)
             .map_err(|_| CoreError::Amount(format!("invalid token amount: {amount_units}")))?;
@@ -1064,8 +1069,25 @@ impl Wallet {
         let token_addr = parse_address(token)?;
         let data = Bytes::from(erc20::encode_transfer(to_addr, amount));
         // Value is 0 for token transfers; the recipient of the tx is the token contract.
-        self.build_sign_send(from_index, token_addr, U256::ZERO, data, None, fee)
+        self.build_sign_send(from_index, token_addr, U256::ZERO, data, None, fee, nonce_override)
             .await
+    }
+
+    /// Cancel a pending transaction by replacing it with a 0-value self-send at the same `nonce`.
+    /// The replacement must pay more gas than the stuck tx (the caller supplies a bumped `fee`), so
+    /// the network prefers it; once it mines, the original is dropped. Returns the replacement hash.
+    pub async fn cancel_transaction(
+        &self,
+        from_index: u32,
+        nonce: u64,
+        fee: Option<(u128, u128)>,
+    ) -> Result<SendResult> {
+        let self_addr = parse_address(&self.address(from_index)?)?;
+        // 0 ETH to yourself, minimal gas, at the same nonce.
+        self.build_sign_send(
+            from_index, self_addr, U256::ZERO, Bytes::new(), Some(21000), fee, Some(nonce),
+        )
+        .await
     }
 
     /// Reconstruct ERC20 transfer history for `token`/`index` from event logs.
@@ -1357,14 +1379,20 @@ impl Wallet {
         data: Bytes,
         gas_limit_override: Option<u64>,
         fee_override: Option<(u128, u128)>, // (max_fee_per_gas, max_priority_fee_per_gas)
+        nonce_override: Option<u64>, // reuse a specific nonce to replace (speed-up/cancel) a pending tx
     ) -> Result<SendResult> {
         let provider = self.provider()?;
         // The sending address comes from the account's derivation (software) or the device's cached
         // address (hardware) — no local key material is required to build the tx.
         let from: Address = parse_address(&self.address(from_index)?)?;
 
-        let nonce_hex = provider.get_transaction_count(&from.to_string()).await?;
-        let nonce = parse_hex_u64(&nonce_hex)?;
+        let nonce = match nonce_override {
+            Some(n) => n,
+            None => {
+                let nonce_hex = provider.get_transaction_count(&from.to_string()).await?;
+                parse_hex_u64(&nonce_hex)?
+            }
+        };
 
         // Use the caller's chosen fee (custom / tier) if given, else the node suggestion.
         let (max_fee_per_gas, max_priority_fee_per_gas) = match fee_override {
@@ -1445,7 +1473,7 @@ impl Wallet {
             .as_str()
             .ok_or_else(|| CoreError::rpc("broadcast returned no hash"))?
             .to_string();
-        Ok(SendResult { tx_hash })
+        Ok(SendResult { tx_hash, nonce })
     }
 }
 
