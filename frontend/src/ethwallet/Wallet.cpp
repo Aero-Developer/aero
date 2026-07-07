@@ -32,13 +32,21 @@ BalanceInfo parseBalance(const QString &json) {
 } // namespace
 
 Wallet::Wallet(AeroWallet *core, QObject *parent)
-    : QObject(parent), m_core(core) {}
+    : QObject(parent), m_core(core) {
+    // Bound how many Tor requests run at once. Enough for all the essential refreshes (balances,
+    // history, native price, market prices, fees, fiat, NFTs) to run together, while queuing the
+    // non-essential burst (per-token liquidity checks, NFT/logo image fetches) right behind them —
+    // so one SOCKS proxy isn't flooded with dozens of simultaneous circuits.
+    m_netPool.setMaxThreadCount(8);
+}
 
 Wallet::~Wallet() {
+    // Drop queued tasks and wait for any running ones to finish BEFORE freeing the core, so no
+    // worker thread touches m_core (or this object) after destruction. Tasks capture `this`, so
+    // this must complete while the object is still valid.
+    m_netPool.clear();
+    m_netPool.waitForDone();
     if (m_core) {
-        // Wait for any in-flight background task (all of which take m_coreLock while touching
-        // m_core) to finish before freeing, so we never free the core out from under a worker
-        // thread. New tasks aren't spawned during destruction (that only happens on this thread).
         QWriteLocker lock(&m_coreLock);
         aero_wallet_free(m_core);
         m_core = nullptr;
@@ -151,7 +159,7 @@ bool Wallet::setProvider(quint64 chainId, const QStringList &endpoints, const QS
 }
 
 void Wallet::connectProvider(quint64 chainId, const QStringList &endpoints, const QString &socksProxy) {
-    QtConcurrent::run([this, chainId, endpoints, socksProxy]() {
+    QtConcurrent::run(&m_netPool, [this, chainId, endpoints, socksProxy]() {
         QJsonArray arr;
         for (const QString &e : endpoints) arr.append(e);
         const QByteArray endpointsJson = QJsonDocument(arr).toJson(QJsonDocument::Compact);
@@ -205,7 +213,7 @@ void Wallet::connectProvider(quint64 chainId, const QStringList &endpoints, cons
 }
 
 void Wallet::fetchAvailable(quint32 index, const QString &token) {
-    QtConcurrent::run([this, index, token]() {
+    QtConcurrent::run(&m_netPool, [this, index, token]() {
         QReadLocker lock(&m_coreLock);
         BalanceInfo b;
         char *j = token.isEmpty()
@@ -221,7 +229,7 @@ void Wallet::fetchAvailable(quint32 index, const QString &token) {
 
 void Wallet::refreshAllBalances(quint32 numAccounts) {
     if (numAccounts == 0) numAccounts = 1;
-    QtConcurrent::run([this, numAccounts]() {
+    QtConcurrent::run(&m_netPool, [this, numAccounts]() {
         QString json;
         {
             QReadLocker lock(&m_coreLock);
@@ -254,7 +262,7 @@ void Wallet::refreshAllBalances(quint32 numAccounts) {
 
 void Wallet::refresh(quint32 accountIndex) {
     // Network I/O runs off the UI thread; results are marshalled back via queued signals.
-    QtConcurrent::run([this, accountIndex]() {
+    QtConcurrent::run(&m_netPool, [this, accountIndex]() {
         QReadLocker lock(&m_coreLock);
         BalanceInfo eth;
         QVector<BalanceInfo> tokenBalances;
@@ -281,7 +289,7 @@ void Wallet::refresh(quint32 accountIndex) {
 }
 
 void Wallet::refreshAccountBalance(quint32 accountIndex) {
-    QtConcurrent::run([this, accountIndex]() {
+    QtConcurrent::run(&m_netPool, [this, accountIndex]() {
         QReadLocker lock(&m_coreLock);
         BalanceInfo eth;
         char *ethJson = aero_wallet_eth_balance(m_core, accountIndex);
@@ -294,7 +302,7 @@ void Wallet::refreshAccountBalance(quint32 accountIndex) {
 }
 
 void Wallet::refreshEthUsdPrice() {
-    QtConcurrent::run([this]() {
+    QtConcurrent::run(&m_netPool, [this]() {
         QReadLocker lock(&m_coreLock);
         char *j = aero_wallet_eth_usd_price(m_core);
         double price = 0.0;
@@ -309,7 +317,7 @@ void Wallet::refreshEthUsdPrice() {
 }
 
 void Wallet::refreshMarketPrices() {
-    QtConcurrent::run([this]() {
+    QtConcurrent::run(&m_netPool, [this]() {
         QReadLocker lock(&m_coreLock);
         double xmrUsd = 0, xmrChg = 0, ethUsd = 0, ethChg = 0;
         char *j = aero_wallet_market_prices(m_core);
@@ -327,7 +335,7 @@ void Wallet::refreshMarketPrices() {
 }
 
 void Wallet::refreshBlockNumber() {
-    QtConcurrent::run([this]() {
+    QtConcurrent::run(&m_netPool, [this]() {
         QReadLocker lock(&m_coreLock);
         const quint64 n = aero_wallet_block_number(m_core);
         QMetaObject::invokeMethod(this, [this, n]() { emit blockNumberUpdated(n); },
@@ -358,7 +366,7 @@ static void parseHistoryArray(const QString &json, QVector<HistoryItem> &out) {
 
 void Wallet::refreshHistory(quint32 accountIndex, const QString &fromBlock) {
     Q_UNUSED(fromBlock);
-    QtConcurrent::run([this, accountIndex]() {
+    QtConcurrent::run(&m_netPool, [this, accountIndex]() {
         QReadLocker lock(&m_coreLock);
         // Full native + token history from the block explorer (over Tor) in one call.
         QVector<HistoryItem> items;
@@ -371,7 +379,7 @@ void Wallet::refreshHistory(quint32 accountIndex, const QString &fromBlock) {
 }
 
 void Wallet::refreshHistoryAll(quint32 numAccounts) {
-    QtConcurrent::run([this, numAccounts]() {
+    QtConcurrent::run(&m_netPool, [this, numAccounts]() {
         QReadLocker lock(&m_coreLock);
         QVector<HistoryItem> items;
         QSet<QString> seen;
@@ -400,7 +408,7 @@ void Wallet::refreshHistoryAll(quint32 numAccounts) {
 }
 
 void Wallet::scanFunded(quint32 gapLimit) {
-    QtConcurrent::run([this, gapLimit]() {
+    QtConcurrent::run(&m_netPool, [this, gapLimit]() {
         QReadLocker lock(&m_coreLock);
         QList<quint32> indices;
         char *j = aero_wallet_scan_funded(m_core, gapLimit);
@@ -415,7 +423,7 @@ void Wallet::scanFunded(quint32 gapLimit) {
 }
 
 void Wallet::checkTokenLiquidity(const QString &tokenAddress) {
-    QtConcurrent::run([this, tokenAddress]() {
+    QtConcurrent::run(&m_netPool, [this, tokenAddress]() {
         QReadLocker lock(&m_coreLock);
         double usd = 0.0;
         char *j = aero_wallet_token_liquidity_usd(m_core, tokenAddress.toUtf8().constData());
@@ -431,7 +439,7 @@ void Wallet::checkTokenLiquidity(const QString &tokenAddress) {
 }
 
 void Wallet::refreshNfts(quint32 accountIndex) {
-    QtConcurrent::run([this, accountIndex]() {
+    QtConcurrent::run(&m_netPool, [this, accountIndex]() {
         QReadLocker lock(&m_coreLock);
         QVector<NftCollection> out;
         char *j = aero_wallet_account_nfts(m_core, accountIndex);
@@ -456,7 +464,7 @@ void Wallet::refreshNfts(quint32 accountIndex) {
 }
 
 void Wallet::fetchImage(const QString &url) {
-    QtConcurrent::run([this, url]() {
+    QtConcurrent::run(&m_netPool, [this, url]() {
         QReadLocker lock(&m_coreLock);
         QByteArray data;
         char *j = aero_wallet_fetch_image(m_core, url.toUtf8().constData());
@@ -468,7 +476,7 @@ void Wallet::fetchImage(const QString &url) {
 }
 
 void Wallet::resolveTokenMeta(const QString &address) {
-    QtConcurrent::run([this, address]() {
+    QtConcurrent::run(&m_netPool, [this, address]() {
         QReadLocker lock(&m_coreLock);
         QString symbol;
         quint8 decimals = 18;
@@ -485,7 +493,7 @@ void Wallet::resolveTokenMeta(const QString &address) {
 }
 
 void Wallet::refreshFiatRate(const QString &currency) {
-    QtConcurrent::run([this, currency]() {
+    QtConcurrent::run(&m_netPool, [this, currency]() {
         QReadLocker lock(&m_coreLock);
         double rate = 1.0;
         char *j = aero_wallet_fiat_per_usd(m_core, currency.toUtf8().constData());
@@ -537,7 +545,7 @@ QVector<TokenInfo> Wallet::tokens() const {
 }
 
 void Wallet::refreshFees() {
-    QtConcurrent::run([this]() {
+    QtConcurrent::run(&m_netPool, [this]() {
         QReadLocker lock(&m_coreLock);
         QString base, tip;
         char *feeJson = aero_wallet_suggest_fees(m_core);
@@ -554,7 +562,7 @@ void Wallet::refreshFees() {
 void Wallet::createTransaction(quint32 fromIndex, const QString &to, const QString &amount,
                                const QString &token, const QString &maxFeeWei,
                                const QString &maxPriorityWei, quint8 decimals) {
-    QtConcurrent::run([this, fromIndex, to, amount, token, maxFeeWei, maxPriorityWei, decimals]() {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, to, amount, token, maxFeeWei, maxPriorityWei, decimals]() {
         QReadLocker lock(&m_coreLock);
         PendingEthTx tx;
         tx.fromIndex = fromIndex;
@@ -597,7 +605,7 @@ void Wallet::createTransaction(quint32 fromIndex, const QString &to, const QStri
 }
 
 void Wallet::commitTransaction(const PendingEthTx &tx) {
-    QtConcurrent::run([this, tx]() {
+    QtConcurrent::run(&m_netPool, [this, tx]() {
         QReadLocker lock(&m_coreLock);
         // Hardware wallets require an on-device confirmation before the (blocking) broadcast.
         if (aero_wallet_is_hardware(m_core) != 0)

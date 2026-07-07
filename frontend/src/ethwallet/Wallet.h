@@ -14,6 +14,7 @@
 #include <QObject>
 #include <QReadWriteLock>
 #include <QString>
+#include <QThreadPool>
 #include <QVector>
 
 #include "aero_core.h"
@@ -245,6 +246,14 @@ private:
     // concurrent reads (shared) are allowed and safe; every mutation takes it exclusively (write).
     // Recursive so a read op that calls another read op (e.g. refresh() -> tokens()) won't deadlock.
     mutable QReadWriteLock m_coreLock{QReadWriteLock::Recursive};
+
+    // Dedicated pool for network (Tor) tasks. All refresh/fetch methods run here instead of the
+    // global QThreadPool, so (a) they never contend with Qt's own worker threads, and (b) the bound
+    // caps how many Tor circuits open at once — flooding one SOCKS proxy with dozens of simultaneous
+    // requests (balances + history + prices + fees + NFTs + liquidity + images) is what made data
+    // arrive in stuttering waves. A modest bound lets the essentials run together and queues the
+    // rest right behind them.
+    QThreadPool m_netPool;
 };
 
 Q_DECLARE_METATYPE(BalanceInfo)
