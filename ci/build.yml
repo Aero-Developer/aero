@@ -1,0 +1,88 @@
+# ACTIVATION: move this file to `.github/workflows/build.yml` for GitHub Actions to run it.
+# It lives under ci/ in the repo only because the token used to commit it lacked the `workflow`
+# scope; copy it into .github/workflows/ via the GitHub web UI or a token with that scope.
+
+name: build
+
+# Builds the Rust core + Qt GUI on Windows, Linux and macOS. On a version tag (v*) the built
+# binaries are attached to the GitHub Release. Runs on GitHub-hosted runners — this is how the
+# non-Windows binaries are produced (they can't be cross-built from a Windows dev box).
+#
+# NOTE: bundling Tor per-OS and full Qt deployment (windeployqt / macdeployqt / linuxdeploy) are
+# packaging steps layered on top of these builds; see RELEASING.md. The Tor Expert Bundle is
+# downloaded per-OS at package time.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            core_lib: aero_core.dll
+          - os: ubuntu-latest
+            core_lib: libaero_core.so
+          - os: macos-latest
+            core_lib: libaero_core.dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- Rust core -------------------------------------------------------
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - name: Build core
+        working-directory: core
+        run: cargo build --release --locked
+      - name: Test core
+        working-directory: core
+        run: cargo test --release --locked
+
+      # --- Qt -------------------------------------------------------------
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: 6.8.2
+          modules: qtsvg
+
+      # Linux needs the usual X/GL dev headers for a Qt Widgets build.
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev libxkbcommon-dev
+
+      # --- GUI ------------------------------------------------------------
+      - name: Configure + build GUI
+        working-directory: frontend/gui
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j
+
+      - name: Collect binaries
+        shell: bash
+        run: |
+          mkdir -p out
+          cp -f frontend/gui/build/aero_gui* out/ 2>/dev/null || true
+          cp -f core/target/release/${{ matrix.core_lib }} out/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aero-${{ matrix.os }}
+          path: out/*
+
+      # On a tag, attach the raw binaries to the Release. Full portable packaging
+      # (Qt deploy + bundled Tor + checksums) is done from RELEASING.md.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*

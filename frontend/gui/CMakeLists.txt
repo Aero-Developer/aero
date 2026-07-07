@@ -20,10 +20,21 @@ set(CMAKE_AUTOUIC_SEARCH_PATHS ${CMAKE_CURRENT_SOURCE_DIR}/ui)
 
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Concurrent Network)
 
-# Prebuilt Rust core (import lib for aero_core.dll). Build it first: `cargo build --release`.
+# Prebuilt Rust core (cdylib). Build it first: `cargo build --release`. The library name and the
+# link target differ per platform: Windows links the .dll.a import lib and ships the .dll next to
+# the exe; Linux/macOS link the shared object directly (with an rpath of $ORIGIN/@loader_path).
 set(AERO_CORE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../core)
-set(AERO_CORE_IMPLIB ${AERO_CORE_DIR}/target/release/libaero_core.dll.a)
-set(AERO_CORE_DLL     ${AERO_CORE_DIR}/target/release/aero_core.dll)
+set(AERO_CORE_OUT ${AERO_CORE_DIR}/target/release)
+if(WIN32)
+    set(AERO_CORE_LINK ${AERO_CORE_OUT}/libaero_core.dll.a)
+    set(AERO_CORE_RUNTIME ${AERO_CORE_OUT}/aero_core.dll)
+elseif(APPLE)
+    set(AERO_CORE_LINK ${AERO_CORE_OUT}/libaero_core.dylib)
+    set(AERO_CORE_RUNTIME ${AERO_CORE_OUT}/libaero_core.dylib)
+else()
+    set(AERO_CORE_LINK ${AERO_CORE_OUT}/libaero_core.so)
+    set(AERO_CORE_RUNTIME ${AERO_CORE_OUT}/libaero_core.so)
+endif()
 
 set(ETHWALLET_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../src/ethwallet)
 
@@ -83,11 +94,20 @@ target_include_directories(aero_gui PRIVATE
 
 target_link_libraries(aero_gui PRIVATE
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Network
-    ${AERO_CORE_IMPLIB}
+    ${AERO_CORE_LINK}
 )
 
-# Copy the Rust DLL next to the executable so it runs in place.
+# Find the core shared library next to the executable at runtime.
+if(APPLE)
+    set_target_properties(aero_gui PROPERTIES INSTALL_RPATH "@loader_path")
+    set_target_properties(aero_gui PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE)
+elseif(NOT WIN32)
+    set_target_properties(aero_gui PROPERTIES INSTALL_RPATH "$ORIGIN")
+    set_target_properties(aero_gui PROPERTIES BUILD_WITH_INSTALL_RPATH TRUE)
+endif()
+
+# Copy the Rust shared library next to the executable so it runs in place.
 add_custom_command(TARGET aero_gui POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${AERO_CORE_DLL} $<TARGET_FILE_DIR:aero_gui>/aero_core.dll
+        ${AERO_CORE_RUNTIME} $<TARGET_FILE_DIR:aero_gui>/
 )
