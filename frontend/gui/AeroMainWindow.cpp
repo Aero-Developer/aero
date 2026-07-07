@@ -283,8 +283,21 @@ AeroMainWindow::~AeroMainWindow() {
 
 void AeroMainWindow::closeEvent(QCloseEvent *event) {
     // Flush any in-memory changes (created addresses, imported keys, tokens) to the wallet file.
-    if (m_wallet)
-        m_wallet->save();
+    // If this final save fails, changes made since the last successful save (notably imported keys,
+    // which aren't recoverable from the seed) would be lost — so let the user cancel the close and
+    // fix the problem rather than silently dropping them.
+    if (m_wallet && !m_wallet->walletPath().isEmpty() && !m_wallet->save()) {
+        const auto choice = QMessageBox::warning(
+            this, tr("Could not save wallet"),
+            tr("Your wallet could not be saved:\n\n%1\n\nAny recently imported keys or new addresses "
+               "may be lost if you close now. Close anyway?")
+                .arg(m_wallet->errorString()),
+            QMessageBox::Close | QMessageBox::Cancel, QMessageBox::Cancel);
+        if (choice != QMessageBox::Close) {
+            event->ignore();
+            return;
+        }
+    }
     QMainWindow::closeEvent(event);
 }
 
@@ -2055,7 +2068,22 @@ void AeroMainWindow::onImportKey() {
         QMessageBox::warning(this, tr("Import failed"), m_wallet->errorString());
         return;
     }
-    m_wallet->save(); // persist the imported private key
+    // Imported keys are the ONLY funds not recoverable from the seed, so persistence must succeed.
+    // If the save fails, tell the user loudly (and keep the key on screen so they can retry/back it
+    // up) instead of silently losing it on the next close.
+    if (m_wallet->walletPath().isEmpty()) {
+        QMessageBox::warning(
+            this, tr("Not saved"),
+            tr("The key was imported but this wallet isn't saved to a file, so it will be lost when "
+               "you close. Save the wallet first, then re-import."));
+    } else if (!m_wallet->save()) {
+        QMessageBox::critical(
+            this, tr("Import not saved"),
+            tr("The private key was imported but could NOT be written to your wallet file:\n\n%1\n\n"
+               "This key is NOT recoverable from your seed. Do not close the wallet — back up the "
+               "key you just pasted, fix the problem (disk space / permissions), then try again.")
+                .arg(m_wallet->errorString()));
+    }
     m_account = idx;
     // A key you explicitly imported should always be visible in Receive, even with the
     // "show only funded" filter on (the funded scan only covers HD-derived addresses).
