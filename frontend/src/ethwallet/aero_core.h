@@ -316,6 +316,14 @@ char *aero_wallet_send_erc20(AeroWallet *w,
                              uint64_t nonce);
 
 /**
+ * Historical USD spot price of `symbol` on `date` (YYYY-MM-DD) as a decimal string ("0" if
+ * unavailable). Caller frees the string.
+ */
+char *aero_wallet_price_on_date(AeroWallet *w,
+                                const char *symbol,
+                                const char *date);
+
+/**
  * "Pay to many": send to several recipients (one tx each, sequential nonces). `recipients_json` is
  * a JSON array of `["0xto","amountBaseUnits"]` pairs; `token` empty = native, else ERC-20 address.
  * Returns a JSON array of `{to, tx_hash}` / `{to, error}`. Caller frees the string.

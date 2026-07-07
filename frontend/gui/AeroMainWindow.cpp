@@ -1367,6 +1367,7 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
         m_historyModel->setKnownTokens(verifiedTokenAddresses());
         m_historyModel->onHistoryRefreshed(items);
         checkUntrackedTokenLiquidity(); // auto-trust unknown-but-liquid tokens (DexScreener/Tor)
+        requestHistoricalPrices(items); // value each native-coin tx at its date
     });
     connect(m_wallet, &Wallet::accountBalanceUpdated, this, &AeroMainWindow::onAccountBalance);
     connect(m_wallet, &Wallet::ethUsdPriceUpdated, this, &AeroMainWindow::onEthUsdPrice);
@@ -1380,6 +1381,7 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     connect(m_wallet, &Wallet::transactionSent, this, &AeroMainWindow::onTransactionSent);
     connect(m_wallet, &Wallet::fundedScanned, this, &AeroMainWindow::onFundedScanned);
     connect(m_wallet, &Wallet::tokenLiquidity, this, &AeroMainWindow::onTokenLiquidity);
+    connect(m_wallet, &Wallet::historicalPriceReady, this, &AeroMainWindow::onHistoricalPrice);
     connect(m_wallet, &Wallet::nftsRefreshed, this, &AeroMainWindow::onNftsRefreshed);
     connect(m_wallet, &Wallet::imageReady, this, &AeroMainWindow::onImageReady);
     connect(m_wallet, &Wallet::fiatRate, this, &AeroMainWindow::onFiatRate);
@@ -3126,6 +3128,33 @@ void AeroMainWindow::checkUntrackedTokenLiquidity() {
         m_wallet->checkTokenLiquidity(a);
         --budget;
     }
+}
+
+// For each native-coin transfer, fetch the coin's USD price on that transaction's date so History
+// can show its fiat value at the time (not just the current price). Deduped per date and capped so
+// a long history doesn't flood Tor; stablecoins/tokens keep the current-price valuation.
+void AeroMainWindow::requestHistoricalPrices(const QVector<HistoryItem> &items) {
+    if (!m_wallet) return;
+    int budget = 60; // cap per refresh
+    for (const HistoryItem &h : items) {
+        if (budget <= 0) break;
+        if (h.timestamp == 0 || h.symbol.compare(m_nativeSymbol, Qt::CaseInsensitive) != 0)
+            continue; // historical valuation is for the native coin only
+        const QString date =
+            QDateTime::fromSecsSinceEpoch(static_cast<qint64>(h.timestamp), Qt::UTC)
+                .toString(QStringLiteral("yyyy-MM-dd"));
+        const QString key = m_nativeSymbol.toUpper() + QLatin1Char('|') + date;
+        if (m_histPriceRequested.contains(key))
+            continue;
+        m_histPriceRequested.insert(key);
+        m_wallet->historicalPrice(m_nativeSymbol, date);
+        --budget;
+    }
+}
+
+void AeroMainWindow::onHistoricalPrice(const QString &symbol, const QString &date, double usd) {
+    if (usd > 0.0 && m_historyModel)
+        m_historyModel->setHistoricalUnitPrice(symbol.toUpper() + QLatin1Char('|') + date, usd);
 }
 
 void AeroMainWindow::onTokenLiquidity(const QString &tokenAddress, double usd) {

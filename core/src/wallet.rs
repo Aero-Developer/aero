@@ -800,6 +800,19 @@ impl Wallet {
         }
     }
 
+    /// Historical USD spot price of `symbol` on `date` (YYYY-MM-DD, UTC) via Coinbase — used to show
+    /// each transaction's fiat value at the time it happened. Returns 0.0 if unavailable.
+    pub async fn price_on_date(&self, symbol: &str, date: &str) -> Result<f64> {
+        let provider = self.provider()?;
+        let sym = symbol.to_uppercase();
+        let url = format!("https://api.coinbase.com/v2/prices/{sym}-USD/spot?date={date}");
+        let v = provider.http_get_json(&url).await?;
+        Ok(v["data"]["amount"]
+            .as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0))
+    }
+
     /// Best-effort USD spot price for a native coin from keyless, Tor-friendly public APIs.
     /// CoinGecko is unreliable over shared Tor exit IPs (empty/429 responses), so we try Coinbase
     /// first (covers ETH/POL/BNB/AVAX and rarely rate-limits), then Kraken, then CoinGecko. Returns

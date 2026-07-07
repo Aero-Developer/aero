@@ -101,6 +101,26 @@ void HistoryModel::setFiat(double rate, const QString &symbol) {
         emit dataChanged(index(0, Column_Value), index(m_items.size() - 1, Column_Value));
 }
 
+void HistoryModel::setHistoricalUnitPrice(const QString &key, double usd) {
+    if (usd <= 0.0)
+        return;
+    m_histUnitPrice.insert(key, usd);
+    if (!m_items.isEmpty())
+        emit dataChanged(index(0, Column_Value), index(m_items.size() - 1, Column_Value));
+}
+
+double HistoryModel::unitPriceFor(const HistoryItem &h) const {
+    if (h.timestamp > 0) {
+        const QString date =
+            QDateTime::fromSecsSinceEpoch(static_cast<qint64>(h.timestamp), Qt::UTC)
+                .toString(QStringLiteral("yyyy-MM-dd"));
+        const double hist = m_histUnitPrice.value(h.symbol.toUpper() + QLatin1Char('|') + date, 0.0);
+        if (hist > 0.0)
+            return hist; // fiat value at the time of the transaction
+    }
+    return m_prices.value(h.symbol.toUpper(), 0.0); // fall back to the current price
+}
+
 QStringList HistoryModel::untrackedTokenAddresses() const {
     QSet<QString> seen;
     QStringList out;
@@ -178,7 +198,7 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
         case Column_Amount:
         case Column_Value: {
             const double amt = h.formatted.toDouble();
-            const double price = m_prices.value(h.symbol.toUpper(), 0.0);
+            const double price = unitPriceFor(h);
             return price > 0.0 ? amt * price : amt; // sort by USD value when known, else raw amount
         }
         case Column_Direction:
@@ -205,7 +225,7 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
                                                   : (h.direction == "in" ? tr("Received") : tr("Sent"));
         case Column_Amount:       return QStringLiteral("%1 %2").arg(h.formatted, h.symbol);
         case Column_Value: {
-            const double price = m_prices.value(h.symbol.toUpper(), 0.0);
+            const double price = unitPriceFor(h);
             if (price <= 0.0)
                 return QStringLiteral("—"); // price not known (yet) for this asset
             const double val = h.formatted.toDouble() * price * m_fiatRate;

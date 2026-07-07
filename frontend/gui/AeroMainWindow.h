@@ -67,6 +67,7 @@ private slots:
     void onCancelLast();  // replace the last pending tx with a 0-value self-send (higher fee)
     void onFundedScanned(const QList<quint32> &indices);
     void onTokenLiquidity(const QString &tokenAddress, double usd);
+    void onHistoricalPrice(const QString &symbol, const QString &date, double usd);
     void onFiatRate(const QString &currency, double rate);
     void onTokenMetaResolved(const QString &address, const QString &symbol, quint8 decimals);
     void onNftsRefreshed(const QVector<NftCollection> &items);
@@ -198,6 +199,8 @@ private:
     QToolButton *m_networkButton = nullptr; // status-bar network selector
     QMessageBox *m_deviceDialog = nullptr;  // "confirm on your device" prompt during hardware signing
     bool m_parsingUri = false; // guard against re-entrancy while rewriting the Pay-to field
+    void requestHistoricalPrices(const QVector<HistoryItem> &items); // fetch per-date native prices
+    QSet<QString> m_histPriceRequested; // "SYMBOL|date" already requested (dedupe historical lookups)
     // Set when a batched balance refresh sees an actual change vs the cached value; drives an
     // event-driven history refresh (so we don't re-pull the full history on every block).
     bool m_balancesChanged = false;

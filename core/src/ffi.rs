@@ -859,6 +859,32 @@ pub extern "C" fn aero_wallet_send_erc20(
     })
 }
 
+/// Historical USD spot price of `symbol` on `date` (YYYY-MM-DD) as a decimal string ("0" if
+/// unavailable). Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_price_on_date(
+    w: *mut Wallet,
+    symbol: *const c_char,
+    date: *const c_char,
+) -> *mut c_char {
+    clear_error();
+    let Some(w) = (unsafe { w.as_ref() }) else {
+        set_error("null wallet");
+        return ptr::null_mut();
+    };
+    let (Some(symbol), Some(date)) = (from_cstr(symbol), from_cstr(date)) else {
+        set_error("null symbol/date");
+        return ptr::null_mut();
+    };
+    match RUNTIME.block_on(w.price_on_date(&symbol, &date)) {
+        Ok(p) => to_cstr(&p.to_string()),
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
 /// "Pay to many": send to several recipients (one tx each, sequential nonces). `recipients_json` is
 /// a JSON array of `["0xto","amountBaseUnits"]` pairs; `token` empty = native, else ERC-20 address.
 /// Returns a JSON array of `{to, tx_hash}` / `{to, error}`. Caller frees the string.

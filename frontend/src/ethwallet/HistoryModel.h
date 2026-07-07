@@ -77,6 +77,13 @@ public slots:
     void setDustThreshold(double usd);
     void setPrices(const QHash<QString, double> &pricesBySymbol); // symbol (upper) -> USD
     void setFiat(double rate, const QString &symbol);             // USD -> display fiat for Value column
+    // Historical unit price for the Value column, keyed "SYMBOL|YYYY-MM-DD" (UTC). When present for a
+    // transfer's asset+date it's used instead of the current price, so Value shows the fiat worth at
+    // the time of the transaction.
+    void setHistoricalUnitPrice(const QString &key, double usd);
+
+    // Unit price to value a transfer: the historical price for its date if known, else current.
+    double unitPriceFor(const HistoryItem &h) const;
 
 private:
     bool isSpamToken(const HistoryItem &h) const;
@@ -89,6 +96,7 @@ private:
     bool m_hideSpam = true;
     double m_dustUsd = 0.0;              // hide incoming worth less than this many USD (0 = off)
     QHash<QString, double> m_prices;     // symbol (upper) -> USD, for dust valuation
+    QHash<QString, double> m_histUnitPrice; // "SYMBOL|YYYY-MM-DD" -> USD, historical valuation
     double m_fiatRate = 1.0;             // USD -> display fiat multiplier for the Value column
     QString m_fiatSymbol = QStringLiteral("$");
 };

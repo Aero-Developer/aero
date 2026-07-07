@@ -709,6 +709,23 @@ void Wallet::broadcastRaw(const QString &rawHex) {
     });
 }
 
+void Wallet::historicalPrice(const QString &symbol, const QString &date) {
+    QtConcurrent::run(&m_netPool, [this, symbol, date]() {
+        QReadLocker lock(&m_coreLock);
+        double p = 0.0;
+        char *j = aero_wallet_price_on_date(m_core, symbol.toUtf8().constData(),
+                                            date.toUtf8().constData());
+        if (j) {
+            bool ok = false;
+            const double v = takeString(j).toDouble(&ok);
+            if (ok) p = v;
+        }
+        QMetaObject::invokeMethod(this,
+                                  [this, symbol, date, p]() { emit historicalPriceReady(symbol, date, p); },
+                                  Qt::QueuedConnection);
+    });
+}
+
 void Wallet::sendMany(quint32 fromIndex, const QVector<QPair<QString, QString>> &recipients,
                       const QString &token, quint8 decimals, const QString &maxFeeWei,
                       const QString &maxPriorityWei) {

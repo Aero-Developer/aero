@@ -165,6 +165,9 @@ public:
     // tokenLiquidity(). Used to auto-trust unknown-but-liquid tokens in History.
     void checkTokenLiquidity(const QString &tokenAddress);
 
+    // Async: historical USD price of `symbol` on `date` (YYYY-MM-DD); emits historicalPriceReady().
+    void historicalPrice(const QString &symbol, const QString &date);
+
     // Async: owned NFT collections for an account (Blockscout over Tor); emits nftsRefreshed().
     void refreshNfts(quint32 accountIndex);
     // Async: fetch an image (NFT thumbnail) over Tor; emits imageReady(url, bytes).
@@ -255,6 +258,7 @@ signals:
     void historyRefreshed(const QVector<HistoryItem> &items);
     void fundedScanned(const QList<quint32> &indices);
     void tokenLiquidity(const QString &tokenAddress, double usd);
+    void historicalPriceReady(const QString &symbol, const QString &date, double usd);
     void nftsRefreshed(const QVector<NftCollection> &items);
     void imageReady(const QString &url, const QByteArray &data);
     void tokenMetaResolved(const QString &address, const QString &symbol, quint8 decimals);
