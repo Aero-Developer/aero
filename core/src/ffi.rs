@@ -1327,6 +1327,8 @@ pub extern "C" fn aero_wallet_scan_funded(w: *mut Wallet, gap_limit: u32) -> *mu
         set_error("null wallet");
         return ptr::null_mut();
     };
+    crate::wallet::SCAN_CHECKED.store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::wallet::SCAN_FOUND.store(0, std::sync::atomic::Ordering::Relaxed);
     match RUNTIME.block_on(w.scan_funded(gap_limit)) {
         Ok(v) => match serde_json::to_string(&v) {
             Ok(s) => to_cstr(&s),
@@ -1367,6 +1369,8 @@ pub extern "C" fn aero_wallet_scan_funded_multi(
         #[serde(default)]
         socks: String,
     }
+    crate::wallet::SCAN_CHECKED.store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::wallet::SCAN_FOUND.store(0, std::sync::atomic::Ordering::Relaxed);
     let chains: Vec<ScanChain> = serde_json::from_str(&js).unwrap_or_default();
     let configs: Vec<ProviderConfig> = chains
         .into_iter()
@@ -1395,6 +1399,19 @@ pub extern "C" fn aero_wallet_scan_funded_multi(
             ptr::null_mut()
         }
     }
+}
+
+/// Live progress of an in-flight funded scan: number of addresses checked so far. Lock-free; safe to
+/// call from any thread while a scan runs on another. Reset to 0 when a scan starts.
+#[no_mangle]
+pub extern "C" fn aero_wallet_scan_progress() -> u64 {
+    crate::wallet::SCAN_CHECKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Live progress of an in-flight funded scan: number of funded addresses found so far. Lock-free.
+#[no_mangle]
+pub extern "C" fn aero_wallet_scan_found() -> u64 {
+    crate::wallet::SCAN_FOUND.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Owned NFT collections (ERC-721 + ERC-1155) for an account as a JSON array. Caller frees.

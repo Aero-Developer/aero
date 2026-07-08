@@ -546,6 +546,17 @@ char *aero_wallet_scan_funded_multi(AeroWallet *w,
                                     uint32_t gap_limit);
 
 /**
+ * Live progress of an in-flight funded scan: number of addresses checked so far. Lock-free; safe to
+ * call from any thread while a scan runs on another. Reset to 0 when a scan starts.
+ */
+uint64_t aero_wallet_scan_progress(void);
+
+/**
+ * Live progress of an in-flight funded scan: number of funded addresses found so far. Lock-free.
+ */
+uint64_t aero_wallet_scan_found(void);
+
+/**
  * Owned NFT collections (ERC-721 + ERC-1155) for an account as a JSON array. Caller frees.
  */
 char *aero_wallet_account_nfts(AeroWallet *w,

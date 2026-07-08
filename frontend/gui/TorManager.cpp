@@ -3,6 +3,7 @@
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QProcess>
 #include <QRegularExpression>
@@ -51,6 +52,11 @@ void TorManager::launchBundled() {
     const QString dataDir = QDir(torDir).filePath(QStringLiteral("data"));
     QDir().mkpath(dataDir);
 
+    // We only get here when no Aero Tor is already listening on our port, so any leftover lock file
+    // belongs to a previous Tor that crashed or was killed. Tor refuses to start (exits code 1 —
+    // "Another process has locked the data directory") if a stale lock remains, so clear it.
+    QFile::remove(QDir(dataDir).filePath(QStringLiteral("lock")));
+
     QStringList args;
     args << QStringLiteral("--SocksPort") << QString::number(m_socksPort)
          << QStringLiteral("--DataDirectory") << dataDir
@@ -67,8 +73,13 @@ void TorManager::launchBundled() {
     connect(m_proc, &QProcess::readyReadStandardOutput, this, [this]() {
         const QString out = QString::fromUtf8(m_proc->readAllStandardOutput());
         const QStringList lines = out.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
-        for (const QString &line : lines)
-            handleLine(line.trimmed());
+        for (const QString &line : lines) {
+            const QString t = line.trimmed();
+            // Keep the last couple of notice/warn lines so a startup failure can be explained.
+            if (t.contains(QLatin1String("[warn]")) || t.contains(QLatin1String("[err]")))
+                m_lastError = t.section(QLatin1Char(']'), -1).trimmed();
+            handleLine(t);
+        }
     });
     connect(m_proc, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
         if (!m_ready)
@@ -77,7 +88,9 @@ void TorManager::launchBundled() {
     connect(m_proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
             [this](int code, QProcess::ExitStatus) {
                 if (!m_ready)
-                    emit failed(tr("Tor exited unexpectedly (code %1)").arg(code));
+                    emit failed(m_lastError.isEmpty()
+                                    ? tr("Tor exited unexpectedly (code %1)").arg(code)
+                                    : tr("Tor failed: %1").arg(m_lastError));
             });
 
     // Give Tor up to 90s to bootstrap before giving up (no clearnet fallback).

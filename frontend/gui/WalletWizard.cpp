@@ -12,9 +12,12 @@
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
+#include <QEventLoop>
+#include <QFutureWatcher>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPointer>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QTimer>
 #include <QtConcurrent/QtConcurrent>
@@ -25,6 +28,33 @@
 
 #include "components.h"
 #include "widgets/TextEdit.h"
+
+namespace {
+// Run a slow blocking operation (Argon2id encrypt/decrypt + disk I/O) off the UI thread while a
+// modal, indeterminate "please wait" dialog keeps the wizard painting — so it never shows as
+// "Not responding". Returns the operation's bool result.
+template <typename Fn>
+bool runBusy(QWidget *parent, const QString &label, Fn fn) {
+    QProgressDialog dlg(label, QString(), 0, 0, parent); // indeterminate, no cancel button
+    dlg.setWindowTitle(QObject::tr("Please wait"));
+    dlg.setWindowModality(Qt::WindowModal);
+    dlg.setMinimumDuration(0);
+    dlg.setAutoClose(false);
+    dlg.setAutoReset(false);
+    QFutureWatcher<bool> watcher;
+    QEventLoop loop;
+    bool result = false;
+    QObject::connect(&watcher, &QFutureWatcher<bool>::finished, &loop, [&]() {
+        result = watcher.future().result();
+        loop.quit();
+    });
+    watcher.setFuture(QtConcurrent::run(std::move(fn)));
+    dlg.show();
+    loop.exec();
+    dlg.close();
+    return result;
+}
+} // namespace
 
 #include <QDateTime>
 #include <QFileInfo>
@@ -521,7 +551,12 @@ bool PasswordPage::validatePage() {
     QDir dir(QDir(m_w->walletDir).filePath(m_w->walletName));
     if (!dir.exists()) dir.mkpath(".");
     const QString path = dir.filePath(m_w->walletName + QStringLiteral(".keys"));
-    if (!m_w->wallet->store(path, ui->widget_password->password())) {
+    // Encrypting the wallet runs Argon2id (64 MiB / 3 passes) + a synced write — slow enough to
+    // freeze the wizard. Run it off-thread behind a busy dialog so the UI stays responsive.
+    Wallet *w = m_w->wallet;
+    const QString pw = ui->widget_password->password();
+    const bool ok = runBusy(this, tr("Creating wallet…"), [w, path, pw]() { return w->store(path, pw); });
+    if (!ok) {
         QMessageBox::warning(this, tr("Error"), m_w->wallet->errorString());
         return false;
     }
@@ -826,11 +861,19 @@ bool OpenPage::validatePage() {
             return false;
         }
     } else {
-        wallet = wm->openWallet(m_walletFile, password);
-        if (!wallet) {
+        // Decrypting runs Argon2id (64 MiB / 3 passes) — run it off-thread behind a busy dialog so
+        // the wizard doesn't hang while the wallet opens.
+        const QString file = m_walletFile, pw = password;
+        Wallet *opened = nullptr;
+        const bool ok = runBusy(this, tr("Opening wallet…"), [wm, file, pw, &opened]() {
+            opened = wm->openWallet(file, pw);
+            return opened != nullptr;
+        });
+        if (!ok) {
             QMessageBox::warning(this, tr("Open failed"), wm->errorString());
             return false;
         }
+        wallet = opened;
     }
     delete m_w->wallet;
     m_w->wallet = wallet;

@@ -43,6 +43,7 @@ private:
     QTimer *m_timeout = nullptr;
     quint16 m_socksPort = 9055; // dedicated to Aero's own bundled Tor (not the common 9050)
     bool m_ready = false;
+    QString m_lastError;        // last Tor [warn]/[err] line, for a useful failure message
 };
 
 #endif // AERO_TORMANAGER_H

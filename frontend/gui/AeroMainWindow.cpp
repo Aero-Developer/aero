@@ -21,6 +21,8 @@
 #include <QHeaderView>
 #include <QTextStream>
 #include <QFile>
+#include <QDir>
+#include <QCoreApplication>
 #include <QFileDialog>
 #include <QDoubleSpinBox>
 #include <QListWidget>
@@ -110,10 +112,12 @@ static QString decodeQrImage(const QImage &in) {
 namespace {
 const quint64 kChainId = 1;
 const QStringList kDefaultEndpoints = {
-    QStringLiteral("https://eth.llamarpc.com"),
+    // Keyless, Tor-reachable public RPCs. (eth.llamarpc.com was dropped: it's Cloudflare-fronted and
+    // returns HTTP 521 to Tor exit nodes; rpc.mevblocker.io is a tx-relay, not a general JSON-RPC.)
     QStringLiteral("https://ethereum-rpc.publicnode.com"),
     QStringLiteral("https://eth.drpc.org"),
-    QStringLiteral("https://rpc.mevblocker.io"),
+    QStringLiteral("https://eth.merkle.io"),
+    QStringLiteral("https://1rpc.io/eth"),
 };
 const QString kDefaultSocks = QStringLiteral("socks5h://127.0.0.1:9055");
 
@@ -138,10 +142,10 @@ const QList<ChainDef> &chainDefs() {
     static const QList<ChainDef> defs = {
         {1, QStringLiteral("Ethereum"), QStringLiteral("ETH"),
          QStringLiteral(":/assets/images/chains/ethereum.png"),
-         {QStringLiteral("https://eth.llamarpc.com"),
-          QStringLiteral("https://ethereum-rpc.publicnode.com"),
+         {QStringLiteral("https://ethereum-rpc.publicnode.com"),
           QStringLiteral("https://eth.drpc.org"),
-          QStringLiteral("https://rpc.mevblocker.io")},
+          QStringLiteral("https://eth.merkle.io"),
+          QStringLiteral("https://1rpc.io/eth")},
          QStringLiteral("https://etherscan.io"),
          true, true, QStringLiteral("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")},
         {42161, QStringLiteral("Arbitrum One"), QStringLiteral("ETH"),
@@ -393,6 +397,17 @@ QString formatBalance(const QString &raw) {
 }
 
 AeroMainWindow::AeroMainWindow(QWidget *parent) : QMainWindow(parent) {
+    // One-time migration (must run before the Receive options menu is built): earlier builds
+    // defaulted the "show only funded addresses" filter ON and persisted it, hiding most accounts
+    // after importing a seed. Flip it OFF once so the full 0..last-used address list is shown.
+    {
+        QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+        if (!s.value(QStringLiteral("receive/fundedOnlyMigratedOff"), false).toBool()) {
+            s.setValue(QStringLiteral("receive/fundedOnly"), false);
+            s.setValue(QStringLiteral("receive/fundedOnlyMigratedOff"), true);
+        }
+    }
+
     ui.setupUi(this);
     ui.stackedWidget->setCurrentWidget(ui.page_wallet);
 
@@ -410,10 +425,20 @@ AeroMainWindow::~AeroMainWindow() {
 }
 
 void AeroMainWindow::closeEvent(QCloseEvent *event) {
+    // Cancel any pending debounced save so it can't race the authoritative flush below.
+    if (m_saveTimer)
+        m_saveTimer->stop();
+    // Queue the latest UI metadata (labels/contacts/notes + the throttled balance cache) and apply
+    // it so the final save below persists it — the balance cache may not have been written yet.
+    if (m_wallet) {
+        m_wallet->queueMetadata(
+            QString::fromUtf8(QJsonDocument(m_meta).toJson(QJsonDocument::Compact)));
+        m_wallet->flushPendingMetadata();
+    }
     // Flush any in-memory changes (created addresses, imported keys, tokens) to the wallet file.
-    // If this final save fails, changes made since the last successful save (notably imported keys,
-    // which aren't recoverable from the seed) would be lost — so let the user cancel the close and
-    // fix the problem rather than silently dropping them.
+    // This one blocking save on exit is acceptable; it writes the complete current state. If it
+    // fails, changes since the last successful save (notably imported keys, which aren't recoverable
+    // from the seed) would be lost — so let the user cancel the close and fix the problem.
     if (m_wallet && !m_wallet->walletPath().isEmpty() && !m_wallet->save()) {
         const auto choice = QMessageBox::warning(
             this, tr("Could not save wallet"),
@@ -459,25 +484,56 @@ void AeroMainWindow::setupTabs() {
     ui.frame_coinControl->hide();
 
     m_historyModel = new HistoryModel(this);
-    // Sort proxy: click the Date or Amount header to sort (chronological / by value, not text).
-    m_historyProxy = new QSortFilterProxyModel(this);
-    m_historyProxy->setSourceModel(m_historyModel);
-    m_historyProxy->setSortRole(HistoryModel::SortRole);
-    m_historyProxy->setFilterKeyColumn(-1); // search across all columns
-    m_historyProxy->setFilterCaseSensitivity(Qt::CaseInsensitive);
-    histUi.history->setModel(m_historyProxy);
+    // The model owns filtering + sorting + pagination (500 rows/page) so only one page is ever
+    // materialised — no sort proxy churning tens of thousands of rows. Header clicks drive sort();
+    // the model's no-op-on-same-params guard prevents the view's post-reset re-sort recursion.
+    histUi.history->setModel(m_historyModel);
     histUi.history->setSelectionBehavior(QAbstractItemView::SelectRows);
     histUi.history->setSortingEnabled(true);
     histUi.history->sortByColumn(HistoryModel::Column_Date, Qt::DescendingOrder); // newest first
     // Wire the (previously dead) history search box, and drop the Monero sync-notice banner.
     connect(histUi.search, &QLineEdit::textChanged, this,
-            [this](const QString &t) { m_historyProxy->setFilterFixedString(t.trimmed()); });
+            [this](const QString &t) { m_historyModel->setSearchText(t); });
     histUi.syncNotice->hide();
-    // Double-click a transaction to open the Feather-style details dialog (map proxy -> source row).
+    // Double-click a transaction to open the Feather-style details dialog.
     connect(histUi.history, &QTreeView::doubleClicked, this, [this](const QModelIndex &idx) {
         if (idx.isValid())
-            showTransactionDialog(m_historyModel->itemAt(m_historyProxy->mapToSource(idx).row()));
+            showTransactionDialog(m_historyModel->itemAt(idx.row()));
     });
+
+    // Pagination bar below the table: Prev / Next + "Page X of Y (N transactions)".
+    {
+        auto *pager = new QWidget(histUi.history->parentWidget());
+        auto *pl = new QHBoxLayout(pager);
+        pl->setContentsMargins(0, 4, 0, 0);
+        m_historyPrev = new QToolButton(pager);
+        m_historyPrev->setText(tr("\u2039 Prev"));
+        m_historyPrev->setToolButtonStyle(Qt::ToolButtonTextOnly);
+        m_historyNext = new QToolButton(pager);
+        m_historyNext->setText(tr("Next \u203a"));
+        m_historyNext->setToolButtonStyle(Qt::ToolButtonTextOnly);
+        m_historyPageLabel = new QLabel(pager);
+        pl->addWidget(m_historyPrev);
+        pl->addWidget(m_historyNext);
+        pl->addStretch(1);
+        pl->addWidget(m_historyPageLabel);
+        histUi.verticalLayout->addWidget(pager);
+        connect(m_historyPrev, &QToolButton::clicked, this,
+                [this]() { m_historyModel->setPage(m_historyModel->currentPage() - 1); });
+        connect(m_historyNext, &QToolButton::clicked, this,
+                [this]() { m_historyModel->setPage(m_historyModel->currentPage() + 1); });
+        connect(m_historyModel, &HistoryModel::pageChanged, this,
+                [this](int page, int pages, int total) {
+                    m_historyPrev->setEnabled(page > 0);
+                    m_historyNext->setEnabled(page + 1 < pages);
+                    if (total <= 0)
+                        m_historyPageLabel->setText(tr("No transactions"));
+                    else
+                        m_historyPageLabel->setText(
+                            tr("Page %1 of %2  (%3 transactions)").arg(page + 1).arg(pages).arg(total));
+                    histUi.history->scrollToTop();
+                });
+    }
 
     // History account filter: "All accounts" or a single account, placed at the left of the
     // search bar (Feather shows a similar account filter above the history view).
@@ -606,7 +662,7 @@ void AeroMainWindow::setupTabs() {
     // Receive "..." options: toggle showing only funded addresses + rescan the seed.
     {
         m_showFundedOnly = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
-                               .value(QStringLiteral("receive/fundedOnly"), true).toBool();
+                               .value(QStringLiteral("receive/fundedOnly"), false).toBool();
         auto *menu = new QMenu(this);
         auto *fundedAct = menu->addAction(tr("Show only addresses with a balance"));
         fundedAct->setCheckable(true);
@@ -621,8 +677,11 @@ void AeroMainWindow::setupTabs() {
         });
         connect(menu->addAction(tr("Rescan for funded addresses (all chains)")), &QAction::triggered,
                 this, [this]() {
-                    if (m_wallet)
-                        m_wallet->scanFundedMulti(allChainsScanConfig(), 20); // silent, cross-chain
+                    if (m_wallet) {
+                        setConnectionState(m_connMode, tr("Scanning for your addresses…"));
+                        startScanProgress();
+                        m_wallet->scanFundedMulti(allChainsScanConfig(), 40); // silent, cross-chain
+                    }
                 });
         recvUi.toolBtn_options->setMenu(menu);
         recvUi.toolBtn_options->setPopupMode(QToolButton::InstantPopup);
@@ -3235,13 +3294,41 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     m_wallet = wallet;
     connect(m_wallet, &Wallet::balanceUpdated, this, &AeroMainWindow::onBalanceUpdated);
     connect(m_wallet, &Wallet::historyRefreshed, this, [this](const QVector<HistoryItem> &items) {
-        // Keep the allow-list current (curated top tokens + tracked tokens) so legit transfers are
-        // shown while unsolicited/fake ERC-20s stay hidden.
+        // Single-account / one-shot path.
         m_historyModel->setKnownTokens(verifiedTokenAddresses());
         m_historyModel->onHistoryRefreshed(items);
         checkUntrackedTokenLiquidity(); // auto-trust unknown-but-liquid tokens (DexScreener/Tor)
         requestHistoricalPrices(items); // value each native-coin tx at its date
     });
+    // Start of an all-account refresh: clear the model + dedup up front (runs before any batch, so
+    // out-of-order parallel batches can't append onto stale rows).
+    connect(m_wallet, &Wallet::historyRefreshStarted, this, [this]() {
+        m_historyModel->beginFullRefresh();
+        m_historyModel->setKnownTokens(verifiedTokenAddresses());
+    });
+    // Incremental all-account path: batches arrive per account (in completion order), appended live.
+    connect(m_wallet, &Wallet::historyBatch, this,
+            [this](const QVector<HistoryItem> &items, quint32 done, quint32 total) {
+                m_historyModel->appendBatch(items);
+                requestHistoricalPrices(items);
+                // Only touch the status bar when we're actually connected (m_connMode>0). Otherwise a
+                // history refresh triggered while still "Connecting to Tor…" / "Offline" would clobber
+                // that with a misleading "Connected". Also skip while a funded scan owns the status.
+                const bool scanning = m_scanProgressTimer && m_scanProgressTimer->isActive();
+                if (m_connMode > 0 && !scanning) {
+                    if (done < total)
+                        setConnectionState(m_connMode,
+                                           tr("Loading history… %1/%2").arg(done).arg(total));
+                    else
+                        setConnectionState(m_connMode,
+                                           m_connText.isEmpty() ? tr("Connected") : m_connText);
+                }
+                if (done == total)
+                    checkUntrackedTokenLiquidity();
+            });
+    // After the address cache is warmed (post-scan), rebuild the account combos from the hot cache.
+    connect(m_wallet, &Wallet::addressesWarmed, this, [this]() { rebuildAccountCombos(); });
+    connect(m_wallet, &Wallet::accountAdded, this, &AeroMainWindow::onAccountAdded);
     connect(m_wallet, &Wallet::accountBalanceUpdated, this, &AeroMainWindow::onAccountBalance);
     connect(m_wallet, &Wallet::ethUsdPriceUpdated, this, &AeroMainWindow::onEthUsdPrice);
     connect(m_wallet, &Wallet::marketPricesUpdated, this, &AeroMainWindow::onMarketPrices);
@@ -3305,6 +3392,10 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     // Event-driven history: after a batched balance refresh, only re-pull the (heavy) history if a
     // balance actually changed. This keeps steady-state bandwidth to the cheap balance batch.
     connect(m_wallet, &Wallet::allBalancesRefreshed, this, [this]() {
+        // The whole batch has arrived — do the (single) authoritative total + used-flag recompute.
+        scheduleHomeRecompute();
+        m_balancesFromCache = false; // first live refresh done; grown balances are real from now on
+        saveBalanceCache(); // persist (debounced) so the next open shows balances instantly
         if (m_swapPage && ui.tabWidget->indexOf(m_swapPage) >= 0) {
             updateSwapAvailable(); // keep the Swap "Available" line current
             updateSwapPayUsd();
@@ -3332,7 +3423,7 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
 
     // Restore the "show funded only" preference; the funded set itself came from loadMetadata().
     m_showFundedOnly = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
-                           .value(QStringLiteral("receive/fundedOnly"), true).toBool();
+                           .value(QStringLiteral("receive/fundedOnly"), false).toBool();
     applyFundedFilter();
     updateHistoryPricing(); // seed the History dust filter with the tracked-token symbols
     loadLiquidityCache();   // restore auto-trust (DEX liquidity) decisions
@@ -3349,6 +3440,8 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     selectAddressRow(savedAcct); // selects the Receive row (fires onAccountChanged if visible)
     updateReceive();
     updateSwapTabEnabled(); // Swap tab depends on chain (CoW) + watch-only status
+
+    loadBalanceCache(); // show last-known balances instantly; the Tor refresh below overwrites them
 
     autoConnect();
 
@@ -3469,7 +3562,7 @@ void AeroMainWindow::autoConnect() {
         }
     }
 
-    setConnectionState(0, tr("Starting Tor…"));
+    setConnectionState(0, tr("Connecting to Tor…"));
 
     // Otherwise always route through Tor — start (or reuse) Tor first, then connect only once it has
     // bootstrapped. There is no clearnet fallback, so the wallet never leaks the user's IP.
@@ -3478,7 +3571,7 @@ void AeroMainWindow::autoConnect() {
         connect(m_tor, &TorManager::statusChanged, this,
                 [this](const QString &msg) { setConnectionState(0, msg); });
         connect(m_tor, &TorManager::ready, this, [this]() {
-            setConnectionState(0, tr("Connecting via Tor…"));
+            setConnectionState(0, tr("Connecting to Tor…"));
             connectCurrentChain();
         });
         connect(m_tor, &TorManager::failed, this, [this](const QString &err) {
@@ -3541,6 +3634,8 @@ void AeroMainWindow::switchChain(quint64 chainId) {
     // Update the Home native ticker label + any native-symbol labels.
     relabelNative();
 
+    loadBalanceCache(); // instantly show the new chain's last-known balances while it reconnects
+
     // Reconnect to the new chain's endpoints (custom node if configured for it, else registry
     // defaults over the existing Tor transport).
     setConnectionState(0, tr("Switching to %1…").arg(c.name));
@@ -3563,24 +3658,33 @@ void AeroMainWindow::relabelNative() {
 }
 
 void AeroMainWindow::onProviderConnected(int mode, const QString &message) {
-    setConnectionState(mode, mode > 0 ? tr("%1 · %2").arg(message, chainDefFor(m_chainId).name) : message);
+    const QString text = mode > 0 ? tr("%1 · %2").arg(message, chainDefFor(m_chainId).name) : message;
+    m_connMode = mode;      // remembered so the "Scanning…" state can restore the connected status
+    m_connText = text;
+    setConnectionState(mode, text);
     if (mode > 0) {
         // Only now that we can actually reach an RPC do we pull balances + prices. Each of these is
         // a single (or batched) request — no per-account fan-out and no duplicate refreshes.
+        // Launch the quick, single-request refreshes FIRST so they grab net-pool threads before the
+        // history fan-out (which can queue one task per account and would otherwise starve them —
+        // delaying balances/prices behind the whole history load).
         refreshAllBalances();               // batched: native + tokens for every account
-        refreshHistoryView();               // full history (Blockscout over Tor)
         m_wallet->refreshEthUsdPrice();     // native/USD (Chainlink or fallback)
         m_wallet->refreshMarketPrices();    // XMR + native market prices for Home
         m_wallet->refreshFees();            // gas suggestion
         if (m_fiatCurrency.compare(QStringLiteral("USD"), Qt::CaseInsensitive) != 0)
             m_wallet->refreshFiatRate(m_fiatCurrency); // USD->fiat rate for display
         refreshNfts();
+        refreshHistoryView();               // full history (Blockscout over Tor) — fanned out, last
         // First time we can reach the chain: if we've never scanned this wallet for funded
         // addresses, do it now — silently, across all chains (an address funded on any chain is
         // discovered even though we're connected to one).
         if (!m_fundedScanned && !m_fundedScanTried) {
             m_fundedScanTried = true;
-            m_wallet->scanFundedMulti(allChainsScanConfig(), 20);
+            // Keep the connected icon but show progress; onFundedScanned restores the status.
+            setConnectionState(m_connMode, tr("Scanning for your addresses…"));
+            startScanProgress();
+            m_wallet->scanFundedMulti(allChainsScanConfig(), 40);
         }
     }
 }
@@ -3608,24 +3712,55 @@ void AeroMainWindow::saveFundedSet() {
     saveMetadata();
 }
 
+// Poll the core's live scan counters and show them in the status bar, so the user actively sees the
+// scan progress ("N checked, M found") instead of a static "Scanning…".
+void AeroMainWindow::startScanProgress() {
+    if (!m_scanProgressTimer) {
+        m_scanProgressTimer = new QTimer(this);
+        m_scanProgressTimer->setInterval(300);
+        connect(m_scanProgressTimer, &QTimer::timeout, this, [this]() {
+            if (!m_wallet) return;
+            const quint64 checked = m_wallet->scanProgress();
+            const quint64 found = m_wallet->scanFound();
+            setConnectionState(m_connMode,
+                               tr("Scanning addresses… %1 checked, %2 found")
+                                   .arg(checked).arg(found));
+        });
+    }
+    m_scanProgressTimer->start();
+}
+
 void AeroMainWindow::onFundedScanned(const QList<quint32> &indices) {
+    if (m_scanProgressTimer)
+        m_scanProgressTimer->stop();
     m_fundedScanned = true;
     m_fundedAccounts.clear();
     // The core scan (across all derivation schemes) already registered each funded address as an
-    // account and returns their unified indices; we just mark them funded and refresh.
+    // account (and backfilled the contiguous gaps) and returns the funded unified indices; we mark
+    // them funded and refresh.
     for (quint32 i : indices)
         m_fundedAccounts.insert(i);
     if (!m_fundedAccounts.isEmpty()) {
-        m_wallet->save(); // persist the discovered accounts (incl. non-standard-path ones)
         m_addressModel->refresh();
-        rebuildAccountCombos();
+        // Warm the address cache off-thread; addressesWarmed -> rebuildAccountCombos (from hot cache)
+        // so the combos don't derive hundreds of addresses synchronously on the UI thread.
+        m_wallet->warmAddresses(m_wallet->numAccounts());
         refreshAllBalances();
     }
+    // Mark funded rows red immediately (before balances load); refreshUsedFlags() keeps them live
+    // after each balance batch.
+    for (quint32 i : m_fundedAccounts)
+        m_addressModel->setUsed(i, true);
+    // Persist the discovered accounts AND the funded set in one debounced, off-thread save (the
+    // whole wallet is re-encrypted once) — previously this ran two blocking Argon2id saves here.
     saveFundedSet();
     applyFundedFilter();
     if (m_addressModel->rowCount() > 0)
-        selectAddressRow(m_addressModel->accountAt(0)); // first visible (funded) address
-    setConnectionState(2, tr("Connected via Tor"));
+        selectAddressRow(m_addressModel->accountAt(0)); // first visible address
+    // Restore the real connected status (Tor/direct). Only when actually connected — never overwrite
+    // a "Connecting…"/"Offline" state with a bogus "Connected".
+    if (m_connMode > 0)
+        setConnectionState(m_connMode, m_connText.isEmpty() ? tr("Connected") : m_connText);
     notify(tr("Scan complete"),
            tr("Found %1 funded address(es).").arg(m_fundedAccounts.size()));
 }
@@ -3650,19 +3785,6 @@ void AeroMainWindow::refreshAllBalances() {
     }
     const QString extraJson = QString::fromUtf8(QJsonDocument(extra).toJson(QJsonDocument::Compact));
     m_wallet->refreshAllBalances(m_wallet->numAccounts(), extraJson);
-}
-
-void AeroMainWindow::updateUsed(quint32 index) {
-    if (!m_addressModel) return;
-    bool used = m_ethRawByAccount.value(index, 0.0) > 0.0;
-    if (!used && m_wallet) {
-        for (const TokenInfo &t : m_wallet->tokens())
-            if (m_tokenRawByKey.value(QStringLiteral("%1|%2").arg(index).arg(t.address), 0.0) > 0.0) {
-                used = true;
-                break;
-            }
-    }
-    m_addressModel->setUsed(index, used);
 }
 
 void AeroMainWindow::loadLabels() {
@@ -3696,10 +3818,103 @@ void AeroMainWindow::copySensitive(const QString &text) {
     });
 }
 
+// Persist the current chain's last-known balances (per account) into the encrypted wallet metadata,
+// so the next open can show them INSTANTLY — before Tor even connects — then refresh in the
+// background. Keyed by chain id (balances differ per chain). Debounced via scheduleSave().
+void AeroMainWindow::saveBalanceCache() {
+    if (!m_wallet) return;
+    QJsonObject eth, disp, tok;
+    for (auto it = m_ethRawByAccount.constBegin(); it != m_ethRawByAccount.constEnd(); ++it)
+        eth[QString::number(it.key())] = it.value();
+    for (auto it = m_accountBalances.constBegin(); it != m_accountBalances.constEnd(); ++it)
+        disp[QString::number(it.key())] = it.value();
+    for (auto it = m_tokenRawByKey.constBegin(); it != m_tokenRawByKey.constEnd(); ++it)
+        tok[it.key()] = it.value();
+    QJsonObject snap;
+    snap[QStringLiteral("eth")] = eth;
+    snap[QStringLiteral("disp")] = disp;
+    snap[QStringLiteral("tok")] = tok;
+    snap[QStringLiteral("usd")] = m_nativeUsd; // so the fiat total is roughly right immediately
+    QJsonObject cache = m_meta.value(QStringLiteral("balcache")).toObject();
+    cache[QString::number(m_chainId)] = snap;
+    m_meta[QStringLiteral("balcache")] = cache;
+    // Update m_meta every time (cheap), but only push it to the core + encrypt+write at most every
+    // 30s — balances refresh each block and re-running Argon2 that often is wasteful. saveMetadata()
+    // queues the whole m_meta (incl. this balcache) into the core, then persists (debounced).
+    // closeEvent also flushes the latest m_meta, so nothing is lost between throttled writes.
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - m_lastBalCacheSaveMs >= 30000) {
+        m_lastBalCacheSaveMs = now;
+        saveMetadata();
+    }
+}
+
+// Populate the in-memory balance caches + UI from the persisted snapshot for the current chain, so
+// balances appear immediately on open/chain-switch. The live refresh over Tor overwrites them.
+void AeroMainWindow::loadBalanceCache() {
+    if (!m_wallet) return;
+    const QJsonObject snap = m_meta.value(QStringLiteral("balcache"))
+                                 .toObject()
+                                 .value(QString::number(m_chainId))
+                                 .toObject();
+    if (snap.isEmpty())
+        return;
+    // These are stale (last-session) values used only for instant display; the first live refresh
+    // must not treat a grown balance as an incoming payment.
+    m_balancesFromCache = true;
+    const QJsonObject eth = snap.value(QStringLiteral("eth")).toObject();
+    for (auto it = eth.constBegin(); it != eth.constEnd(); ++it)
+        m_ethRawByAccount.insert(it.key().toUInt(), it.value().toDouble());
+    const QJsonObject tok = snap.value(QStringLiteral("tok")).toObject();
+    for (auto it = tok.constBegin(); it != tok.constEnd(); ++it)
+        m_tokenRawByKey.insert(it.key(), it.value().toDouble());
+    const double usd = snap.value(QStringLiteral("usd")).toDouble();
+    if (usd > 0.0 && m_nativeUsd <= 0.0)
+        m_nativeUsd = usd;
+    const QJsonObject disp = snap.value(QStringLiteral("disp")).toObject();
+    for (auto it = disp.constBegin(); it != disp.constEnd(); ++it) {
+        const quint32 idx = it.key().toUInt();
+        const QString s = it.value().toString();
+        m_accountBalances.insert(idx, s);
+        if (m_addressModel)
+            m_addressModel->setBalance(idx, s);
+        if (m_fromCombo && static_cast<int>(idx) < m_fromCombo->count()) {
+            QSignalBlocker b(m_fromCombo);
+            m_fromCombo->setItemText(static_cast<int>(idx), accountLabel(idx));
+        }
+        if (m_swapFrom && static_cast<int>(idx) < m_swapFrom->count()) {
+            QSignalBlocker b(m_swapFrom);
+            m_swapFrom->setItemText(static_cast<int>(idx), accountLabel(idx));
+        }
+    }
+    recomputeHomeTotal();
+    refreshUsedFlags();
+    showCachedBalance(m_account);
+    updateReceive();
+}
+
 void AeroMainWindow::saveMetadata() {
     if (!m_wallet) return;
-    m_wallet->setMetadata(QString::fromUtf8(QJsonDocument(m_meta).toJson(QJsonDocument::Compact)));
-    m_wallet->save(); // re-encrypt with the retained password (atomic write)
+    // Queue the metadata lock-free (never touches the core lock on the UI thread) and defer the
+    // encrypt+write. Applying it under the core write lock here would freeze the UI while the funded
+    // scan holds that lock — which is exactly the "double-click a label freezes" bug.
+    m_wallet->queueMetadata(QString::fromUtf8(QJsonDocument(m_meta).toJson(QJsonDocument::Compact)));
+    scheduleSave();
+}
+
+// Debounced, non-blocking save. Coalesces a burst of edits (e.g. typing a label) into a single
+// off-thread encrypt+atomic-write so the UI never freezes on Argon2id.
+void AeroMainWindow::scheduleSave() {
+    if (!m_wallet) return;
+    if (!m_saveTimer) {
+        m_saveTimer = new QTimer(this);
+        m_saveTimer->setSingleShot(true);
+        m_saveTimer->setInterval(400);
+        connect(m_saveTimer, &QTimer::timeout, this, [this]() {
+            if (m_wallet) m_wallet->saveAsync();
+        });
+    }
+    m_saveTimer->start(); // (re)start the debounce window
 }
 
 void AeroMainWindow::loadMetadata() {
@@ -3825,12 +4040,15 @@ void AeroMainWindow::onAvailableBalance(quint32 index, const QString &token,
         const double newBal = formatted.toDouble();
         const double oldBal = m_tokenRawByKey.value(key, -1.0);
         m_tokenRawByKey.insert(key, newBal);
-        recomputeHomeTotal();
-        updateUsed(index);
+        // Instant red for a positive balance; the full/authoritative recompute is debounced so a
+        // bulk refresh of hundreds of accounts doesn't run recomputeHomeTotal thousands of times.
+        if (newBal > 0.0 && m_addressModel)
+            m_addressModel->setUsed(index, true);
+        scheduleHomeRecompute();
         // Any change (incoming or outgoing) means a new tx touched this address -> refresh history.
         if (oldBal >= 0.0 && qAbs(newBal - oldBal) > 1e-9)
             m_balancesChanged = true;
-        if (oldBal >= 0.0 && newBal > oldBal + 1e-9)
+        if (oldBal >= 0.0 && newBal > oldBal + 1e-9 && !m_balancesFromCache)
             notify(tr("Payment received"),
                    tr("+%1 %2 to Account #%3")
                        .arg(grouped(QString::number(newBal - oldBal, 'f', 6)), symbol)
@@ -3910,7 +4128,7 @@ void AeroMainWindow::refreshHistoryView() {
     if (!m_wallet)
         return;
     if (m_historyFilter < 0)
-        m_wallet->refreshHistoryAll(m_wallet->numAccounts());
+        m_wallet->refreshHistoryAll(m_wallet->numAccounts(), m_account); // selected account first
     else
         m_wallet->refreshHistory(static_cast<quint32>(m_historyFilter));
 }
@@ -3920,13 +4138,16 @@ void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, c
     const double newBal = formatted.toDouble();
     const double oldBal = m_ethRawByAccount.value(index, -1.0);
     m_ethRawByAccount.insert(index, newBal); // raw, for the combined total
-    recomputeHomeTotal();
-    updateUsed(index);
+    // Instant red for a positive balance; full recompute is debounced (see scheduleHomeRecompute).
+    if (newBal > 0.0 && m_addressModel)
+        m_addressModel->setUsed(index, true);
+    scheduleHomeRecompute();
     // Any change (incoming or outgoing) means a new tx touched this address -> refresh history.
     if (oldBal >= 0.0 && qAbs(newBal - oldBal) > 1e-12)
         m_balancesChanged = true;
-    // A balance increase means an incoming payment (our own sends decrease it).
-    if (oldBal >= 0.0 && newBal > oldBal + 1e-12)
+    // A balance increase means an incoming payment (our own sends decrease it) — but not when the
+    // baseline was just loaded from the stale on-disk cache (that's not a live payment).
+    if (oldBal >= 0.0 && newBal > oldBal + 1e-12 && !m_balancesFromCache)
         notify(tr("Payment received"),
                tr("+%1 ETH to Account #%2")
                    .arg(grouped(QString::number(newBal - oldBal, 'f', 6)))
@@ -4044,11 +4265,10 @@ void AeroMainWindow::onCreateAddress() {
                                     "tracks the addresses you added."));
         return;
     }
-    quint32 idx;
     if (m_wallet->isHardware()) {
         // Derive the next address from the device (needs it connected; may take a moment).
         QApplication::setOverrideCursor(Qt::WaitCursor);
-        idx = m_wallet->addHardwareAccount();
+        const quint32 idx = m_wallet->addHardwareAccount();
         QApplication::restoreOverrideCursor();
         if (idx == 0xFFFFFFFFu) {
             QMessageBox::warning(this, tr("Create address"),
@@ -4056,11 +4276,18 @@ void AeroMainWindow::onCreateAddress() {
                                      .arg(m_wallet->errorString()));
             return;
         }
-    } else {
-        idx = m_wallet->addAccount();
+        onAccountAdded(idx);
+        return;
     }
+    // Software wallet: derive off the UI thread (onAccountAdded fires when done). This can't freeze
+    // even if the funded scan currently holds the core lock — the derivation just waits on the pool.
+    m_wallet->addAccountAsync();
+}
+
+// Finish creating an address once the (possibly off-thread) derivation completes.
+void AeroMainWindow::onAccountAdded(quint32 idx) {
     m_account = idx;
-    m_wallet->save(); // persist the new account count / cached address
+    scheduleSave(); // persist the new account (debounced, off-thread — no UI freeze)
     rebuildAccountCombos();
     selectAddressRow(idx);
     updateReceive();
@@ -5188,22 +5415,55 @@ void AeroMainWindow::recomputeHomeTotal() {
     double total = 0.0;
     for (auto it = m_ethRawByAccount.constBegin(); it != m_ethRawByAccount.constEnd(); ++it)
         total += it.value() * m_nativeUsd;
-    const QVector<TokenInfo> toks = m_wallet ? m_wallet->tokens() : QVector<TokenInfo>();
+    // Build an address->symbol map ONCE (was an O(tokens) inner scan per balance key, i.e. O(N*T^2)
+    // across a bulk refresh — the main scale freeze). Now O(N + T).
+    QHash<QString, QString> symByAddr;
+    if (m_wallet)
+        for (const TokenInfo &t : m_wallet->tokens())
+            symByAddr.insert(t.address.toLower(), t.symbol);
+    for (const TokenInfo &t : curatedTopTokens(m_chainId))
+        symByAddr.insert(t.address.toLower(), t.symbol);
     for (auto it = m_tokenRawByKey.constBegin(); it != m_tokenRawByKey.constEnd(); ++it) {
-        const QString tokenAddr = it.key().section(QLatin1Char('|'), 1);
-        QString sym;
-        for (const TokenInfo &t : toks)
-            if (t.address.compare(tokenAddr, Qt::CaseInsensitive) == 0) {
-                sym = t.symbol;
-                break;
-            }
-        total += it.value() * unitPriceUsd(sym);
+        const QString tokenAddr = it.key().section(QLatin1Char('|'), 1).toLower();
+        total += it.value() * unitPriceUsd(symByAddr.value(tokenAddr));
     }
     const QString shown = m_hideBalances ? QStringLiteral("\u2022\u2022\u2022\u2022") : fiatStr(total);
     m_homeTotalValue->setText(shown);
     if (m_recvTotalLabel)
         m_recvTotalLabel->setText(m_hideBalances ? tr("Total balance: hidden")
                                                  : tr("Total balance: %1").arg(shown));
+}
+
+// Debounced home-total + used-flag recompute. Per-balance-signal handlers call this instead of
+// running the (previously per-signal) recompute directly, so a bulk refresh of hundreds of accounts
+// coalesces into a single recompute after the burst — the UI never blocks.
+void AeroMainWindow::scheduleHomeRecompute() {
+    if (!m_homeTotalTimer) {
+        m_homeTotalTimer = new QTimer(this);
+        m_homeTotalTimer->setSingleShot(true);
+        m_homeTotalTimer->setInterval(150);
+        connect(m_homeTotalTimer, &QTimer::timeout, this, [this]() {
+            recomputeHomeTotal();
+            refreshUsedFlags();
+        });
+    }
+    m_homeTotalTimer->start();
+}
+
+// Recompute every account's "used" (red) flag once, in a single O(N + tokenKeys) pass, from the
+// in-memory balances — instead of looping the tracked-token list per account per balance signal.
+void AeroMainWindow::refreshUsedFlags() {
+    if (!m_addressModel || !m_wallet)
+        return;
+    QSet<quint32> hasToken;
+    for (auto it = m_tokenRawByKey.constBegin(); it != m_tokenRawByKey.constEnd(); ++it)
+        if (it.value() > 0.0)
+            hasToken.insert(it.key().section(QLatin1Char('|'), 0, 0).toUInt());
+    const quint32 n = m_wallet->numAccounts();
+    for (quint32 i = 0; i < n; ++i) {
+        const bool used = m_ethRawByAccount.value(i, 0.0) > 0.0 || hasToken.contains(i);
+        m_addressModel->setUsed(i, used); // no-op when unchanged
+    }
 }
 
 // Rebuild the amount-unit selector for the currently selected send currency. ETH lets you enter

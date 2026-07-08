@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aero: A Free Tor-Routed Ethereum Wallet</title>
+<meta name="description" content="Aero is a free, open-source, Tor-routed Ethereum and ERC-20 desktop wallet with a lightweight Feather-style interface.">
+<link rel="canonical" href="https://aero.free/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Aero">
+<meta property="og:title" content="Aero: A Free Tor-Routed Ethereum Wallet">
+<meta property="og:description" content="A free, open-source, Tor-routed Ethereum &amp; ERC-20 desktop wallet. No telemetry, no accounts, no logging.">
+<meta property="og:url" content="https://aero.free/">
+<meta property="og:image" content="https://aero.free/assets/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Aero logo">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Aero: A Free Tor-Routed Ethereum Wallet">
+<meta name="twitter:description" content="A free, open-source, Tor-routed Ethereum &amp; ERC-20 desktop wallet.">
+<meta name="twitter:image" content="https://aero.free/assets/og.png">
+<meta name="theme-color" content="#f4f0e6">
+<link rel="icon" href="assets/favicon.ico">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <div class="masthead">
+      <img src="assets/aero.png" alt="Aero logo">
+      <h1>Aero</h1>
+    </div>
+    <p class="tagline">A free, Tor-routed Ethereum &amp; ERC-20 desktop wallet.</p>
+    <nav class="links">
+      <strong>Home</strong><span class="sep">|</span>
+      <a href="/download">Download</a><span class="sep">|</span>
+      <a href="/screenshots">Screenshots</a><span class="sep">|</span>
+      <a href="/faq">FAQ</a><span class="sep">|</span>
+      <a href="https://github.com/Aero-Developer/aero">Source</a>
+    </nav>
+  </header>
+
+  <hr>
+
+  <p>
+    Aero is a small, fast, open-source Ethereum wallet for the desktop. It routes
+    <em>everything</em> over a bundled Tor client, keeps no logs, and phones no home.
+    It borrows its interface and philosophy from
+    <a href="https://featherwallet.org/">Feather</a>, the Monero wallet: sane defaults
+    for most people, with a full feature set for those who want it.
+  </p>
+
+  <p>
+    The latest version is <code>v0.1.3</code>.
+    <a href="/download">Download it here</a>.
+  </p>
+
+  <hr>
+
+  <h2>What you get</h2>
+  <ul>
+    <li><strong>Tor by default.</strong> A Tor client is bundled and started for you.
+      Every RPC call, price lookup, swap request and block-explorer query goes through it.
+      With no proxy configured, Aero refuses to talk to a remote node rather than leak your IP.</li>
+    <li><strong>No telemetry, no accounts, no logging.</strong> There is no server behind Aero.
+      Nothing about you or your wallet is collected or transmitted anywhere.</li>
+    <li><strong>Multichain.</strong> Ethereum, Arbitrum, Base, Optimism, Polygon,
+      BNB Smart Chain, Gnosis and Avalanche &mdash; one seed, switch networks from a menu.</li>
+    <li><strong>Private swaps.</strong> Compare keyless aggregators (CoW Protocol, KyberSwap,
+      Odos, ParaSwap, OpenOcean) and swap over Tor. Every route enforces a minimum
+      output on-chain, so a swap can never fill below your slippage.</li>
+    <li><strong>Hardware wallets.</strong> Ledger and Trezor supported, with host-entered
+      passphrases.</li>
+    <li><strong>Watch-only &amp; air-gapped.</strong> Track an address with no keys, or build an
+      unsigned transaction on an online machine and sign it offline.</li>
+    <li><strong>Portable.</strong> Nothing is installed. Unzip it, run it, delete it.
+      Your encrypted wallet lives beside the app.</li>
+    <li><strong>Strong key storage.</strong> Wallet files are encrypted with Argon2id and
+      AES-256-GCM and stored in an opaque binary format.</li>
+    <li><strong>Free software.</strong> BSD-3-Clause. Read, build and audit the
+      <a href="https://github.com/Aero-Developer/aero">source</a>.</li>
+  </ul>
+
+  <hr>
+
+  <h2>Why Aero</h2>
+  <p>
+    Most Ethereum wallets are browser extensions that watch what you do, or heavy Electron
+    apps that leak your addresses to third-party servers on every refresh. Aero is a native
+    desktop program that treats network privacy as the default, not a setting. It is meant to
+    feel obvious: pick a network, hold your keys, sign what you mean to sign.
+  </p>
+
+  <hr>
+
+  <footer>
+    <p>
+      Aero is not affiliated with the Feather or Monero projects; it is an independent wallet
+      inspired by Feather's design.
+      &middot; <a href="https://github.com/Aero-Developer/aero">GitHub</a>
+      &middot; <a href="https://github.com/Aero-Developer/aero/releases">Releases</a>
+    </p>
+  </footer>
+
+</div>
+</body>
+</html>

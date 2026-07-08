@@ -12,9 +12,19 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use once_cell::sync::Lazy;
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 
 use crate::error::{CoreError, Result};
+
+/// Process-wide cap on how many Tor requests may be in flight at once. Scanning and history fan out
+/// across many chains/accounts/lists concurrently; without a shared cap that fan-out could open
+/// dozens of simultaneous streams and congest the single Tor circuit. Every outbound request
+/// (JSON-RPC calls/batches and explorer/price/image HTTP GET/POSTs) acquires a permit first, so the
+/// whole app — regardless of how many concurrent callers — never exceeds this bound. Tuned
+/// "balanced": high enough to hide per-request Tor latency, low enough to keep one circuit healthy.
+static RPC_SEM: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(10));
 
 /// Networking configuration for the wallet.
 #[derive(Clone, Debug)]
@@ -108,6 +118,7 @@ impl RpcProvider {
     /// GET raw bytes (e.g. an NFT thumbnail) over the same Tor-proxied client, so fetching remote
     /// images can't be tied to the user's IP.
     pub async fn http_get_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let _permit = RPC_SEM.acquire().await; // global Tor concurrency cap
         let resp = self
             .http
             .get(url)
@@ -123,6 +134,7 @@ impl RpcProvider {
     }
 
     pub async fn http_get_json(&self, url: &str) -> Result<Value> {
+        let _permit = RPC_SEM.acquire().await; // global Tor concurrency cap
         let resp = self
             .http
             .get(url)
@@ -140,6 +152,7 @@ impl RpcProvider {
     /// returned even for non-2xx statuses so callers (e.g. the CoW order-book API) can read the
     /// structured error object.
     pub async fn http_post_json(&self, url: &str, body: &Value) -> Result<Value> {
+        let _permit = RPC_SEM.acquire().await; // global Tor concurrency cap
         let resp = self
             .http
             .post(url)
@@ -179,6 +192,7 @@ impl RpcProvider {
     }
 
     async fn try_call(&self, url: &str, body: &Value) -> Result<Value> {
+        let _permit = RPC_SEM.acquire().await; // global Tor concurrency cap
         let resp = self
             .http
             .post(url)
@@ -228,6 +242,7 @@ impl RpcProvider {
     }
 
     async fn try_call_batch(&self, url: &str, body: &Value, n: usize) -> Result<Vec<Value>> {
+        let _permit = RPC_SEM.acquire().await; // global Tor concurrency cap
         let resp = self
             .http
             .post(url)

@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Download &mdash; Aero</title>
+<meta name="description" content="Download Aero, the free Tor-routed Ethereum wallet. Windows portable build with SHA-256 verification.">
+<link rel="canonical" href="https://aero.free/download">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Aero">
+<meta property="og:title" content="Download &mdash; Aero">
+<meta property="og:description" content="Download Aero, the free, Tor-routed Ethereum &amp; ERC-20 desktop wallet.">
+<meta property="og:url" content="https://aero.free/download">
+<meta property="og:image" content="https://aero.free/assets/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Aero logo">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Download &mdash; Aero">
+<meta name="twitter:description" content="Download Aero, the free, Tor-routed Ethereum &amp; ERC-20 desktop wallet.">
+<meta name="twitter:image" content="https://aero.free/assets/og.png">
+<meta name="theme-color" content="#f4f0e6">
+<link rel="icon" href="assets/favicon.ico">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <div class="masthead">
+      <img src="assets/aero.png" alt="Aero logo">
+      <h1>Aero</h1>
+    </div>
+    <p class="tagline">A free, Tor-routed Ethereum &amp; ERC-20 desktop wallet.</p>
+    <nav class="links">
+      <a href="/">Home</a><span class="sep">|</span>
+      <strong>Download</strong><span class="sep">|</span>
+      <a href="/screenshots">Screenshots</a><span class="sep">|</span>
+      <a href="/faq">FAQ</a><span class="sep">|</span>
+      <a href="https://github.com/Aero-Developer/aero">Source</a>
+    </nav>
+  </header>
+
+  <hr>
+
+  <h2>Download Aero <code>v0.1.3</code></h2>
+
+  <p>
+    <a class="download" href="https://github.com/Aero-Developer/aero/">Download on GitHub</a>
+  </p>
+  <p class="muted">All builds, checksums and release notes are published on GitHub. Grab the latest
+    Windows portable archive from the releases there.</p>
+
+  <h3>Windows (64-bit)</h3>
+  <p class="muted">Portable &mdash; nothing is installed. Extract the archive anywhere and run
+    <code>aero_gui.exe</code> (or <code>run.bat</code>). The bundled Tor client starts
+    automatically; your encrypted wallet is created in a <code>wallets</code> folder next to
+    the program.</p>
+
+  <hr>
+
+  <h2>Verify your download</h2>
+  <p>Always check the archive's hash before running it.</p>
+  <p>SHA-256:</p>
+  <pre><code>32c739cd27de8ab66f1f4a97d4f3970ac9577bbd5736935393db027264e9f40c  Aero-Windows-x64-portable.zip</code></pre>
+  <p>On Windows (PowerShell):</p>
+  <pre><code>Get-FileHash .\Aero-Windows-x64-portable.zip -Algorithm SHA256</code></pre>
+  <p class="muted">The printed hash must match the value above. A
+    <a href="https://github.com/Aero-Developer/aero/releases/download/v0.1.3/SHA256SUMS.txt">SHA256SUMS.txt</a>
+    is attached to the release as well.</p>
+
+  <hr>
+
+  <h2>Linux &amp; macOS</h2>
+  <p>
+    Linux and macOS builds are produced on CI and will be attached to a future release.
+    In the meantime you can build from source &mdash; see the
+    <a href="https://github.com/Aero-Developer/aero#building">build instructions</a>.
+  </p>
+
+  <hr>
+
+  <h2>All releases</h2>
+  <p>
+    Older versions, checksums and release notes live on the
+    <a href="https://github.com/Aero-Developer/aero/releases">GitHub releases page</a>.
+  </p>
+
+  <hr>
+
+  <footer>
+    <p>
+      <a href="https://github.com/Aero-Developer/aero">GitHub</a>
+      &middot; <a href="https://github.com/Aero-Developer/aero/releases">Releases</a>
+      &middot; BSD-3-Clause
+    </p>
+  </footer>
+
+</div>
+</body>
+</html>

@@ -11,6 +11,9 @@
 #ifndef AERO_WALLET_H
 #define AERO_WALLET_H
 
+#include <QAtomicInt>
+#include <QHash>
+#include <QMutex>
 #include <QObject>
 #include <QReadWriteLock>
 #include <QString>
@@ -103,6 +106,10 @@ public:
     QString address(quint32 index) const;
     quint32 numAccounts() const;
     quint32 addAccount();
+    // Async variant: derives the next HD account off the UI thread and emits accountAdded(index).
+    // Used by "Create new address" so it can't freeze the UI while the funded scan holds the core
+    // lock exclusively (the write would otherwise block on the UI thread for the whole scan).
+    void addAccountAsync();
     // Import a raw hex private key as a new account; returns its index (or 0xFFFFFFFF on error).
     quint32 importPrivateKey(const QString &hexKey);
 
@@ -134,7 +141,13 @@ public:
     bool hasPassword() const { return !m_password.isEmpty(); }
     bool passwordMatches(const QString &pw) const { return pw == m_password; }
     // Re-save the wallet to its known path with its retained password. No-op if no path is set.
+    // Synchronous (blocks the caller with the full Argon2id encrypt + fsync). Prefer saveAsync()
+    // on the UI thread; use this only where blocking is acceptable (e.g. flush on app close).
     bool save();
+    // Non-blocking save: runs the (slow) encrypt + atomic write on the bounded net pool and emits
+    // saved(ok) on the UI thread. Saves are serialized so two encrypt/atomic-writes never overlap;
+    // a request made while one is in flight coalesces into a single follow-up save.
+    void saveAsync();
 
     // ##### Networking #####
     // endpoints: list of RPC URLs; socksProxy e.g. "socks5h://127.0.0.1:9050" ("" disables Tor).
@@ -162,14 +175,23 @@ public:
     // Async: reconstruct ERC20 transfer history from logs; emits historyRefreshed().
     void refreshHistory(quint32 accountIndex, const QString &fromBlock = QStringLiteral("earliest"));
 
-    // Async: merged history across accounts [0, numAccounts); emits historyRefreshed() once.
-    void refreshHistoryAll(quint32 numAccounts);
+    // Async: history across accounts [0, numAccounts), fetched with bounded parallelism. Emits one
+    // historyBatch(items, done, total) per account as it completes. `priorityIndex` (the currently
+    // selected account) is fetched first so its rows appear near-instantly.
+    void refreshHistoryAll(quint32 numAccounts, quint32 priorityIndex = 0);
 
     // Async: gap-limit scan of HD addresses (current chain); emits fundedScanned().
     void scanFunded(quint32 gapLimit = 20);
     // Async: gap-limit scan across MULTIPLE chains. `configsJson` is a JSON array of
     // {"chain_id","endpoints":[...],"socks"}. Finds addresses funded on any chain. Emits fundedScanned().
     void scanFundedMulti(const QString &configsJson, quint32 gapLimit = 20);
+    // Live progress of an in-flight scan (lock-free reads of core atomics): addresses checked / found.
+    quint64 scanProgress() const;
+    quint64 scanFound() const;
+    // Derive addresses 0..count-1 off the UI thread to warm the address cache, then emit
+    // addressesWarmed(). Lets a big post-scan rebuildAccountCombos read from a hot cache instead of
+    // doing hundreds of synchronous key derivations on the UI thread.
+    void warmAddresses(quint32 count);
 
     // Async: query a token's deepest DEX pool liquidity (USD) via DexScreener over Tor; emits
     // tokenLiquidity(). Used to auto-trust unknown-but-liquid tokens in History.
@@ -205,6 +227,12 @@ public:
     // Opaque JSON blob owned by the UI. Read once on open; setMetadata()+save() persists it.
     QString metadata() const;
     void setMetadata(const QString &json);
+    // Queue metadata to be applied to the core off the UI thread (by the next saveAsync). This never
+    // takes the core lock on the UI thread, so editing a label can't freeze the UI while the funded
+    // scan holds the core lock exclusively. flushPendingMetadata() applies it synchronously (used by
+    // the blocking save on close).
+    void queueMetadata(const QString &json);
+    void flushPendingMetadata();
 
     // ##### Tokens (Assets panel) #####
     void addToken(const TokenInfo &t);
@@ -300,6 +328,7 @@ public:
 
 signals:
     void updated();
+    void saved(bool ok); // emitted on the UI thread after an async save completes
     void refreshed(bool success, const QString &message);
     void balanceUpdated(const BalanceInfo &eth, const QVector<BalanceInfo> &tokens);
     void transactionCreated(const PendingEthTx &tx);
@@ -315,7 +344,17 @@ signals:
     // Emitted when sendMany() finishes: `resultJson` is an array of {to, tx_hash|error}.
     void manySent(const QString &resultJson, const QString &error);
     void historyRefreshed(const QVector<HistoryItem> &items);
+    // Emitted (synchronously, on the caller/UI thread) at the very start of an all-account refresh,
+    // before any batch is dispatched — the UI clears the model + resets dedup here. This must NOT be
+    // driven off "done==1", because with parallel per-account fetches batches complete out of order
+    // and a later batch could be delivered first.
+    void historyRefreshStarted();
+    // Incremental all-account history: one batch per account (delivered as each completes, so in
+    // arbitrary order). `done`/`total` drive the progress indicator; done==total is the end.
+    void historyBatch(const QVector<HistoryItem> &items, quint32 done, quint32 total);
+    void addressesWarmed(); // emitted after warmAddresses() finishes populating the address cache
     void fundedScanned(const QList<quint32> &indices);
+    void accountAdded(quint32 index); // a new HD account was derived (addAccountAsync)
     void tokenLiquidity(const QString &tokenAddress, double usd);
     void historicalPriceReady(const QString &symbol, const QString &date, double usd);
     void nftsRefreshed(const QVector<NftCollection> &items);
@@ -379,6 +418,40 @@ private:
     // arrive in stuttering waves. A modest bound lets the essentials run together and queues the
     // rest right behind them.
     QThreadPool m_netPool;
+
+    // Serialize async saves: only one encrypt/atomic-write runs at a time; a request arriving while
+    // one is in flight sets m_saveQueued so exactly one follow-up save runs afterwards (coalescing a
+    // burst of edits into a single write).
+    QAtomicInt m_saveRunning{0};
+    QAtomicInt m_saveQueued{0};
+
+    // Derived-address cache (index -> checksummed address). Deriving an address re-runs BIP32 HD
+    // derivation under the core lock; with ~230 accounts, rebuildAccountCombos would derive hundreds
+    // of times on the UI thread and stutter. Cache them (addresses are chain-independent). Cleared
+    // whenever the account set/order changes (add account, import key, funded scan).
+    mutable QHash<quint32, QString> m_addrCache;
+    mutable QMutex m_addrCacheMutex;
+    void invalidateAddressCache();
+
+    // Caches for the two other hot, UI-thread getters (account count + tracked tokens). The funded
+    // scan holds an EXCLUSIVE core lock for its whole (multi-minute, Tor-bound) run; without these,
+    // any tokens()/numAccounts() call on the UI thread during the scan would block on that lock and
+    // freeze the app ("not responding"). Populated before the scan, invalidated on mutation.
+    mutable QMutex m_metaCacheMutex;
+    mutable int m_numAccountsCache = -1;         // -1 = unknown
+    mutable QVector<TokenInfo> m_tokensCache;
+    mutable bool m_tokensCacheValid = false;
+    mutable int m_watchOnlyCache = -1;           // -1 = unknown (immutable once computed)
+    // Bumped on every invalidation. A getter reads it before the (unlocked) core read and only stores
+    // the result if it hasn't changed since — so a mutation that races an in-flight read can never
+    // poison the cache with a stale value (the read simply isn't cached and re-runs next call).
+    mutable quint64 m_metaGen = 0;
+    void invalidateMetaCache(); // clears the account-count + tokens caches
+
+    // Metadata queued from the UI thread (lock-free); applied to the core off-thread by saveAsync.
+    QMutex m_pendingMetaMutex;
+    QString m_pendingMetadata;
+    bool m_hasPendingMetadata = false;
 };
 
 Q_DECLARE_METATYPE(BalanceInfo)

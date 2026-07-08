@@ -78,6 +78,7 @@ private slots:
     void onRefresh();
     void onAccountChanged(int index);
     void onCreateAddress();
+    void onAccountAdded(quint32 index); // completes onCreateAddress once derivation finishes
     void onImportKey();
     void onAddressContextMenu(const QPoint &pos);
     void onSendClicked();
@@ -121,12 +122,17 @@ private:
     void rebuildAccountCombos();
     void refreshAllBalances();
     void recomputeHomeTotal();
+    void scheduleHomeRecompute();     // debounced recompute (coalesces bulk balance updates)
+    void refreshUsedFlags();          // recompute all rows' red/used flags in one pass
+    void startScanProgress();         // poll live funded-scan progress into the status bar
     void notify(const QString &title, const QString &body);
-    void updateUsed(quint32 index);   // mark an address red if it holds funds / has transacted
     void loadLabels();                // restore persisted address labels for the open wallet
     // Per-wallet metadata (labels/contacts/notes/funded) lives encrypted inside the wallet file.
     void loadMetadata();              // parse m_wallet->metadata() (+ migrate legacy) and apply to UI
-    void saveMetadata();              // serialize m_meta into the wallet and persist (encrypted)
+    void saveMetadata();              // serialize m_meta into the wallet, then persist (debounced)
+    void saveBalanceCache();          // stash the current chain's balances in metadata (for instant reopen)
+    void loadBalanceCache();          // show last-known balances instantly, before the Tor refresh
+    void scheduleSave();              // debounced, off-thread wallet save (never blocks the UI)
     void migrateLegacyMetadata();     // one-time import from the old plaintext QSettings
     void showCachedBalance(quint32 index); // instant status-bar balance from cache
     void showTransactionDialog(const HistoryItem &tx); // Feather-style tx details (txid + copy)
@@ -284,13 +290,21 @@ private:
 
     QTimer *m_refreshTimer = nullptr;
     QTimer *m_blockTimer = nullptr;            // polls the chain head for new blocks
+    QTimer *m_saveTimer = nullptr;             // debounces wallet saves (coalesces rapid edits)
+    qint64 m_lastBalCacheSaveMs = 0;           // throttles persisting the balance cache (Argon2 cost)
+    bool m_balancesFromCache = false;          // suppress "payment received" on the 1st refresh after
+                                               // loading stale cached balances (not a live change)
+    QTimer *m_homeTotalTimer = nullptr;        // debounces home-total + used-flag recompute
+    QTimer *m_scanProgressTimer = nullptr;     // polls live funded-scan progress into the status bar
     quint64 m_lastBlock = 0;                   // last seen block height
     QSystemTrayIcon *m_tray = nullptr;         // desktop notifications (received / sent)
     TorManager *m_tor = nullptr;               // bundled Tor process supervisor
     HistoryModel *m_historyModel = nullptr;
-    QSortFilterProxyModel *m_historyProxy = nullptr; // enables header-click sort (date / amount)
     QComboBox *m_historyCombo = nullptr;       // History filter: All / a specific account
     int m_historyFilter = -1;                  // -1 = All accounts, else account index
+    QToolButton *m_historyPrev = nullptr;      // pagination: previous 500-row page
+    QToolButton *m_historyNext = nullptr;      // pagination: next 500-row page
+    QLabel *m_historyPageLabel = nullptr;      // "Page X of Y (N transactions)"
     QAction *m_hideSpamAction = nullptr;       // History menu toggle (kept in sync with Settings)
     AddressModel *m_addressModel = nullptr;    // Receive: the address list
     QWidget *m_nftTab = nullptr;               // NFTs tab
@@ -358,8 +372,10 @@ private:
     QSet<QString> m_liquidityInFlight;         // checks currently running (avoid duplicates)
     double m_liquidityThresholdUsd = 1000000.0;// auto-trust tokens with pool liquidity above this
     QSet<quint32> m_fundedAccounts;            // HD indices discovered to hold a balance
-    bool m_showFundedOnly = true;              // Receive: show only funded addresses
+    bool m_showFundedOnly = false;             // Receive: show only funded addresses (default off)
     bool m_fundedScanned = false;              // a gap-limit scan has completed/was persisted
+    int m_connMode = 0;                        // last connection mode (0 off, 1 direct, 2 Tor)
+    QString m_connText;                        // last connected status text (to restore after Scanning)
     bool m_fundedScanTried = false;            // guard so auto-scan runs at most once per session
 };
 

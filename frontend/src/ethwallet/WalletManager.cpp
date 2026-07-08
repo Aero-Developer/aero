@@ -2,8 +2,10 @@
 #include "WalletManager.h"
 #include "Wallet.h"
 
+#include <QCoreApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QThread>
 
 #include "aero_core.h"
 
@@ -20,6 +22,21 @@ static QString takeError() {
     return s;
 }
 
+// Create a Wallet and anchor it to the GUI (main) thread. The wizard opens/creates wallets on a
+// worker thread (runBusy → QtConcurrent), so a Wallet born there would have its thread affinity set
+// to that worker thread. Its queued signals — notably providerConnected(), emitted from the network
+// pool via QMetaObject::invokeMethod(this, …, QueuedConnection) — are delivered on the object's
+// thread's event loop, which for a finished worker thread doesn't exist. The result was the UI never
+// leaving "Connecting to Tor…" even though the connect succeeded. Moving it to the main thread (which
+// has the running event loop) makes those signals reach the UI slots.
+static Wallet *anchoredWallet(AeroWallet *core) {
+    Wallet *w = new Wallet(core);
+    QThread *guiThread = QCoreApplication::instance() ? QCoreApplication::instance()->thread() : nullptr;
+    if (guiThread && w->thread() != guiThread)
+        w->moveToThread(guiThread);
+    return w;
+}
+
 Wallet *WalletManager::createWallet(quint32 wordCount, const QString &passphrase) {
     AeroWallet *core = passphrase.isEmpty()
         ? aero_wallet_create_new(wordCount)
@@ -28,7 +45,7 @@ Wallet *WalletManager::createWallet(quint32 wordCount, const QString &passphrase
         m_errorString = takeError();
         return nullptr;
     }
-    return new Wallet(core);
+    return anchoredWallet(core);
 }
 
 Wallet *WalletManager::recoveryWallet(const QString &mnemonic, const QString &passphrase) {
@@ -40,7 +57,7 @@ Wallet *WalletManager::recoveryWallet(const QString &mnemonic, const QString &pa
         m_errorString = takeError();
         return nullptr;
     }
-    return new Wallet(core);
+    return anchoredWallet(core);
 }
 
 Wallet *WalletManager::createWatchOnly(const QStringList &addresses) {
@@ -56,7 +73,7 @@ Wallet *WalletManager::createWatchOnly(const QStringList &addresses) {
         m_errorString = takeError();
         return nullptr;
     }
-    return new Wallet(core);
+    return anchoredWallet(core);
 }
 
 Wallet *WalletManager::openWallet(const QString &path, const QString &password) {
@@ -65,7 +82,7 @@ Wallet *WalletManager::openWallet(const QString &path, const QString &password) 
         m_errorString = takeError();
         return nullptr;
     }
-    Wallet *w = new Wallet(core);
+    Wallet *w = anchoredWallet(core);
     w->setWalletPath(path);
     w->setPassword(password); // retain so later changes can be re-saved
     return w;

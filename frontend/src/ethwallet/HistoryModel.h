@@ -14,6 +14,8 @@
 
 #include "Wallet.h"
 
+class QTimer;
+
 class HistoryModel : public QAbstractTableModel
 {
     Q_OBJECT
@@ -51,13 +53,33 @@ public:
     QVariant data(const QModelIndex &index, int role) const override;
     QVariant headerData(int section, Qt::Orientation orientation, int role) const override;
 
+    // Sort the full result set (not just the current page) by a column; the view drives this via
+    // header clicks. Resets to the first page. Kept in the model (rather than a proxy) so only the
+    // 500-row page window is ever materialised, no matter how large the full history is.
+    void sort(int column, Qt::SortOrder order = Qt::AscendingOrder) override;
+
+    // --- Pagination (500 rows per page) -----------------------------------------------------
+    int pageSize() const { return m_pageSize; }
+    int currentPage() const { return m_page; }               // 0-based
+    int pageCount() const {                                   // >= 1
+        const int total = m_filtered.size();
+        return qMax(1, (total + m_pageSize - 1) / m_pageSize);
+    }
+    int totalRows() const { return m_filtered.size(); }       // rows across ALL pages (post-filter)
+
     // Distinct ERC-20 contract addresses (lower-case) present in history that aren't currently
     // trusted and aren't obvious homoglyph/ETH impersonators — candidates for a liquidity check.
     QStringList untrackedTokenAddresses() const;
 
 public slots:
-    // Connect to Wallet::historyRefreshed.
+    // Connect to Wallet::historyRefreshed (single-account / one-shot path).
     void onHistoryRefreshed(const QVector<HistoryItem> &items);
+
+    // Incremental all-account refresh: clear + reset dedup, then append per-account batches so a
+    // huge multi-account history fills in progressively (each append is a small beginInsertRows,
+    // not a full model reset). The sorting proxy orders rows for display.
+    void beginFullRefresh();
+    void appendBatch(const QVector<HistoryItem> &items);
 
     // Optimistically prepend a locally-broadcast send so it shows immediately.
     void addLocalSend(const QString &txHash, const QString &to, const QString &amountFormatted,
@@ -67,6 +89,12 @@ public slots:
     // router swaps that only reach the explorer once mined). It's reconciled away when the real row
     // (CoW order by uid, or the mined tx) appears in fetched history.
     void addLocalSwap(const HistoryItem &h);
+
+    // Jump to a page (0-based; clamped to a valid range). Only re-slices the already-filtered list.
+    void setPage(int page);
+
+    // Case-insensitive search across the visible columns; filters the full set then paginates.
+    void setSearchText(const QString &text);
 
     // Contract addresses (lower-case) of tokens the user actually tracks. Incoming transfers of any
     // *other* ERC-20 are treated as unsolicited spam/airdrops and hidden.
@@ -90,16 +118,28 @@ public slots:
     // Unit price to value a transfer: the historical price for its date if known, else current.
     double unitPriceFor(const HistoryItem &h) const;
 
+signals:
+    // Emitted after any re-slice so the UI can update its pager (1-based page shown to the user is
+    // page+1). `total` is the post-filter row count across all pages.
+    void pageChanged(int page, int pageCount, int total);
+
 private:
     bool isSpamToken(const HistoryItem &h) const;
     bool isHiddenSpam(const HistoryItem &h) const; // rows removed when m_hideSpam is on
-    void rebuildVisible();                         // recompute m_items from m_allItems
-    void rebuildAll();                             // compose m_allItems = pending swaps + fetched
+    bool matchesSearch(const HistoryItem &h) const;
+    bool lessThan(const HistoryItem &a, const HistoryItem &b) const; // by current sort column
+    void rebuildVisible();      // filter m_allItems -> m_filtered, sort, then re-slice the page
+    void reslice();             // materialise only the current page window into m_items
+    void sortFiltered();        // sort m_filtered by the current column/order
+    void scheduleRebuild();     // debounce rebuildVisible during incremental appendBatch bursts
+    void rebuildAll();          // compose m_allItems = pending swaps + fetched
 
     QVector<HistoryItem> m_fetched;    // last fetched (on-chain + CoW) history
     QVector<HistoryItem> m_localSwaps; // optimistic pending swaps until they appear in m_fetched
     QVector<HistoryItem> m_allItems; // full unfiltered history (+ local sends)
-    QVector<HistoryItem> m_items;    // visible rows (m_allItems minus hidden spam)
+    QSet<QString> m_seen;              // dedup keys for the incremental appendBatch path
+    QVector<HistoryItem> m_filtered;   // full filtered + sorted result (all pages)
+    QVector<HistoryItem> m_items;    // the CURRENT PAGE slice of m_filtered (what the view renders)
     QSet<QString> m_knownTokens;
     bool m_hideSpam = true;
     double m_dustUsd = 0.0;              // hide incoming worth less than this many USD (0 = off)
@@ -107,6 +147,13 @@ private:
     QHash<QString, double> m_histUnitPrice; // "SYMBOL|YYYY-MM-DD" -> USD, historical valuation
     double m_fiatRate = 1.0;             // USD -> display fiat multiplier for the Value column
     QString m_fiatSymbol = QStringLiteral("$");
+
+    int m_pageSize = 500;                        // rows per page
+    int m_page = 0;                              // current 0-based page
+    QString m_search;                            // lower-case search text ("" = no filter)
+    int m_sortColumn = Column_Date;              // default sort: newest first
+    Qt::SortOrder m_sortOrder = Qt::DescendingOrder;
+    QTimer *m_coalesceTimer = nullptr;           // coalesces appendBatch bursts into one rebuild
 };
 
 #endif // AERO_HISTORYMODEL_H

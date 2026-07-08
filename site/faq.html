@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FAQ &mdash; Aero</title>
+<meta name="description" content="Frequently asked questions about Aero, the Tor-routed Ethereum wallet: privacy, Tor, key storage, supported chains, swaps and verification.">
+<link rel="canonical" href="https://aero.free/faq">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Aero">
+<meta property="og:title" content="FAQ &mdash; Aero">
+<meta property="og:description" content="Answers about Aero: Tor, privacy, key storage, supported chains, swaps and verification.">
+<meta property="og:url" content="https://aero.free/faq">
+<meta property="og:image" content="https://aero.free/assets/og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Aero logo">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="FAQ &mdash; Aero">
+<meta name="twitter:description" content="Answers about Aero: Tor, privacy, key storage, supported chains, swaps and verification.">
+<meta name="twitter:image" content="https://aero.free/assets/og.png">
+<meta name="theme-color" content="#f4f0e6">
+<link rel="icon" href="assets/favicon.ico">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <div class="masthead">
+      <img src="assets/aero.png" alt="Aero logo">
+      <h1>Aero</h1>
+    </div>
+    <p class="tagline">A free, Tor-routed Ethereum &amp; ERC-20 desktop wallet.</p>
+    <nav class="links">
+      <a href="/">Home</a><span class="sep">|</span>
+      <a href="/download">Download</a><span class="sep">|</span>
+      <a href="/screenshots">Screenshots</a><span class="sep">|</span>
+      <strong>FAQ</strong><span class="sep">|</span>
+      <a href="https://github.com/Aero-Developer/aero">Source</a>
+    </nav>
+  </header>
+
+  <hr>
+
+  <h2>Frequently asked questions</h2>
+
+  <h3>What is Aero?</h3>
+  <p>A free, open-source desktop wallet for Ethereum and ERC-20 tokens. It is small, native and
+    private by default, with an interface modelled on the Monero wallet
+    <a href="https://featherwallet.org/">Feather</a>.</p>
+
+  <h3>Does it really use Tor?</h3>
+  <p>Yes. A Tor client is bundled and launched automatically. Every network request &mdash;
+    JSON-RPC to nodes, block-explorer history, token prices and swap-router APIs &mdash; is sent
+    through it, with DNS resolved through Tor as well. If no proxy is configured, Aero refuses to
+    contact a remote node rather than fall back to a direct connection that would leak your IP.</p>
+
+  <h3>Is there any telemetry, tracking or logging?</h3>
+  <p>No. There is no Aero server, no analytics, no accounts and no crash reporting. The website you
+    are reading loads no scripts, fonts or trackers either.</p>
+
+  <h3>Where are my keys stored?</h3>
+  <p>On your machine, in an encrypted wallet file next to the program. The file is encrypted with
+    Argon2id (key derivation) and AES-256-GCM (authenticated encryption) and written in an opaque
+    binary format. Aero is non-custodial &mdash; your keys never leave your computer.</p>
+
+  <h3>Which networks are supported?</h3>
+  <p>Ethereum, Arbitrum, Base, Optimism, Polygon, BNB Smart Chain, Gnosis and Avalanche. One seed
+    works across all of them; you switch networks from a menu.</p>
+
+  <h3>How do swaps work?</h3>
+  <p>Aero queries several keyless DEX aggregators (CoW Protocol, KyberSwap, Odos, ParaSwap,
+    OpenOcean) over Tor and shows you the quotes so you can pick a route. Every route enforces a
+    minimum output on-chain, so a swap can never execute below your chosen slippage. Token
+    approvals default to the exact amount a swap needs, not an unlimited allowance.</p>
+
+  <h3>Can I use a hardware wallet?</h3>
+  <p>Yes &mdash; Ledger and Trezor are supported. You can also create a watch-only wallet from an
+    address, or build an unsigned transaction on an online machine and sign it on an offline one
+    (air-gapped signing).</p>
+
+  <h3>How do I verify my download?</h3>
+  <p>Every release lists a SHA-256 hash. Compute the hash of the file you downloaded and confirm it
+    matches. On Windows: <code>Get-FileHash .\Aero-Windows-x64-portable.zip -Algorithm SHA256</code>.
+    See the <a href="/download">Download</a> page.</p>
+
+  <h3>Is it safe to run the portable build?</h3>
+  <p>The build is unsigned for now, so Windows SmartScreen may warn you. Verify the SHA-256 hash
+    against the release, and if you prefer, build it yourself from
+    <a href="https://github.com/Aero-Developer/aero">source</a> &mdash; the code is BSD-3-Clause.</p>
+
+  <h3>Where do I get help or report a bug?</h3>
+  <p>Open an issue on <a href="https://github.com/Aero-Developer/aero/issues">GitHub</a>.</p>
+
+  <hr>
+
+  <footer>
+    <p>
+      <a href="https://github.com/Aero-Developer/aero">GitHub</a>
+      &middot; <a href="/download">Download</a>
+      &middot; BSD-3-Clause
+    </p>
+  </footer>
+
+</div>
+</body>
+</html>

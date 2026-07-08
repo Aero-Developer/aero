@@ -22,6 +22,13 @@ use crate::keys::{SeedPhrase, WordCount};
 use crate::keystore::{self, AccountEntry, HwDescriptor, TokenRef, WalletSecrets};
 use crate::provider::{ProviderConfig, RpcProvider};
 
+// ---- Funded-scan live progress -------------------------------------------------------------
+// Bumped by scan_funded so the UI can poll "N addresses checked, M funded" while the (long) scan
+// runs on the runtime thread. Plain atomics (NOT thread-local) because the scan and the UI poll
+// are on different threads. Reset by the FFI entry points before a scan starts.
+pub static SCAN_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SCAN_FOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 // ---- CoW Protocol swap constants + types ---------------------------------------------------
 // Same addresses on every chain CoW is deployed to.
 const COW_SETTLEMENT: &str = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"; // EIP-712 verifyingContract
@@ -781,9 +788,16 @@ impl Wallet {
             .filter_map(|t| parse_address(&t.address).ok())
             .collect();
         let per_addr = 1 + tokens.len(); // 1 eth_getBalance + one balanceOf per token
-        let chunk: u32 = 20;
+        // Size the address chunk so each JSON-RPC batch (per_addr calls per address) stays under the
+        // ~40-call public-RPC cap. A flat 20 addresses overflowed the batch once tokens were tracked
+        // (20 * (1+tokens) calls), and the over-cap calls came back null — which used to be counted
+        // as empty addresses and tripped the gap limit early (the "stopped at ~18" bug).
+        let chunk: u32 = (40 / per_addr).max(1) as u32;
         let hard_cap: u32 = 100_000; // safety bound
         let gap = gap_limit.max(1);
+        // Minimum indices always scanned on the standard BIP44 scheme before the gap can stop us
+        // (covers a deep MetaMask wallet of ~230 accounts with internal unfunded gaps).
+        const SCAN_FLOOR: u32 = 256;
 
         // (scheme index, per-scheme index, full path) of every funded address found.
         let mut found: Vec<(usize, u32, String)> = Vec::new();
@@ -794,8 +808,21 @@ impl Wallet {
                 KeySource::Hardware(_) | KeySource::WatchOnly => unreachable!(),
             };
             let provider = self.provider()?;
+            // The deep 256-index floor is only needed on Ethereum mainnet (where users accumulate
+            // many MetaMask accounts). On L2s/side-chains a fresh wallet is almost always empty, so
+            // there we rely on the plain gap limit instead of scanning 256 indices per scheme.
+            let is_mainnet = provider.chain_id() == 1;
+            // Tracks whether anything at all was found on THIS chain. On non-mainnet chains, if the
+            // standard BIP44 scheme (scheme 0) turns up nothing we skip the rare alternate-derivation
+            // schemes (Ledger Live / legacy) for that chain — they're seldom used on L2s, and any that
+            // are would already be registered from the mainnet scan. This cuts a fresh/empty wallet's
+            // cross-chain scan from thousands of probes to a few hundred.
+            let mut chain_found_any = false;
 
             for (scheme_idx, template) in SCHEMES.iter().enumerate() {
+                if scheme_idx > 0 && !is_mainnet && !chain_found_any {
+                    break; // this non-mainnet chain looks empty on the standard path — stop early
+                }
                 let mut consecutive_empty = 0u32;
                 let mut index: u32 = 0;
 
@@ -827,24 +854,50 @@ impl Wallet {
                             ));
                         }
                     }
-                    let results = provider.call_batch(&calls).await?;
+                    // Run the batch; if it comes back empty/failed (transient Tor/RPC hiccup, or the
+                    // endpoint rejecting the batch) retry once. A failed read must never be mistaken
+                    // for a real zero balance, or it would wrongly advance the gap counter.
+                    let batch_failed =
+                        |r: &[serde_json::Value]| r.is_empty() || r.first().map(|v| v.is_null()).unwrap_or(true);
+                    let mut results = provider.call_batch(&calls).await?;
+                    if batch_failed(&results) {
+                        results = provider.call_batch(&calls).await?;
+                    }
+                    if batch_failed(&results) {
+                        // Endpoint can't service this scheme's batches; stop scanning it rather than
+                        // loop to the hard cap treating every address as unknown.
+                        break 'scheme;
+                    }
 
                     for (p, _) in addrs.iter().enumerate() {
                         let base = p * per_addr;
-                        let mut has_balance = results
-                            .get(base)
-                            .and_then(|v| parse_hex_u256(v).ok())
-                            .map(|wei| wei > U256::ZERO)
-                            .unwrap_or(false);
+                        // Native balance: distinguish a *successful* read from a failed/absent one.
+                        let native = results.get(base).and_then(|v| parse_hex_u256(v).ok());
+                        let native_ok = native.is_some();
+                        let mut has_balance = native.map(|wei| wei > U256::ZERO).unwrap_or(false);
+                        // Token balances. A missing entry or an explicit JSON `null` means the CALL
+                        // failed (transient/batch issue) -> unknown, must not advance the gap. But a
+                        // concrete return — including an empty `0x` from a revert or from there being
+                        // no such token contract on THIS chain (the tracked list is mainnet tokens, so
+                        // their addresses aren't contracts on L2s) — is a definitive read worth zero.
+                        // Treating that `0x` as "failed" was why non-mainnet scans never advanced the
+                        // gap and ran toward the hard cap.
+                        let mut tokens_ok = true;
                         if !has_balance {
                             for j in 0..tokens.len() {
-                                let bal = results
-                                    .get(base + 1 + j)
-                                    .and_then(|v| hex_bytes(v).ok())
-                                    .and_then(|b| erc20::decode_u256(&b));
-                                if matches!(bal, Some(b) if b > U256::ZERO) {
-                                    has_balance = true;
-                                    break;
+                                match results.get(base + 1 + j) {
+                                    None => tokens_ok = false,
+                                    Some(v) if v.is_null() => tokens_ok = false,
+                                    Some(v) => {
+                                        let bal = hex_bytes(v)
+                                            .ok()
+                                            .and_then(|b| erc20::decode_u256(&b))
+                                            .unwrap_or(U256::ZERO); // `0x`/no-contract => zero
+                                        if bal > U256::ZERO {
+                                            has_balance = true;
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -852,41 +905,240 @@ impl Wallet {
                         let (i, path) = paths[p].clone();
                         if has_balance {
                             found.push((scheme_idx, i, path));
+                            SCAN_FOUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             consecutive_empty = 0;
-                        } else {
+                            chain_found_any = true;
+                        } else if native_ok && tokens_ok {
+                            // Genuinely empty: every read succeeded and was zero.
                             consecutive_empty += 1;
-                            if consecutive_empty >= gap {
+                            // Depth floor for the standard BIP44 scheme (scheme 0, e.g. MetaMask):
+                            // always scan at least SCAN_FLOOR indices before the gap can stop us, so a
+                            // wallet with many accounts and internal empty runs (> gap) — e.g. ~230
+                            // MetaMask accounts where some middle ones are unfunded — is fully found
+                            // rather than truncated. Other schemes rarely go deep, so they keep the
+                            // plain gap limit.
+                            if consecutive_empty >= gap
+                                && (scheme_idx != 0 || !is_mainnet || i + 1 >= SCAN_FLOOR)
+                            {
                                 break 'scheme;
                             }
                         }
+                        // else: a read failed (null) -> unknown; do NOT advance the gap counter.
                     }
+                    SCAN_CHECKED.fetch_add((end - start) as u64, std::sync::atomic::Ordering::Relaxed);
                     index = end;
                 }
             }
         }
 
-        // Register every funded address as an account (deduped), returning their unified indices so
-        // the UI can show them. Scheme 0 keeps the compact `Hd(index)` form.
+        Ok(self.register_found(&found))
+    }
+
+    /// Register scanned funded derivation paths as accounts (deduped) and return their unified
+    /// positions in `account_order` so the UI can mark them. Scheme 0 keeps the compact `Hd(index)`
+    /// form; other schemes store the explicit path. Shared by the single-chain and all-chains scans.
+    fn register_found(&mut self, found: &[(usize, u32, String)]) -> Vec<u32> {
+        for (scheme_idx, i, path) in found {
+            let entry = if *scheme_idx == 0 {
+                AccountEntry::Hd(*i)
+            } else {
+                AccountEntry::HdPath(path.clone())
+            };
+            if !self.secrets.account_order.iter().any(|e| *e == entry) {
+                if let AccountEntry::Hd(idx) = &entry {
+                    self.secrets.account_count = self.secrets.account_count.max(idx + 1);
+                }
+                self.secrets.account_order.push(entry);
+            }
+        }
+
+        // Make the standard-scheme accounts contiguous (0..=max) and in order, so the Receive tab
+        // lists every account — funded ones AND the unfunded gaps between them — as one continuous
+        // 0,1,2,... run instead of only the funded indices. Done only when the wallet is purely HD
+        // (no imported keys / alternate-scheme accounts, whose unified positions and user labels we
+        // must not move); pre-existing Hd(0..n) keep their positions, so labels stay aligned. This
+        // targets the fresh-seed-import case.
+        let max_hd = self
+            .secrets
+            .account_order
+            .iter()
+            .filter_map(|e| if let AccountEntry::Hd(i) = e { Some(*i) } else { None })
+            .max();
+        let only_hd = self
+            .secrets
+            .account_order
+            .iter()
+            .all(|e| matches!(e, AccountEntry::Hd(_)));
+        if let (Some(max_hd), true) = (max_hd, only_hd) {
+            let mut order = Vec::with_capacity(max_hd as usize + 1);
+            for i in 0..=max_hd {
+                order.push(AccountEntry::Hd(i));
+            }
+            self.secrets.account_order = order;
+            self.secrets.account_count = max_hd + 1;
+        }
+
+        // Return the unified positions (into the final account_order) of the funded addresses. With
+        // the contiguous fill above, a scheme-0 funded index == its position.
         let mut out = Vec::with_capacity(found.len());
         for (scheme_idx, i, path) in found {
-            let entry = if scheme_idx == 0 {
-                AccountEntry::Hd(i)
+            let entry = if *scheme_idx == 0 {
+                AccountEntry::Hd(*i)
             } else {
-                AccountEntry::HdPath(path)
+                AccountEntry::HdPath(path.clone())
             };
-            let uni = match self.secrets.account_order.iter().position(|e| *e == entry) {
-                Some(pos) => pos as u32,
-                None => {
-                    if let AccountEntry::Hd(idx) = &entry {
-                        self.secrets.account_count = self.secrets.account_count.max(idx + 1);
-                    }
-                    self.secrets.account_order.push(entry);
-                    (self.secrets.account_order.len() - 1) as u32
-                }
-            };
-            out.push(uni);
+            if let Some(pos) = self.secrets.account_order.iter().position(|e| *e == entry) {
+                out.push(pos as u32);
+            }
         }
-        Ok(out)
+        out
+    }
+
+    /// Scan ONE chain (via the given provider) for funded derivation paths, WITHOUT mutating the
+    /// wallet — so several chains can be scanned concurrently (see `scan_funded_all_chains`). Returns
+    /// the funded `(scheme_idx, per-scheme index, path)` tuples; the caller registers them. Chunks
+    /// within each scheme are fetched with a small concurrent look-ahead window (`buffered`) instead
+    /// of one-at-a-time, and the global RPC semaphore keeps total Tor concurrency bounded.
+    async fn scan_chain_paths(
+        &self,
+        provider: &RpcProvider,
+        gap_limit: u32,
+    ) -> Vec<(usize, u32, String)> {
+        use futures::stream::StreamExt;
+        const SCHEMES: [&str; 4] = [
+            "m/44'/60'/0'/0/{i}", // BIP44: MetaMask, Trezor, Trust, imToken, Coinbase Wallet, ...
+            "m/44'/60'/{i}'/0/0", // Ledger Live
+            "m/44'/60'/0'/{i}",   // Ledger legacy / MyEtherWallet / MyCrypto
+            "m/44'/60'/0'/0'/{i}",// some older/hardened variants
+        ];
+        const SCAN_FLOOR: u32 = 256; // min BIP44 indices scanned on mainnet before the gap can stop
+        const WINDOW: usize = 4;     // chunks in flight per scheme (globally capped by RPC_SEM)
+
+        let seed = match &self.keys {
+            KeySource::Software(s) => s,
+            KeySource::Hardware(_) | KeySource::WatchOnly => return Vec::new(),
+        };
+        let tokens: Vec<Address> = self
+            .secrets
+            .tokens
+            .iter()
+            .filter_map(|t| parse_address(&t.address).ok())
+            .collect();
+        let per_addr = 1 + tokens.len(); // 1 eth_getBalance + one balanceOf per token
+        // Address chunk sized to the per-request call budget. With no tracked tokens the batch is
+        // just eth_getBalance calls, which public RPCs happily serve in larger batches, so use a
+        // bigger budget (fewer round-trips); with tokens tracked, stay under the conservative ~40
+        // call cap (over-cap calls come back null and would trip the gap logic).
+        let budget = if per_addr == 1 { 100 } else { 40 };
+        let chunk: u32 = (budget / per_addr).max(1) as u32;
+        let hard_cap: u32 = 100_000;
+        let gap = gap_limit.max(1);
+        let is_mainnet = provider.chain_id() == 1;
+
+        let batch_failed =
+            |r: &[serde_json::Value]| r.is_empty() || r.first().map(|v| v.is_null()).unwrap_or(true);
+
+        let mut found: Vec<(usize, u32, String)> = Vec::new();
+        let mut chain_found_any = false;
+
+        for (scheme_idx, template) in SCHEMES.iter().enumerate() {
+            // On non-mainnet chains, if the standard path found nothing, skip the rare alt schemes.
+            if scheme_idx > 0 && !is_mainnet && !chain_found_any {
+                break;
+            }
+
+            let ranges = (0..hard_cap)
+                .step_by(chunk as usize)
+                .map(move |start| (start, (start + chunk).min(hard_cap)));
+            // Fetch balances for a window of chunks concurrently; `buffered` yields them IN ORDER so
+            // the gap-limit logic below still applies sequentially by index.
+            let fetches = futures::stream::iter(ranges)
+                .map(|(start, end)| {
+                    let tokens = &tokens;
+                    async move {
+                        let mut paths: Vec<(u32, String)> = Vec::with_capacity((end - start) as usize);
+                        let mut calls: Vec<(String, serde_json::Value)> =
+                            Vec::with_capacity(((end - start) as usize) * per_addr);
+                        for i in start..end {
+                            let path = template.replace("{i}", &i.to_string());
+                            let addr = match seed.signer_at_path(&path) {
+                                Ok(s) => s.address(),
+                                Err(_) => return (start, end, paths, Vec::new(), true),
+                            };
+                            calls.push((
+                                "eth_getBalance".to_string(),
+                                serde_json::json!([addr.to_string(), "latest"]),
+                            ));
+                            for t in tokens {
+                                let data = format!("0x{}", hex::encode(erc20::encode_balance_of(addr)));
+                                calls.push((
+                                    "eth_call".to_string(),
+                                    serde_json::json!([{ "to": t.to_string(), "data": data }, "latest"]),
+                                ));
+                            }
+                            paths.push((i, path));
+                        }
+                        // Retry once on a failed/empty batch (a failed read must not count as zero).
+                        let mut results = provider.call_batch(&calls).await.unwrap_or_default();
+                        if batch_failed(&results) {
+                            results = provider.call_batch(&calls).await.unwrap_or_default();
+                        }
+                        let failed = batch_failed(&results);
+                        (start, end, paths, results, failed)
+                    }
+                })
+                .buffered(WINDOW);
+            futures::pin_mut!(fetches);
+
+            let mut consecutive_empty = 0u32;
+            'scheme: while let Some((start, end, paths, results, failed)) = fetches.next().await {
+                if failed {
+                    break 'scheme; // endpoint can't service this scheme's batches
+                }
+                SCAN_CHECKED.fetch_add((end - start) as u64, std::sync::atomic::Ordering::Relaxed);
+                for (p, (i, path)) in paths.iter().enumerate() {
+                    let base = p * per_addr;
+                    let native = results.get(base).and_then(|v| parse_hex_u256(v).ok());
+                    let native_ok = native.is_some();
+                    let mut has_balance = native.map(|wei| wei > U256::ZERO).unwrap_or(false);
+                    let mut tokens_ok = true;
+                    if !has_balance {
+                        for j in 0..tokens.len() {
+                            match results.get(base + 1 + j) {
+                                None => tokens_ok = false,
+                                Some(v) if v.is_null() => tokens_ok = false,
+                                Some(v) => {
+                                    let bal = hex_bytes(v)
+                                        .ok()
+                                        .and_then(|b| erc20::decode_u256(&b))
+                                        .unwrap_or(U256::ZERO); // `0x`/no-contract => zero
+                                    if bal > U256::ZERO {
+                                        has_balance = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if has_balance {
+                        found.push((scheme_idx, *i, path.clone()));
+                        SCAN_FOUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        consecutive_empty = 0;
+                        chain_found_any = true;
+                    } else if native_ok && tokens_ok {
+                        consecutive_empty += 1;
+                        if consecutive_empty >= gap
+                            && (scheme_idx != 0 || !is_mainnet || i + 1 >= SCAN_FLOOR)
+                        {
+                            break 'scheme; // dropping `fetches` cancels the look-ahead chunks
+                        }
+                    }
+                    // else: a read failed (null) -> unknown; do NOT advance the gap counter.
+                }
+            }
+        }
+
+        found
     }
 
     /// Scan for funded addresses across MULTIPLE chains. EVM chains share the same addresses, so an
@@ -901,22 +1153,37 @@ impl Wallet {
         if matches!(self.keys, KeySource::Hardware(_) | KeySource::WatchOnly) {
             return Ok(Vec::new());
         }
-        let original = self.provider_cfg.clone();
-        let mut found: Vec<u32> = Vec::new();
-        for cfg in configs {
-            if cfg.endpoints.is_empty() || self.set_provider(cfg).is_err() {
-                continue;
-            }
-            if let Ok(mut v) = self.scan_funded(gap_limit).await {
-                found.append(&mut v); // one unreachable chain shouldn't abort the whole scan
+        // Build a dedicated provider per chain and scan them ALL CONCURRENTLY (join_all), rather than
+        // swapping the wallet's provider and scanning chains one after another. `scan_chain_paths` is
+        // &self (read-only), so concurrent borrows are fine; the global RPC semaphore keeps total Tor
+        // requests bounded. The wallet's own provider is left untouched (no set_provider swaps), so
+        // there's nothing to restore. Registration happens once, after all chains finish.
+        let providers: Vec<RpcProvider> = configs
+            .into_iter()
+            .filter(|c| !c.endpoints.is_empty())
+            .filter_map(|c| RpcProvider::new(&c).ok())
+            .collect();
+
+        let per_chain =
+            futures::future::join_all(providers.iter().map(|p| self.scan_chain_paths(p, gap_limit)))
+                .await;
+
+        // Merge funded paths across chains, deduped by (scheme, path) — the same address is funded on
+        // multiple chains, but should register as one account.
+        let mut found: Vec<(usize, u32, String)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for chain in per_chain {
+            for f in chain {
+                if seen.insert((f.0, f.2.clone())) {
+                    found.push(f);
+                }
             }
         }
-        if !original.endpoints.is_empty() {
-            let _ = self.set_provider(original); // back to the chain the UI is showing
-        }
-        found.sort_unstable();
-        found.dedup();
-        Ok(found)
+
+        let mut indices = self.register_found(&found);
+        indices.sort_unstable();
+        indices.dedup();
+        Ok(indices)
     }
 
     /// ETH/USD price read on-chain from the Chainlink mainnet aggregator via `eth_call`
@@ -2269,9 +2536,18 @@ impl Wallet {
 
         let mut items: Vec<HistoryItem> = Vec::new();
 
+        // Fetch the three explorer lists CONCURRENTLY (they're independent) instead of one after
+        // another — cuts an account's history latency to roughly that of a single list. Bounded by
+        // the global RPC semaphore so the fan-out never floods Tor.
+        let (txlist, tokentx, internal) = tokio::join!(
+            fetch_all_pages(provider, base, "txlist", &owner),
+            fetch_all_pages(provider, base, "tokentx", &owner),
+            fetch_all_pages(provider, base, "txlistinternal", &owner),
+        );
+
         // Native ETH transactions — ALL pages, so an old wallet's early history (e.g. 2021) isn't
         // truncated to the most recent 100.
-        for r in fetch_all_pages(provider, base, "txlist", &owner).await {
+        for r in txlist {
             let s = |k: &str| r.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
             let to = s("to").to_lowercase();
             let dir = if to == owner { "in" } else { "out" };
@@ -2295,7 +2571,7 @@ impl Wallet {
         }
 
         // ERC20 token transfers — ALL pages.
-        for r in fetch_all_pages(provider, base, "tokentx", &owner).await {
+        for r in tokentx {
             let s = |k: &str| r.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
             let to = s("to").to_lowercase();
             let dir = if to == owner { "in" } else { "out" };
@@ -2322,7 +2598,7 @@ impl Wallet {
         // unwrap, a refund, etc. Without them a token->native swap looks like a one-sided "Sent"
         // (the native the user got back arrives by an internal tx, not the external tx list). Only
         // inbound value is added; native the owner *sends* is already in the external tx list above.
-        for r in fetch_all_pages(provider, base, "txlistinternal", &owner).await {
+        for r in internal {
             let s = |k: &str| r.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
             if s("to").to_lowercase() != owner {
                 continue; // only native received via a contract

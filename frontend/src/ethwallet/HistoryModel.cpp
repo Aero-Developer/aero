@@ -8,6 +8,7 @@
 #include <QDateTime>
 #include <QFileInfo>
 #include <QIcon>
+#include <QTimer>
 
 // A token symbol is an impersonation if it isn't plain ASCII. Scam tokens use Cyrillic/Greek
 // look-alikes (e.g. "ЕТН"/"ΕΤΗ" for "ETH") to dodge naive symbol checks and fool the eye; every
@@ -82,18 +83,137 @@ bool HistoryModel::isSuspicious(int row) const {
     return m_items.at(row).failed;
 }
 
-void HistoryModel::rebuildVisible() {
-    beginResetModel();
-    if (!m_hideSpam) {
-        m_items = m_allItems;
-    } else {
-        m_items.clear();
-        m_items.reserve(m_allItems.size());
-        for (const HistoryItem &h : m_allItems)
-            if (!isHiddenSpam(h))
-                m_items.append(h);
+// True if `text` (search box) matches this row on any visible column. m_search is pre-lowercased.
+bool HistoryModel::matchesSearch(const HistoryItem &h) const {
+    if (m_search.isEmpty())
+        return true;
+    if (h.counterparty.toLower().contains(m_search)) return true;
+    if (h.txHash.toLower().contains(m_search)) return true;
+    if (h.symbol.toLower().contains(m_search)) return true;
+    if (h.buySymbol.toLower().contains(m_search)) return true;
+    if (h.formatted.contains(m_search)) return true;
+    if (h.buyFormatted.contains(m_search)) return true;
+    // Direction words as shown in the table.
+    const QString dir = (h.kind == QLatin1String("swap"))
+                            ? QStringLiteral("swap")
+                            : (h.failed ? QStringLiteral("failed")
+                                        : (h.direction == QLatin1String("in") ? QStringLiteral("received")
+                                                                              : QStringLiteral("sent")));
+    if (dir.contains(m_search)) return true;
+    if (h.timestamp) {
+        const QString d = QDateTime::fromSecsSinceEpoch(static_cast<qint64>(h.timestamp))
+                              .toString(QStringLiteral("yyyy-MM-dd HH:mm"));
+        if (d.contains(m_search)) return true;
     }
+    return false;
+}
+
+// Order comparison for the current sort column (ascending sense; sortFiltered flips for descending).
+bool HistoryModel::lessThan(const HistoryItem &a, const HistoryItem &b) const {
+    switch (m_sortColumn) {
+    case Column_Date:
+        return (a.timestamp ? a.timestamp : a.block) < (b.timestamp ? b.timestamp : b.block);
+    case Column_Amount:
+    case Column_Value: {
+        const double ap = unitPriceFor(a);
+        const double bp = unitPriceFor(b);
+        const double av = a.formatted.toDouble() * (ap > 0.0 ? ap : 1.0);
+        const double bv = b.formatted.toDouble() * (bp > 0.0 ? bp : 1.0);
+        return av < bv;
+    }
+    case Column_Direction: {
+        const int ak = a.failed ? 2 : (a.direction == QLatin1String("in") ? 0 : 1);
+        const int bk = b.failed ? 2 : (b.direction == QLatin1String("in") ? 0 : 1);
+        return ak < bk;
+    }
+    case Column_Counterparty:
+        return a.counterparty < b.counterparty;
+    case Column_TxHash:
+        return a.txHash < b.txHash;
+    default:
+        return false;
+    }
+}
+
+void HistoryModel::sortFiltered() {
+    std::stable_sort(m_filtered.begin(), m_filtered.end(),
+                     [this](const HistoryItem &a, const HistoryItem &b) {
+                         return m_sortOrder == Qt::AscendingOrder ? lessThan(a, b) : lessThan(b, a);
+                     });
+}
+
+// Recompute the full filtered + sorted result set, then show only the current page.
+void HistoryModel::rebuildVisible() {
+    m_filtered.clear();
+    m_filtered.reserve(m_allItems.size());
+    for (const HistoryItem &h : m_allItems) {
+        if (m_hideSpam && isHiddenSpam(h))
+            continue;
+        if (!matchesSearch(h))
+            continue;
+        m_filtered.append(h);
+    }
+    sortFiltered();
+    reslice();
+}
+
+// Materialise ONLY the 500-row window for the current page into m_items (what the view renders), so
+// display cost stays constant regardless of how large the full history is.
+void HistoryModel::reslice() {
+    const int total = m_filtered.size();
+    const int pages = qMax(1, (total + m_pageSize - 1) / m_pageSize);
+    m_page = qBound(0, m_page, pages - 1);
+    beginResetModel();
+    m_items.clear();
+    const int start = m_page * m_pageSize;
+    const int end = qMin(total, start + m_pageSize);
+    m_items.reserve(qMax(0, end - start));
+    for (int i = start; i < end; ++i)
+        m_items.append(m_filtered.at(i));
     endResetModel();
+    emit pageChanged(m_page, pages, total);
+}
+
+void HistoryModel::setPage(int page) {
+    if (page == m_page)
+        return;
+    m_page = page;
+    reslice();
+}
+
+void HistoryModel::setSearchText(const QString &text) {
+    const QString t = text.trimmed().toLower();
+    if (t == m_search)
+        return;
+    m_search = t;
+    m_page = 0; // a new filter always starts at the first page
+    rebuildVisible();
+}
+
+void HistoryModel::sort(int column, Qt::SortOrder order) {
+    // No-op when nothing changed — this also breaks the recursion the view would otherwise cause by
+    // re-issuing sort() after each model reset (we own the ordering, there is no proxy).
+    if (column == m_sortColumn && order == m_sortOrder)
+        return;
+    m_sortColumn = column;
+    m_sortOrder = order;
+    m_page = 0;
+    rebuildVisible();
+}
+
+// Coalesce a burst of appendBatch() calls (one per account during an all-account load) into a single
+// filter+sort+re-slice, so we don't re-sort a growing list on every one of hundreds of batches.
+void HistoryModel::scheduleRebuild() {
+    if (!m_coalesceTimer) {
+        m_coalesceTimer = new QTimer(this);
+        m_coalesceTimer->setSingleShot(true);
+        m_coalesceTimer->setInterval(150);
+        connect(m_coalesceTimer, &QTimer::timeout, this, [this]() { rebuildVisible(); });
+    }
+    // Start only if not already pending, so a continuous burst still refreshes ~every 150ms (page 0
+    // fills in visibly) instead of deferring the rebuild until the burst stops.
+    if (!m_coalesceTimer->isActive())
+        m_coalesceTimer->start();
 }
 
 void HistoryModel::setHideSpam(bool hide) {
@@ -294,6 +414,44 @@ QVariant HistoryModel::headerData(int section, Qt::Orientation orientation, int 
 void HistoryModel::onHistoryRefreshed(const QVector<HistoryItem> &items) {
     m_fetched = items;
     rebuildAll();
+}
+
+// Start of an incremental all-account refresh: clear fetched history + dedup, keep any optimistic
+// local swaps on top, and reset to the first page.
+void HistoryModel::beginFullRefresh() {
+    m_fetched.clear();
+    m_seen.clear();
+    // Seed dedup with the pending local swaps (by uid) so their settled copies aren't re-added.
+    for (const HistoryItem &h : m_localSwaps)
+        if (!h.txHash.isEmpty())
+            m_seen.insert(h.txHash.toLower());
+    m_allItems = m_localSwaps;
+    m_page = 0;
+    rebuildVisible(); // filter + sort + slice page 0 (just the pending swaps at this point)
+}
+
+// Append one account's rows (deduped) to the full set, then schedule a debounced filter/sort/slice.
+// Only the current 500-row page is ever materialised, so a huge multi-account history stays smooth.
+void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
+    QVector<HistoryItem> add;
+    add.reserve(items.size());
+    for (const HistoryItem &h : items) {
+        // A settled swap whose pending local copy is already shown: skip (keep the local one).
+        if (h.kind == QLatin1String("swap") && !h.txHash.isEmpty() &&
+            m_seen.contains(h.txHash.toLower()))
+            continue;
+        const QString key = QStringLiteral("%1|%2|%3|%4")
+                                .arg(h.txHash, h.token, h.direction, h.amount);
+        if (m_seen.contains(key))
+            continue;
+        m_seen.insert(key);
+        add.append(h);
+    }
+    if (add.isEmpty())
+        return;
+    m_fetched += add;
+    m_allItems += add;
+    scheduleRebuild();
 }
 
 // Compose the unfiltered list as [optimistic pending swaps] + [fetched history], dropping any

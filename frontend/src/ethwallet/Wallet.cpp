@@ -4,11 +4,13 @@
 #include <algorithm>
 
 #include <QtConcurrent/QtConcurrent>
+#include <QAtomicInt>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QReadLocker>
 #include <QSet>
+#include <QSharedPointer>
 #include <QWriteLocker>
 
 namespace {
@@ -58,18 +60,82 @@ QString Wallet::takeLastError() const {
 }
 
 QString Wallet::address(quint32 index) const {
-    QReadLocker lock(&m_coreLock);
-    return takeString(aero_wallet_address(m_core, index));
+    {
+        QMutexLocker cl(&m_addrCacheMutex);
+        auto it = m_addrCache.constFind(index);
+        if (it != m_addrCache.constEnd())
+            return it.value();
+    }
+    QString addr;
+    {
+        QReadLocker lock(&m_coreLock);
+        addr = takeString(aero_wallet_address(m_core, index));
+    }
+    if (!addr.isEmpty()) {
+        QMutexLocker cl(&m_addrCacheMutex);
+        m_addrCache.insert(index, addr);
+    }
+    return addr;
+}
+
+void Wallet::invalidateAddressCache() {
+    QMutexLocker cl(&m_addrCacheMutex);
+    m_addrCache.clear();
+}
+
+void Wallet::invalidateMetaCache() {
+    QMutexLocker c(&m_metaCacheMutex);
+    ++m_metaGen; // signals any in-flight getter not to cache the value it's about to read
+    m_numAccountsCache = -1;
+    m_tokensCacheValid = false;
+    m_tokensCache.clear();
 }
 
 quint32 Wallet::numAccounts() const {
-    QReadLocker lock(&m_coreLock);
-    return aero_wallet_account_count(m_core);
+    quint64 gen;
+    {
+        QMutexLocker c(&m_metaCacheMutex); // served from cache so UI reads never block on the core
+        if (m_numAccountsCache >= 0)        // lock (e.g. while the funded scan holds it exclusively)
+            return static_cast<quint32>(m_numAccountsCache);
+        gen = m_metaGen;
+    }
+    quint32 n;
+    {
+        QReadLocker lock(&m_coreLock);
+        n = aero_wallet_account_count(m_core);
+    }
+    QMutexLocker c(&m_metaCacheMutex);
+    if (m_metaGen == gen) // no mutation raced us — safe to cache
+        m_numAccountsCache = static_cast<int>(n);
+    return n;
 }
 
 quint32 Wallet::addAccount() {
-    QWriteLocker lock(&m_coreLock); // mutates secrets.account_count
-    return aero_wallet_add_account(m_core);
+    quint32 idx;
+    {
+        QWriteLocker lock(&m_coreLock); // mutates secrets.account_count
+        idx = aero_wallet_add_account(m_core);
+    }
+    invalidateAddressCache();
+    invalidateMetaCache();
+    return idx;
+}
+
+void Wallet::addAccountAsync() {
+    // Run on the GLOBAL pool, not m_netPool: deriving the next account is a quick local op and must
+    // not queue behind the network tasks (e.g. a large history fan-out) sitting in m_netPool — that
+    // would delay the new address. Any core-lock wait happens on this worker thread, never the UI.
+    QtConcurrent::run([this]() {
+        quint32 idx;
+        {
+            QWriteLocker lock(&m_coreLock);
+            idx = aero_wallet_add_account(m_core);
+        }
+        invalidateAddressCache();
+        invalidateMetaCache();
+        QMetaObject::invokeMethod(this, [this, idx]() { emit accountAdded(idx); },
+                                  Qt::QueuedConnection);
+    });
 }
 
 quint32 Wallet::importPrivateKey(const QString &hexKey) {
@@ -79,6 +145,8 @@ quint32 Wallet::importPrivateKey(const QString &hexKey) {
         m_status = Status_Error;
         m_errorString = takeLastError();
     }
+    invalidateAddressCache();
+    invalidateMetaCache();
     return idx;
 }
 
@@ -114,8 +182,19 @@ bool Wallet::isHardware() const {
 }
 
 bool Wallet::isWatchOnly() const {
-    QReadLocker lock(&m_coreLock);
-    return aero_wallet_is_watch_only(m_core) != 0;
+    {
+        QMutexLocker c(&m_metaCacheMutex); // immutable for the wallet's lifetime; cache it so a UI
+        if (m_watchOnlyCache >= 0)          // call during the scan's exclusive lock doesn't block
+            return m_watchOnlyCache != 0;
+    }
+    int wo;
+    {
+        QReadLocker lock(&m_coreLock);
+        wo = aero_wallet_is_watch_only(m_core) != 0 ? 1 : 0;
+    }
+    QMutexLocker c(&m_metaCacheMutex);
+    m_watchOnlyCache = wo;
+    return wo != 0;
 }
 
 QString Wallet::hwKind() const {
@@ -165,6 +244,59 @@ bool Wallet::save() {
     return true;
 }
 
+void Wallet::saveAsync() {
+    if (m_path.isEmpty())
+        return; // nothing to persist (demo/throwaway wallet)
+    // If a save is already running, just mark that another is wanted; the running one will pick it
+    // up when it finishes. This coalesces a burst of edits into a single trailing write and, with
+    // testAndSetOrdered, guarantees only one encrypt/atomic-write is in flight at any time.
+    if (!m_saveRunning.testAndSetOrdered(0, 1)) {
+        m_saveQueued.storeRelease(1);
+        return;
+    }
+    QtConcurrent::run(&m_netPool, [this]() {
+        bool ok = true;
+        do {
+            m_saveQueued.storeRelease(0); // clear before saving so edits during the write re-queue
+            // Apply any UI-queued metadata (labels/contacts/notes) off-thread, so the UI thread never
+            // took the core write lock for it (which would freeze behind the funded scan).
+            {
+                QString meta;
+                bool hasMeta = false;
+                {
+                    QMutexLocker m(&m_pendingMetaMutex);
+                    if (m_hasPendingMetadata) {
+                        meta = m_pendingMetadata;
+                        hasMeta = true;
+                        m_hasPendingMetadata = false;
+                    }
+                }
+                if (hasMeta) {
+                    QWriteLocker lock(&m_coreLock);
+                    aero_wallet_set_metadata(m_core, meta.toUtf8().constData());
+                }
+            }
+            {
+                QReadLocker lock(&m_coreLock);
+                int rc = aero_wallet_save(m_core, m_path.toUtf8().constData(),
+                                          m_password.toUtf8().constData());
+                if (rc != 0) {
+                    m_status = Status_Error;
+                    m_errorString = takeLastError();
+                    ok = false;
+                }
+            }
+            // Loop if another save was requested while this one ran.
+        } while (m_saveQueued.loadAcquire() != 0);
+        m_saveRunning.storeRelease(0);
+        // A request that raced in right as we cleared m_saveRunning would have hit the fast path
+        // above and set m_saveQueued; run one more pass so it isn't lost.
+        if (m_saveQueued.loadAcquire() != 0)
+            saveAsync();
+        QMetaObject::invokeMethod(this, [this, ok]() { emit saved(ok); }, Qt::QueuedConnection);
+    });
+}
+
 bool Wallet::setProvider(quint64 chainId, const QStringList &endpoints, const QString &socksProxy) {
     m_chainId = chainId;
     QJsonArray arr;
@@ -192,16 +324,23 @@ void Wallet::connectProvider(quint64 chainId, const QStringList &endpoints, cons
 
         // Configure the given proxy ("" = direct) then probe connectivity with a real RPC call.
         // A direct connection must explicitly allow clearnet (the core refuses otherwise).
-        // Hold the write lock across set_provider + probe so no read runs against a half-swapped
-        // provider (this is the chain-switch data race).
+        //
+        // set_provider is swapped under a brief EXCLUSIVE write lock (a single fast FFI call), but the
+        // connectivity probe — which can block up to the RPC timeout when Tor is still bootstrapping /
+        // unreachable — runs under a SHARED read lock. Reads on the UI thread (address(), tokens(),
+        // balances) are also shared reads, so they no longer block behind a stuck connect: this was
+        // the "Aero not responding" freeze whenever Tor was slow or down.
         auto tryMode = [&](const QString &proxy) -> bool {
-            QWriteLocker lock(&m_coreLock);
-            const QByteArray p = proxy.toUtf8();
-            int rc = aero_wallet_set_provider(m_core, chainId, endpointsJson.constData(),
-                                               proxy.isEmpty() ? nullptr : p.constData(),
-                                               proxy.isEmpty(), 30);
-            if (rc != 0)
-                return false;
+            {
+                QWriteLocker lock(&m_coreLock);
+                const QByteArray p = proxy.toUtf8();
+                const int rc = aero_wallet_set_provider(m_core, chainId, endpointsJson.constData(),
+                                                        proxy.isEmpty() ? nullptr : p.constData(),
+                                                        proxy.isEmpty(), 20);
+                if (rc != 0)
+                    return false;
+            }
+            QReadLocker lock(&m_coreLock);
             char *probe = aero_wallet_eth_balance(m_core, 0); // null => RPC unreachable
             if (!probe)
                 return false;
@@ -442,34 +581,43 @@ void Wallet::mergeCowOrders(quint32 accountIndex, QVector<HistoryItem> &items) {
     }
 }
 
-void Wallet::refreshHistoryAll(quint32 numAccounts) {
-    QtConcurrent::run(&m_netPool, [this, numAccounts]() {
-        QReadLocker lock(&m_coreLock);
-        QVector<HistoryItem> items;
-        QSet<QString> seen;
-        for (quint32 a = 0; a < numAccounts; ++a) {
-            char *j = aero_wallet_account_history(m_core, a);
-            if (!j)
-                continue;
+void Wallet::refreshHistoryAll(quint32 numAccounts, quint32 priorityIndex) {
+    if (numAccounts == 0) numAccounts = 1;
+    // Called on the UI thread: emit the start signal SYNCHRONOUSLY so the model is cleared + dedup
+    // reset before any (out-of-order) batch can arrive. Then fan out the per-account fetches.
+    emit historyRefreshStarted();
+    // Fetch accounts with bounded parallelism (m_netPool caps concurrent tasks; the global RPC
+    // semaphore caps concurrent Tor requests) instead of one-at-a-time. Order the work so the
+    // currently-selected account is scheduled first, so its rows show up near-instantly. Each
+    // account's fetch emits its own historyBatch as it completes; a shared atomic counts completions
+    // so the model's begin/append/finish sequencing (done==1 .. done==total) still works even though
+    // batches now arrive out of order.
+    QVector<quint32> order;
+    order.reserve(static_cast<int>(numAccounts));
+    if (priorityIndex < numAccounts)
+        order.append(priorityIndex);
+    for (quint32 a = 0; a < numAccounts; ++a)
+        if (a != priorityIndex)
+            order.append(a);
+
+    auto done = QSharedPointer<QAtomicInt>::create(0);
+    const quint32 total = numAccounts;
+    for (quint32 a : order) {
+        QtConcurrent::run(&m_netPool, [this, a, total, done]() {
             QVector<HistoryItem> part;
-            parseHistoryArray(takeString(j), part);
-            mergeCowOrders(a, part); // CoW swaps for this account (off-chain; not in the explorer)
-            for (const HistoryItem &h : part) {
-                // Dedup across accounts (e.g. an internal transfer between two of the user's own
-                // addresses would otherwise appear once per side).
-                const QString key = QStringLiteral("%1|%2|%3|%4")
-                                        .arg(h.txHash, h.token, h.direction, h.amount);
-                if (seen.contains(key))
-                    continue;
-                seen.insert(key);
-                items.append(h);
+            {
+                QReadLocker lock(&m_coreLock);
+                char *j = aero_wallet_account_history(m_core, a);
+                if (j)
+                    parseHistoryArray(takeString(j), part);
+                mergeCowOrders(a, part); // CoW swaps for this account (off-chain; not the explorer)
             }
-        }
-        std::sort(items.begin(), items.end(),
-                  [](const HistoryItem &a, const HistoryItem &b) { return a.timestamp > b.timestamp; });
-        QMetaObject::invokeMethod(this, [this, items]() { emit historyRefreshed(items); },
-                                  Qt::QueuedConnection);
-    });
+            const quint32 d = static_cast<quint32>(done->fetchAndAddOrdered(1)) + 1;
+            QMetaObject::invokeMethod(
+                this, [this, part, d, total]() { emit historyBatch(part, d, total); },
+                Qt::QueuedConnection);
+        });
+    }
 }
 
 void Wallet::scanFunded(quint32 gapLimit) {
@@ -482,8 +630,27 @@ void Wallet::scanFunded(quint32 gapLimit) {
             for (const QJsonValue &v : arr)
                 indices.append(static_cast<quint32>(v.toDouble()));
         }
+        invalidateAddressCache(); // account_order may have been reordered (contiguous backfill)
+        invalidateMetaCache();    // account count changed
         QMetaObject::invokeMethod(this, [this, indices]() { emit fundedScanned(indices); },
                                   Qt::QueuedConnection);
+    });
+}
+
+quint64 Wallet::scanProgress() const {
+    // Lock-free: reads a core atomic that the scan (on another thread) updates. No m_coreLock.
+    return aero_wallet_scan_progress();
+}
+
+quint64 Wallet::scanFound() const {
+    return aero_wallet_scan_found();
+}
+
+void Wallet::warmAddresses(quint32 count) {
+    QtConcurrent::run(&m_netPool, [this, count]() {
+        for (quint32 i = 0; i < count; ++i)
+            (void)address(i); // populates the thread-safe m_addrCache
+        QMetaObject::invokeMethod(this, [this]() { emit addressesWarmed(); }, Qt::QueuedConnection);
     });
 }
 
@@ -499,6 +666,8 @@ void Wallet::scanFundedMulti(const QString &configsJson, quint32 gapLimit) {
             for (const QJsonValue &v : arr)
                 indices.append(static_cast<quint32>(v.toDouble()));
         }
+        invalidateAddressCache(); // account_order was reordered by the contiguous backfill
+        invalidateMetaCache();    // account count changed
         QMetaObject::invokeMethod(this, [this, indices]() { emit fundedScanned(indices); },
                                   Qt::QueuedConnection);
     });
@@ -599,29 +768,72 @@ void Wallet::setMetadata(const QString &json) {
     aero_wallet_set_metadata(m_core, json.toUtf8().constData());
 }
 
+void Wallet::queueMetadata(const QString &json) {
+    // Lock-free store only (no core lock): the UI thread must never block here, even while the
+    // funded scan holds the core lock exclusively. saveAsync() applies it off-thread.
+    QMutexLocker m(&m_pendingMetaMutex);
+    m_pendingMetadata = json;
+    m_hasPendingMetadata = true;
+}
+
+void Wallet::flushPendingMetadata() {
+    QString json;
+    {
+        QMutexLocker m(&m_pendingMetaMutex);
+        if (!m_hasPendingMetadata)
+            return;
+        json = m_pendingMetadata;
+        m_hasPendingMetadata = false;
+    }
+    QWriteLocker lock(&m_coreLock);
+    aero_wallet_set_metadata(m_core, json.toUtf8().constData());
+}
+
 void Wallet::addToken(const TokenInfo &t) {
-    QWriteLocker lock(&m_coreLock); // mutates secrets.tokens
-    aero_wallet_add_token(m_core, t.address.toUtf8().constData(),
-                           t.symbol.toUtf8().constData(), t.decimals);
+    {
+        QWriteLocker lock(&m_coreLock); // mutates secrets.tokens
+        aero_wallet_add_token(m_core, t.address.toUtf8().constData(),
+                               t.symbol.toUtf8().constData(), t.decimals);
+    }
+    invalidateMetaCache();
 }
 
 void Wallet::removeToken(const QString &address) {
-    QWriteLocker lock(&m_coreLock); // mutates secrets.tokens
-    aero_wallet_remove_token(m_core, address.toUtf8().constData());
+    {
+        QWriteLocker lock(&m_coreLock); // mutates secrets.tokens
+        aero_wallet_remove_token(m_core, address.toUtf8().constData());
+    }
+    invalidateMetaCache();
 }
 
 QVector<TokenInfo> Wallet::tokens() const {
-    QReadLocker lock(&m_coreLock);
+    quint64 gen;
+    {
+        QMutexLocker c(&m_metaCacheMutex); // cache so UI reads don't block on the core lock (scan)
+        if (m_tokensCacheValid)
+            return m_tokensCache;
+        gen = m_metaGen;
+    }
     QVector<TokenInfo> out;
-    const QString json = takeString(aero_wallet_tokens(m_core));
-    const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
-    for (const QJsonValue &v : arr) {
-        const QJsonObject o = v.toObject();
-        TokenInfo t;
-        t.address = o.value("address").toString();
-        t.symbol = o.value("symbol").toString();
-        t.decimals = static_cast<quint8>(o.value("decimals").toInt(18));
-        out.append(t);
+    {
+        QReadLocker lock(&m_coreLock);
+        const QString json = takeString(aero_wallet_tokens(m_core));
+        const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
+        for (const QJsonValue &v : arr) {
+            const QJsonObject o = v.toObject();
+            TokenInfo t;
+            t.address = o.value("address").toString();
+            t.symbol = o.value("symbol").toString();
+            t.decimals = static_cast<quint8>(o.value("decimals").toInt(18));
+            out.append(t);
+        }
+    }
+    {
+        QMutexLocker c(&m_metaCacheMutex);
+        if (m_metaGen == gen) { // no mutation raced us — safe to cache
+            m_tokensCache = out;
+            m_tokensCacheValid = true;
+        }
     }
     return out;
 }

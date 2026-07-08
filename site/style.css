@@ -1,0 +1,189 @@
+/* Aero website - deliberately plain, retro, no-frills (Feather-style).
+   No web fonts, no JS, no gradients/shadows/animations. One column, cream paper. */
+
+html {
+    -webkit-text-size-adjust: 100%;
+}
+
+body {
+    background: #f4f0e6;
+    color: #1b1b1b;
+    font-family: Georgia, "Times New Roman", Times, serif;
+    font-size: 17px;
+    line-height: 1.6;
+    margin: 0;
+    padding: 0;
+}
+
+/* Single centered reading column. */
+.page {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 28px 20px 64px;
+}
+
+a {
+    color: #14509b;
+    text-decoration: underline;
+}
+a:visited {
+    color: #5a3e8b;
+}
+a:hover {
+    color: #0f3c74;
+}
+
+hr {
+    border: none;
+    border-top: 1px solid #d8d0be;
+    margin: 22px 0;
+}
+
+/* ---- Header ---- */
+.masthead {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+.masthead img {
+    width: 52px;
+    height: 52px;
+    image-rendering: auto;
+}
+.masthead h1 {
+    font-size: 34px;
+    margin: 0;
+    line-height: 1;
+    letter-spacing: 0.5px;
+}
+.tagline {
+    color: #4a463b;
+    font-style: italic;
+    margin: 8px 0 0;
+}
+
+/* ---- Nav (Home | Download | ...) ---- */
+nav.links {
+    margin: 12px 0 0;
+    font-size: 16px;
+}
+nav.links a {
+    white-space: nowrap;
+}
+nav.links .sep {
+    color: #b7ad95;
+    padding: 0 6px;
+}
+
+/* ---- Headings & text ---- */
+h2 {
+    font-size: 23px;
+    margin: 28px 0 8px;
+    font-weight: bold;
+}
+h3 {
+    font-size: 19px;
+    margin: 22px 0 4px;
+}
+p {
+    margin: 10px 0;
+}
+ul {
+    margin: 10px 0;
+    padding-left: 22px;
+}
+li {
+    margin: 4px 0;
+}
+strong {
+    font-weight: bold;
+}
+
+/* ---- Code / hashes / commands ---- */
+code, kbd, samp, pre {
+    font-family: Consolas, "DejaVu Sans Mono", "Courier New", monospace;
+    font-size: 14px;
+}
+code {
+    background: #ece6d6;
+    padding: 1px 4px;
+    border: 1px solid #ddd4bf;
+    border-radius: 2px;
+}
+pre {
+    background: #ece6d6;
+    border: 1px solid #ddd4bf;
+    padding: 10px 12px;
+    overflow-x: auto;
+    line-height: 1.45;
+}
+pre code {
+    background: none;
+    border: none;
+    padding: 0;
+}
+
+/* ---- Understated download link (not a glossy button) ---- */
+a.download {
+    display: inline-block;
+    text-decoration: none;
+    border: 1px solid #14509b;
+    padding: 6px 14px;
+    margin: 6px 0;
+    background: #eef2f8;
+    color: #14509b;
+    font-family: Georgia, serif;
+}
+a.download:hover {
+    background: #e2eaf5;
+}
+.muted {
+    color: #6a6558;
+    font-size: 15px;
+}
+
+/* ---- Screenshots ---- */
+figure {
+    margin: 20px 0;
+}
+figure img {
+    max-width: 100%;
+    height: auto;
+    border: 1px solid #cfc7b2;
+    display: block;
+}
+figcaption {
+    color: #4a463b;
+    font-style: italic;
+    font-size: 15px;
+    margin-top: 6px;
+}
+
+/* ---- Footer ---- */
+footer {
+    margin-top: 30px;
+    color: #6a6558;
+    font-size: 14px;
+}
+
+/* Tables (e.g. downloads / chains) kept plain. */
+table {
+    border-collapse: collapse;
+    margin: 12px 0;
+    width: 100%;
+}
+th, td {
+    text-align: left;
+    padding: 6px 10px;
+    border-bottom: 1px solid #ddd4bf;
+    vertical-align: top;
+}
+th {
+    font-weight: bold;
+}
+
+@media (max-width: 480px) {
+    body { font-size: 16px; }
+    .masthead h1 { font-size: 28px; }
+    .page { padding: 20px 14px 48px; }
+}
