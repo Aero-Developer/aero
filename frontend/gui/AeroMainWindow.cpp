@@ -4760,7 +4760,11 @@ void AeroMainWindow::onAvailableBalance(quint32 index, const QString &token,
         // Any change (incoming or outgoing) means a new tx touched this address -> refresh history.
         if (oldBal >= 0.0 && qAbs(newBal - oldBal) > 1e-9)
             m_balancesChanged = true;
-        if (oldBal >= 0.0 && newBal > oldBal + 1e-9 && !m_balancesFromCache)
+        // Notify on an incoming token payment — but ONLY for verified/tracked tokens. Random airdropped
+        // spam tokens (the bulk of unsolicited transfers) aren't in the trusted set, so they no longer
+        // pop a "Payment received" notification.
+        if (oldBal >= 0.0 && newBal > oldBal + 1e-9 && !m_balancesFromCache &&
+            verifiedTokenAddresses().contains(token.toLower()))
             notify(tr("Payment received"),
                    tr("+%1 %2 to Account #%3")
                        .arg(grouped(QString::number(newBal - oldBal, 'f', 6)), symbol)
@@ -6832,8 +6836,21 @@ void AeroMainWindow::onSendClicked() {
         return;
     }
 
-    m_wallet->createTransaction(static_cast<quint32>(fromIndex), to, tokenAmount, currentTokenAddr(),
-                                fee.first, fee.second, currentDecimals());
+    // Build the tx locally and show the confirmation IMMEDIATELY. Everything needed is already known
+    // (amount + the fee resolved above), so there's no worker hop, no core lock, and no network call
+    // before the prompt — it pops up instantly. The nonce and any gas specifics are resolved later,
+    // off-thread, when the user actually confirms and it broadcasts (commitTransaction).
+    PendingEthTx tx;
+    tx.fromIndex = static_cast<quint32>(fromIndex);
+    tx.to = to;
+    tx.token = currentTokenAddr();
+    tx.fee.maxFee = fee.first;
+    tx.fee.maxPriorityFee = fee.second;
+    if (tx.token.isEmpty())
+        tx.amountWei = Wallet::parseUnits(tokenAmount, 18);
+    else
+        tx.amountUnits = Wallet::parseUnits(tokenAmount, currentDecimals());
+    onTransactionCreated(tx);
 }
 
 void AeroMainWindow::onTransactionCreated(const PendingEthTx &tx) {
@@ -7038,7 +7055,8 @@ void AeroMainWindow::onTransactionCommitted(bool ok, const QString &txHash, cons
             // MetaMask/Feather's pending balance). A speed-up/cancel is skipped — the original tx is
             // already shown, so we'd otherwise double-count it.
             m_historyModel->addLocalSend(txHash, to, amount, sym, m_committedTokenAddr);
-            notify(tr("Payment sent"), tr("%1 %2 to %3").arg(amount, sym, shortAddr(to)));
+            // No "Payment sent" notification — outgoing sends are user-initiated, so a popup is just
+            // noise. Notifications are reserved for INCOMING payments (and a failed-tx alert below).
             applyOptimisticSend(amount, m_committedTokenAddr);
         }
         // NOTE: deliberately no immediate refreshAllBalances/refreshHistoryView here — that would read
