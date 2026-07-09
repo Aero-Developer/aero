@@ -122,6 +122,11 @@ public:
     // Address-only watch wallet: tracks addresses with no keys (can't sign or send).
     bool isWatchOnly() const;
 
+    // Ask the core's background network loops (funded scan, per-account history) to stop ASAP so they
+    // release the core lock — call this before a blocking close-time save so the UI can't hang waiting
+    // on an in-flight multi-minute scan/history load. Process-global; safe to call from the UI thread.
+    static void requestShutdown();
+
     // ##### Hardware wallets #####
     bool isHardware() const;      // keys live on a Ledger/Trezor
     QString hwKind() const;       // "ledger" | "trezor" | "" (software)

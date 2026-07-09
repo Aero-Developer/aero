@@ -570,6 +570,12 @@ char *aero_wallet_cow_orders(AeroWallet *w,
                              uint32_t index);
 
 /**
+ * Request cooperative shutdown of all background network loops (funded scan, per-account history),
+ * so they stop and release the core lock promptly when the app is closing.
+ */
+void aero_request_shutdown(void);
+
+/**
  * Scan every common Ethereum derivation scheme for balances (Electrum-style multi-path recovery),
  * registering funded addresses as accounts and returning their unified indices as a JSON array.
  * Mutates the wallet, so it takes `&mut`. Caller frees the string.

@@ -456,6 +456,12 @@ AeroMainWindow::~AeroMainWindow() {
 }
 
 void AeroMainWindow::closeEvent(QCloseEvent *event) {
+    // FIRST: tell the core's background loops (funded scan / per-account history) to stop. They hold
+    // the core lock while running (a scan holds it exclusively for its whole multi-minute run, made
+    // longer by rate-limit backoff), and the blocking flush + save below need that lock. Without this
+    // the window appears to hang on the X until the in-flight scan/history finishes. The loops poll
+    // this flag between requests (and wake early from backoff sleeps), so they bail within ~1s.
+    Wallet::requestShutdown();
     // Fold the latest fetched history into m_meta so this chain's cache is persisted on exit (the
     // debounced history save may not have fired yet). Must run before we stop the save timer + flush.
     if (m_wallet && m_historyModel) {
@@ -6448,7 +6454,12 @@ void AeroMainWindow::refreshUsedFlags() {
             hasToken.insert(it.key().section(QLatin1Char('|'), 0, 0).toUInt());
     const quint32 n = m_wallet->numAccounts();
     for (quint32 i = 0; i < n; ++i) {
-        const bool used = m_ethRawByAccount.value(i, 0.0) > 0.0 || hasToken.contains(i);
+        // A funded account (discovered by the scan) stays red REGARDLESS of whether its live balance
+        // has loaded yet. Without this, the first balance batch to arrive would recompute `used` from
+        // only the handful of balances fetched so far and clear the red flag on every funded account
+        // still waiting on its (rate-limited, slow) balance — the "only the first few stay red" bug.
+        const bool used = m_fundedAccounts.contains(i) ||
+                          m_ethRawByAccount.value(i, 0.0) > 0.0 || hasToken.contains(i);
         m_addressModel->setUsed(i, used); // no-op when unchanged
     }
 }

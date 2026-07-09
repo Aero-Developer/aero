@@ -99,6 +99,10 @@ QString Wallet::address(quint32 index) const {
     return addr;
 }
 
+void Wallet::requestShutdown() {
+    aero_request_shutdown();
+}
+
 bool Wallet::addressesCached(quint32 count) const {
     QMutexLocker cl(&m_addrCacheMutex);
     for (quint32 i = 0; i < count; ++i)

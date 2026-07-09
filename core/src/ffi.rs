@@ -1411,6 +1411,14 @@ pub extern "C" fn aero_wallet_cow_orders(w: *mut Wallet, index: u32) -> *mut c_c
     })
 }
 
+/// Request cooperative shutdown of all background network loops (funded scan, per-account history).
+/// Called from the GUI's close handler so those loops stop and release the core lock promptly,
+/// instead of the blocking close-time save waiting on an in-flight multi-minute scan/history.
+#[no_mangle]
+pub extern "C" fn aero_request_shutdown() {
+    crate::provider::request_shutdown();
+}
+
 /// Scan every common Ethereum derivation scheme for balances (Electrum-style multi-path recovery),
 /// registering funded addresses as accounts and returning their unified indices as a JSON array.
 /// Mutates the wallet, so it takes `&mut`. Caller frees the string.

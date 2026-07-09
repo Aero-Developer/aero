@@ -11,7 +11,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,37 @@ pub async fn background<F: std::future::Future>(f: F) -> F::Output {
 
 fn current_priority() -> Priority {
     PRIORITY.try_with(|p| *p).unwrap_or(Priority::Interactive)
+}
+
+/// Set once when the app is closing. Long-running background loops (the funded scan, the per-account
+/// history fetch) poll this and bail out promptly so they release the core lock — otherwise the
+/// blocking flush/save in the GUI's closeEvent would wait on an in-flight multi-minute scan/history
+/// (made longer by rate-limit backoff), freezing the window so the X button appears to hang.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Request cooperative shutdown of all background network loops.
+pub fn request_shutdown() {
+    SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+/// Whether shutdown has been requested (background loops should stop and return what they have).
+pub fn shutting_down() -> bool {
+    SHUTDOWN.load(Ordering::Relaxed)
+}
+
+/// Sleep for `d`, but wake early (in <=200 ms) if shutdown is requested, so a backoff wait can't
+/// keep the core lock held while the app is trying to close.
+pub async fn interruptible_sleep(d: Duration) {
+    let step = Duration::from_millis(200);
+    let mut left = d;
+    while left > Duration::ZERO {
+        if shutting_down() {
+            return;
+        }
+        let chunk = if left < step { left } else { step };
+        tokio::time::sleep(chunk).await;
+        left = left.saturating_sub(chunk);
+    }
 }
 
 /// Hard cap on how many Tor requests may be in flight at once across the WHOLE app. A single Tor

@@ -1091,6 +1091,9 @@ impl Wallet {
         let mut chain_found_any = false;
 
         for (scheme_idx, template) in SCHEMES.iter().enumerate() {
+            if crate::provider::shutting_down() {
+                break; // app closing — stop scanning and return what we have
+            }
             // On non-mainnet chains, if the standard path found nothing, skip the rare alt schemes.
             if scheme_idx > 0 && !is_mainnet && !chain_found_any {
                 break;
@@ -1137,9 +1140,9 @@ impl Wallet {
                         // scan reaches the true end instead of stopping at the first hiccup.
                         let mut results = provider.call_batch(&calls).await.unwrap_or_default();
                         let mut tries = 0u32;
-                        while batch_failed(&results) && tries < 6 {
+                        while batch_failed(&results) && tries < 6 && !crate::provider::shutting_down() {
                             tries += 1;
-                            tokio::time::sleep(backoff_delay(tries)).await;
+                            crate::provider::interruptible_sleep(backoff_delay(tries)).await;
                             results = provider.call_batch(&calls).await.unwrap_or_default();
                         }
                         let failed = batch_failed(&results);
@@ -1151,8 +1154,8 @@ impl Wallet {
 
             let mut consecutive_empty = 0u32;
             'scheme: while let Some((start, end, paths, results, failed)) = fetches.next().await {
-                if failed {
-                    break 'scheme; // endpoint can't service this scheme's batches
+                if failed || crate::provider::shutting_down() {
+                    break 'scheme; // endpoint can't service this scheme's batches, or app is closing
                 }
                 SCAN_CHECKED.fetch_add((end - start) as u64, std::sync::atomic::Ordering::Relaxed);
                 for (p, (i, path)) in paths.iter().enumerate() {
@@ -3330,6 +3333,9 @@ async fn fetch_all_pages(
     let mut out = Vec::new();
     let mut page = 1u32;
     while page <= MAX_PAGES {
+        if crate::provider::shutting_down() {
+            return out; // app closing — stop paging and release the core lock promptly
+        }
         let url = format!(
             "{base}&action={action}&address={owner}&sort=desc&page={page}&offset={PER_PAGE}"
         );
@@ -3361,9 +3367,9 @@ async fn fetch_all_pages(
                         || msg.contains("too many")
                         || msg.contains("notok")
                         || msg.contains("try again");
-                    if rate_limited && attempt < MAX_RETRIES {
+                    if rate_limited && attempt < MAX_RETRIES && !crate::provider::shutting_down() {
                         attempt += 1;
-                        tokio::time::sleep(backoff_delay(attempt)).await;
+                        crate::provider::interruptible_sleep(backoff_delay(attempt)).await;
                         continue; // retry same page
                     }
                     // Terminal: genuine empty result, or we've exhausted retries.
@@ -3372,9 +3378,9 @@ async fn fetch_all_pages(
                 Err(_) => {
                     // Transport/parse error (often a 429 body that isn't JSON). Retry with backoff
                     // rather than silently dropping the rest of this account's history.
-                    if attempt < MAX_RETRIES {
+                    if attempt < MAX_RETRIES && !crate::provider::shutting_down() {
                         attempt += 1;
-                        tokio::time::sleep(backoff_delay(attempt)).await;
+                        crate::provider::interruptible_sleep(backoff_delay(attempt)).await;
                         continue;
                     }
                     return out;
