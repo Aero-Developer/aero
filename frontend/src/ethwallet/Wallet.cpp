@@ -87,11 +87,16 @@ QString Wallet::address(quint32 index) const {
         if (it != m_addrCache.constEnd())
             return it.value();
     }
-    QString addr;
-    {
-        QReadLocker lock(&m_coreLock);
-        addr = takeString(aero_wallet_address(m_core, index));
-    }
+    // Cache miss. NEVER block the (usually UI) caller on the core lock: a scan holds it exclusively
+    // for minutes, and address() is called all over the UI — labels, the Receive QR, and especially
+    // applyReceiveSearch() which derives EVERY visible row on each keystroke. A blocking read here
+    // froze the whole window whenever any of those ran during a scan. Try to read without waiting; if
+    // a writer holds the lock, return empty. Addresses are warmed off-thread (warmAddresses, which
+    // may block on its worker), so the cache fills in and the UI refreshes on the next pass.
+    if (!m_coreLock.tryLockForRead())
+        return QString();
+    const QString addr = takeString(aero_wallet_address(m_core, index));
+    m_coreLock.unlock();
     if (!addr.isEmpty()) {
         QMutexLocker cl(&m_addrCacheMutex);
         m_addrCache.insert(index, addr);
@@ -235,8 +240,19 @@ QString Wallet::verifyMessage(const QString &message, const QString &signature) 
 }
 
 bool Wallet::isHardware() const {
-    QReadLocker lock(&m_coreLock);
-    return aero_wallet_is_hardware(m_core) != 0;
+    {
+        QMutexLocker c(&m_metaCacheMutex); // immutable for the wallet's lifetime; cache it so a UI
+        if (m_hardwareCache >= 0)           // call during the scan's exclusive lock doesn't block
+            return m_hardwareCache != 0;
+    }
+    int hw;
+    {
+        QReadLocker lock(&m_coreLock);
+        hw = aero_wallet_is_hardware(m_core) != 0 ? 1 : 0;
+    }
+    QMutexLocker c(&m_metaCacheMutex);
+    m_hardwareCache = hw;
+    return hw != 0;
 }
 
 bool Wallet::isWatchOnly() const {
@@ -256,8 +272,20 @@ bool Wallet::isWatchOnly() const {
 }
 
 QString Wallet::hwKind() const {
-    QReadLocker lock(&m_coreLock);
-    return takeString(aero_wallet_hw_kind(m_core));
+    {
+        QMutexLocker c(&m_metaCacheMutex); // immutable for the wallet's lifetime; cache it
+        if (m_hwKindCached)
+            return m_hwKindCache;
+    }
+    QString kind;
+    {
+        QReadLocker lock(&m_coreLock);
+        kind = takeString(aero_wallet_hw_kind(m_core));
+    }
+    QMutexLocker c(&m_metaCacheMutex);
+    m_hwKindCache = kind;
+    m_hwKindCached = true;
+    return kind;
 }
 
 quint32 Wallet::addHardwareAccount() {
@@ -776,8 +804,25 @@ quint64 Wallet::scanFound() const {
 
 void Wallet::warmAddresses(quint32 count) {
     QtConcurrent::run(&m_netPool, [this, count]() {
-        for (quint32 i = 0; i < count; ++i)
-            (void)address(i); // populates the thread-safe m_addrCache
+        // On a WORKER thread it's fine to block until any in-flight scan releases the write lock;
+        // take the read lock ONCE for the whole warm and derive every not-yet-cached address, so the
+        // (non-blocking) UI address() getter finds them all in the cache afterwards. This is what
+        // keeps the UI from ever having to derive under the core lock itself.
+        {
+            QReadLocker lock(&m_coreLock);
+            for (quint32 i = 0; i < count; ++i) {
+                {
+                    QMutexLocker cl(&m_addrCacheMutex);
+                    if (m_addrCache.contains(i))
+                        continue;
+                }
+                const QString a = takeString(aero_wallet_address(m_core, i));
+                if (!a.isEmpty()) {
+                    QMutexLocker cl(&m_addrCacheMutex);
+                    m_addrCache.insert(i, a);
+                }
+            }
+        }
         QMetaObject::invokeMethod(this, [this]() { emit addressesWarmed(); }, Qt::QueuedConnection);
     });
 }

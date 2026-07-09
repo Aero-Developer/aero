@@ -493,6 +493,9 @@ private:
     mutable QVector<TokenInfo> m_tokensCache;
     mutable bool m_tokensCacheValid = false;
     mutable int m_watchOnlyCache = -1;           // -1 = unknown (immutable once computed)
+    mutable int m_hardwareCache = -1;            // -1 = unknown (immutable once computed)
+    mutable QString m_hwKindCache;               // immutable once computed
+    mutable bool m_hwKindCached = false;
     // Bumped on every invalidation. A getter reads it before the (unlocked) core read and only stores
     // the result if it hasn't changed since — so a mutation that races an in-flight read can never
     // poison the cache with a stale value (the read simply isn't cached and re-runs next call).
