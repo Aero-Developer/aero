@@ -4952,10 +4952,19 @@ void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, c
     // account (the optimistic drop reverts upward until the tx mines — that's not a real payment).
     const bool recentlySentHere =
         index == m_lastSendFrom && (QDateTime::currentMSecsSinceEpoch() - m_lastSendMs) < 120000;
-    if (oldBal >= 0.0 && newBal > oldBal + 1e-12 && !m_balancesFromCache && !recentlySentHere)
+    // Suppress dust: address-poisoning attacks send ~0 ETH (they show as "0.0000") to plant a
+    // lookalike address in your history. Only notify when the received amount clears the same dust
+    // threshold the History filter uses (default $0.005). When no native price is known yet, fall
+    // back to a tiny ETH floor so a genuine dust attack still can't pop a notification.
+    const double received = newBal - oldBal;
+    const double dustUsd = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
+                               .value(QStringLiteral("history/dustUsd"), 0.005).toDouble();
+    const bool aboveDust = (m_nativeUsd > 0.0) ? (received * m_nativeUsd >= dustUsd)
+                                               : (received >= 1e-5);
+    if (oldBal >= 0.0 && received > 1e-12 && !m_balancesFromCache && !recentlySentHere && aboveDust)
         notify(tr("Payment received"),
                tr("+%1 ETH to Account #%2")
-                   .arg(grouped(QString::number(newBal - oldBal, 'f', 6)))
+                   .arg(grouped(QString::number(received, 'f', 6)))
                    .arg(index));
     const QString display = tr("%1 %2").arg(formatBalance(formatted), symbol);
     m_accountBalances.insert(index, display);
