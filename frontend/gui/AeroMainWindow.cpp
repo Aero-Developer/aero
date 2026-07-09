@@ -1095,12 +1095,15 @@ void AeroMainWindow::setupHomeTab() {
 
     auto *row = new QHBoxLayout();
     QLabel *unused = nullptr;
-    // Feather-style: price tickers on the left, total balance pinned to the right.
+    // Total balance FIRST (left) — it's the most important number and must always be visible. It used
+    // to be pinned to the far right, but Aero's wide tab bar forces a window minimum wider than a small
+    // (e.g. 1024px) screen, so a right-pinned box fell off the right edge and the user could never see
+    // their total balance. Keeping everything left-aligned guarantees it's on-screen at any width.
+    row->addWidget(makeTicker(tr("Total balance"), m_homeTotalValue, unused, false));
     row->addWidget(makeTicker(QStringLiteral("XMR"), m_homeXmrValue, m_homeXmrPct, true));
     m_homeNativeBox = makeTicker(m_nativeSymbol, m_homeEthValue, m_homeEthPct, true);
     row->addWidget(m_homeNativeBox);
     row->addStretch();
-    row->addWidget(makeTicker(tr("Total balance"), m_homeTotalValue, unused, false));
     outer->addLayout(row);
 
     auto *line = new QFrame(m_homeTab);
@@ -3884,10 +3887,14 @@ void AeroMainWindow::onBlockNumber(quint64 block) {
     m_lastBlock = block;
     if (firstSeen)
         return; // baseline; the connect handler already did the initial refresh
-    // A new block landed. Do only the cheap batched balance fetch; history is re-pulled (via
-    // allBalancesRefreshed) only if a balance actually changed. Refresh the fee suggestion just
-    // when the Send tab is open (it's where the estimate is shown), to avoid a call every block.
-    refreshAllBalances();
+    // A new block landed. Refresh ONLY the account currently on screen — NOT a full sweep of every
+    // account. On a large HD wallet, re-fetching all N accounts' balances every ~12s is a perpetual
+    // RPC request storm that trips rate limits and starves the initial load so it never finishes.
+    // The one-time full sweep happens on connect; per-block we just keep the viewed account live.
+    if (m_wallet->numAccounts() <= 8)
+        refreshAllBalances();
+    else
+        m_wallet->refreshAccountBalance(m_account);
     if (ui.tabWidget->currentWidget() == ui.tabSend)
         m_wallet->refreshFees();
 }
@@ -4252,21 +4259,24 @@ void AeroMainWindow::onFundedScanned(const QList<quint32> &indices) {
 
 void AeroMainWindow::refreshAllBalances() {
     if (!m_wallet) return;
-    // ONE batched request fetches native + all tracked-token balances for every account, instead of
-    // firing numAccounts × (1 + numTokens) independent Tor calls (which trickled in one-by-one and
-    // could overwhelm Tor so nothing loaded). Results arrive via the usual per-account signals.
+    // ONE batched request fetches native + tracked-token balances for every account, instead of
+    // firing numAccounts × (1 + numTokens) independent Tor calls. Results arrive via per-account signals.
     //
-    // Include the CURRENT chain's curated tokens as extras so their balances load proactively (the
-    // Send/Swap pickers show them right away) without permanently tracking cross-chain tokens — the
-    // default tracked list is mainnet-only, so on other chains the real tokens otherwise showed no
-    // balance until individually selected.
+    // The curated top-tokens are added as EXTRAS only for SMALL wallets. Each extra token adds one
+    // eth_call PER ACCOUNT, so bundling ~24 curated tokens across a big HD wallet (e.g. 167 accounts)
+    // meant ~24×167 mostly-zero token reads — which blew the per-request budget down to one account
+    // per batch, instantly tripped the public RPC's rate limit, and (with retries) thrashed forever so
+    // balances never finished loading. For a large wallet we fetch native + the user's TRACKED tokens
+    // only; the current account's curated-token balances are loaded on demand elsewhere (Send/Swap).
     QJsonArray extra;
-    for (const TokenInfo &t : curatedTopTokens(m_chainId)) {
-        QJsonObject o;
-        o[QStringLiteral("address")] = t.address;
-        o[QStringLiteral("symbol")] = t.symbol;
-        o[QStringLiteral("decimals")] = static_cast<int>(t.decimals);
-        extra.append(o);
+    if (m_wallet->numAccounts() <= 8) {
+        for (const TokenInfo &t : curatedTopTokens(m_chainId)) {
+            QJsonObject o;
+            o[QStringLiteral("address")] = t.address;
+            o[QStringLiteral("symbol")] = t.symbol;
+            o[QStringLiteral("decimals")] = static_cast<int>(t.decimals);
+            extra.append(o);
+        }
     }
     const QString extraJson = QString::fromUtf8(QJsonDocument(extra).toJson(QJsonDocument::Compact));
     m_wallet->refreshAllBalances(m_wallet->numAccounts(), extraJson);
