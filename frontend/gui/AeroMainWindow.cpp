@@ -4171,11 +4171,33 @@ void AeroMainWindow::onFundedScanned(const QList<quint32> &indices) {
     // them funded and refresh.
     for (quint32 i : indices)
         m_fundedAccounts.insert(i);
+    // PERSIST FIRST, GUARANTEED — and UNCONDITIONALLY. The scan mutated account_order in memory
+    // (potentially hundreds of accounts) and produced the funded set. Write BOTH to disk NOW with a
+    // blocking save behind a modal, rather than the debounced saveAsync — otherwise killing the app
+    // (or a later UI stall) before the debounce fires loses the funded metadata even though a
+    // background balance-cache save already persisted account_order. That mismatch is exactly the
+    // "reopened and only ~4 addresses show, nothing red" bug: the accounts were on disk but the
+    // funded set was not. We always mark funded_done so a reopen doesn't needlessly auto-rescan, and
+    // always write the (possibly empty) funded array so it can never be left stale. This runs BEFORE
+    // any combo rebuild, so even if the UI were to stall afterwards the data is already durable.
+    {
+        QJsonArray fundedArr;
+        for (quint32 i : m_fundedAccounts)
+            fundedArr.append(static_cast<double>(i));
+        m_meta[QStringLiteral("funded")] = fundedArr;
+        m_meta[QStringLiteral("funded_done")] = true;
+        const QString metaJson =
+            QString::fromUtf8(QJsonDocument(m_meta).toJson(QJsonDocument::Compact));
+        runBusy(tr("Saving discovered accounts…"),
+                [this, metaJson]() { m_wallet->saveWithMetadata(metaJson); });
+    }
+    // Warm the address cache off-thread REGARDLESS of the funded count: the scan invalidated the
+    // cache and grew account_order, so the next rebuildAccountCombos() (and the setWallet path) would
+    // otherwise derive every address on the UI thread. addressesWarmed -> rebuildAccountCombos builds
+    // from the hot cache with no stall.
+    m_addressModel->refresh();
+    m_wallet->warmAddresses(m_wallet->numAccounts());
     if (!m_fundedAccounts.isEmpty()) {
-        m_addressModel->refresh();
-        // Warm the address cache off-thread; addressesWarmed -> rebuildAccountCombos (from hot cache)
-        // so the combos don't derive hundreds of addresses synchronously on the UI thread.
-        m_wallet->warmAddresses(m_wallet->numAccounts());
         refreshAllBalances();
         // Now that we know which accounts are funded, load their history once (targeted, deduped).
         // Empty accounts are skipped entirely — no fan-out over the whole derivation range.
@@ -4185,9 +4207,7 @@ void AeroMainWindow::onFundedScanned(const QList<quint32> &indices) {
     // after each balance batch.
     for (quint32 i : m_fundedAccounts)
         m_addressModel->setUsed(i, true);
-    // Persist the discovered accounts AND the funded set in one debounced, off-thread save (the
-    // whole wallet is re-encrypted once) — previously this ran two blocking Argon2id saves here.
-    saveFundedSet();
+    // (The discovered accounts + funded set were already persisted synchronously above.)
     applyFundedFilter();
     if (m_addressModel->rowCount() > 0)
         selectAddressRow(m_addressModel->accountAt(0)); // first visible address
@@ -4389,13 +4409,19 @@ void AeroMainWindow::scheduleHistorySave() {
 void AeroMainWindow::saveHistoryCache() {
     if (!m_wallet || !m_historyModel) return;
     QVector<HistoryItem> items = m_historyModel->fetchedItems();
-    // Bound the file: keep the newest ~4000 rows (by timestamp, then block) per chain.
+    // Bound the file, but generously: a wallet with many funded accounts legitimately has thousands
+    // of transactions, and the on-reopen cache is marked "already fetched" per account (status-gate),
+    // so anything dropped here is NOT re-fetched — it just vanishes from the restored view until a
+    // forced rescan. A tight cap (the old 4000) therefore truncated real history on reopen. Keep the
+    // newest 30k rows (by timestamp, then block) per chain — enough to never truncate a realistic
+    // wallet, while still bounding the encrypted file. AES over a few MB is sub-millisecond; the
+    // Argon2id cost is on the key and independent of blob size.
     std::sort(items.begin(), items.end(), [](const HistoryItem &a, const HistoryItem &b) {
         if (a.timestamp != b.timestamp) return a.timestamp > b.timestamp;
         return a.block > b.block;
     });
-    if (items.size() > 4000)
-        items.resize(4000);
+    if (items.size() > 30000)
+        items.resize(30000);
     QJsonArray arr;
     for (const HistoryItem &h : items)
         arr.append(histItemToJson(h));
@@ -4723,6 +4749,19 @@ QString AeroMainWindow::accountLabel(quint32 index) const {
 void AeroMainWindow::rebuildAccountCombos() {
     if (!m_wallet) return;
     const quint32 n = m_wallet->numAccounts();
+    // GUARD AGAINST THE UI FREEZE: accountLabel() below reads m_wallet->address(i) for EVERY account.
+    // If those addresses aren't cached yet (fresh open, or right after a funded scan invalidated the
+    // cache), each read re-derives an HD key under the core lock — with hundreds of accounts that is a
+    // multi-second stall on the UI thread (the "create address freezes" bug). Instead, warm the whole
+    // range off-thread; warmAddresses() emits addressesWarmed -> rebuildAccountCombos(), which then
+    // finds the cache hot and builds instantly. We still refresh the address model now so the Receive
+    // list (which derives lazily per visible row) updates immediately.
+    if (n > 0 && !m_wallet->addressesCached(n)) {
+        if (m_addressModel)
+            m_addressModel->refresh();
+        m_wallet->warmAddresses(n);
+        return;
+    }
     // Send's "From" selector lists every address.
     if (m_fromCombo) {
         QSignalBlocker block(m_fromCombo);
@@ -5026,7 +5065,10 @@ void AeroMainWindow::onCreateAddress() {
 // Finish creating an address once the (possibly off-thread) derivation completes.
 void AeroMainWindow::onAccountAdded(quint32 idx) {
     m_account = idx;
-    scheduleSave(); // persist the new account (debounced, off-thread — no UI freeze)
+    // Persist the new account NOW, not on the 400 ms debounce: a new HD account is a deliberate,
+    // one-off action the user expects to survive an immediate close/kill. saveAsync() runs the
+    // encrypt+write off the UI thread, so this is durable within ~a second without any freeze.
+    m_wallet->saveAsync();
     rebuildAccountCombos();
     selectAddressRow(idx);
     // A freshly derived address has no funds and no history: show 0 immediately, then fetch just its

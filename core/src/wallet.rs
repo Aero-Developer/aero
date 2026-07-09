@@ -1127,9 +1127,19 @@ impl Wallet {
                             }
                             paths.push((i, path));
                         }
-                        // Retry once on a failed/empty batch (a failed read must not count as zero).
+                        // Retry a failed/empty batch with EXPONENTIAL BACKOFF. This is critical for
+                        // scan completeness: the balance reads go over one shared Tor exit and the
+                        // RPC endpoint rate-limits, so a batch mid-scan can transiently fail. The old
+                        // code retried once immediately (both attempts hit the same rate window) and,
+                        // on failure, `break 'scheme` ABANDONED the rest of the scheme — silently
+                        // skipping every higher-index funded account (the "found 167 one run, 43 the
+                        // next" bug). Backing off and retrying lets the rate window recover so the
+                        // scan reaches the true end instead of stopping at the first hiccup.
                         let mut results = provider.call_batch(&calls).await.unwrap_or_default();
-                        if batch_failed(&results) {
+                        let mut tries = 0u32;
+                        while batch_failed(&results) && tries < 6 {
+                            tries += 1;
+                            tokio::time::sleep(backoff_delay(tries)).await;
                             results = provider.call_batch(&calls).await.unwrap_or_default();
                         }
                         let failed = batch_failed(&results);
@@ -3294,8 +3304,20 @@ fn normalize_account_order(secrets: &mut WalletSecrets) {
 }
 
 /// Fetch every page of an Etherscan-compatible list endpoint (txlist / tokentx), so history isn't
-/// truncated to the most recent page. Stops at the first short/empty page or on error, with a hard
-/// cap so a pathological account can't loop forever.
+/// truncated to the most recent page.
+///
+/// CRITICAL for correctness across a multi-account wallet: the keyless Blockscout explorer
+/// rate-limits by IP, and every account in the wallet shares ONE Tor exit. A burst of per-account
+/// history fetches therefore reliably trips the limit, and Blockscout answers with
+/// `{"message":"NOTOK","result":"Max rate limit reached"}` (or a transport error). The old code
+/// treated a non-array `result` as "no more transactions" and returned an EMPTY list — so a
+/// rate-limited account silently contributed ZERO history. Across ~160 accounts that turned a full
+/// history into a tiny, wrong subset (the "only 221 transactions" bug).
+///
+/// So: retry the SAME page with exponential backoff on a rate-limit / transient failure, and only
+/// stop on a genuine terminal response (an array shorter than a full page, or an explicit
+/// "no transactions found"). Bounded by MAX_PAGES and MAX_RETRIES so a pathological account can't
+/// loop forever.
 async fn fetch_all_pages(
     provider: &RpcProvider,
     base: &str,
@@ -3304,26 +3326,71 @@ async fn fetch_all_pages(
 ) -> Vec<serde_json::Value> {
     const PER_PAGE: usize = 1000;
     const MAX_PAGES: u32 = 25; // up to 25k txs per list — plenty, and bounds Tor round-trips
+    const MAX_RETRIES: u32 = 6; // per page, on rate-limit / transient error
     let mut out = Vec::new();
-    for page in 1..=MAX_PAGES {
+    let mut page = 1u32;
+    while page <= MAX_PAGES {
         let url = format!(
             "{base}&action={action}&address={owner}&sort=desc&page={page}&offset={PER_PAGE}"
         );
-        match provider.http_get_json(&url).await {
-            Ok(v) => match v.get("result").and_then(|r| r.as_array()) {
-                Some(rows) => {
-                    let n = rows.len();
-                    out.extend(rows.iter().cloned());
-                    if n < PER_PAGE {
-                        break; // last page reached
+        let mut attempt = 0u32;
+        loop {
+            match provider.http_get_json(&url).await {
+                Ok(v) => {
+                    if let Some(rows) = v.get("result").and_then(|r| r.as_array()) {
+                        let n = rows.len();
+                        out.extend(rows.iter().cloned());
+                        if n < PER_PAGE {
+                            return out; // last page reached
+                        }
+                        break; // full page — go fetch the next one
                     }
+                    // `result` is missing or not an array. Two very different cases:
+                    //   • a genuine "No transactions found" (message == "No transactions found",
+                    //     result is often an empty string) → this account/list is simply done.
+                    //   • a rate-limit / server hiccup ("Max rate limit reached", "NOTOK", etc.)
+                    //     → must NOT be treated as done; back off and retry the SAME page.
+                    let msg = format!(
+                        "{} {}",
+                        v.get("message").and_then(|m| m.as_str()).unwrap_or(""),
+                        v.get("result").and_then(|r| r.as_str()).unwrap_or("")
+                    )
+                    .to_lowercase();
+                    let rate_limited = msg.contains("rate limit")
+                        || msg.contains("max rate")
+                        || msg.contains("too many")
+                        || msg.contains("notok")
+                        || msg.contains("try again");
+                    if rate_limited && attempt < MAX_RETRIES {
+                        attempt += 1;
+                        tokio::time::sleep(backoff_delay(attempt)).await;
+                        continue; // retry same page
+                    }
+                    // Terminal: genuine empty result, or we've exhausted retries.
+                    return out;
                 }
-                None => break, // "No transactions found" / error message => done
-            },
-            Err(_) => break,
+                Err(_) => {
+                    // Transport/parse error (often a 429 body that isn't JSON). Retry with backoff
+                    // rather than silently dropping the rest of this account's history.
+                    if attempt < MAX_RETRIES {
+                        attempt += 1;
+                        tokio::time::sleep(backoff_delay(attempt)).await;
+                        continue;
+                    }
+                    return out;
+                }
+            }
         }
+        page += 1;
     }
     out
+}
+
+/// Exponential backoff (capped) for retrying a rate-limited explorer page: 0.5s, 1s, 2s, 4s, 8s, 8s.
+/// Enough to let a shared-Tor-exit rate window recover without stalling forever.
+fn backoff_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(4); // 0..=4
+    Duration::from_millis((500u64 << shift).min(8000))
 }
 
 /// Current unix time in seconds (0 if the clock is before the epoch, which shouldn't happen).

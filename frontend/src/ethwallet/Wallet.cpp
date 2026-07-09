@@ -99,6 +99,14 @@ QString Wallet::address(quint32 index) const {
     return addr;
 }
 
+bool Wallet::addressesCached(quint32 count) const {
+    QMutexLocker cl(&m_addrCacheMutex);
+    for (quint32 i = 0; i < count; ++i)
+        if (!m_addrCache.contains(i))
+            return false;
+    return true;
+}
+
 void Wallet::invalidateAddressCache() {
     QMutexLocker cl(&m_addrCacheMutex);
     m_addrCache.clear();
@@ -152,7 +160,11 @@ void Wallet::addAccountAsync() {
             QWriteLocker lock(&m_coreLock);
             idx = aero_wallet_add_account(m_core);
         }
-        invalidateAddressCache();
+        // NOTE: do NOT clear the whole address cache here. Appending an HD account does not change
+        // any existing index's address (derivation is deterministic per index), and clearing it made
+        // the subsequent rebuildAccountCombos() re-derive ALL accounts synchronously on the UI thread
+        // — a multi-second freeze once a wallet has hundreds of funded accounts. The new index simply
+        // isn't cached yet and gets derived once on first access. Only the count cache must refresh.
         invalidateMetaCache();
         QMetaObject::invokeMethod(this, [this, idx]() { emit accountAdded(idx); },
                                   Qt::QueuedConnection);
@@ -260,6 +272,23 @@ bool Wallet::store(const QString &path, const QString &password) {
 bool Wallet::save() {
     if (m_path.isEmpty())
         return false; // no file to save to (e.g. demo/throwaway wallet)
+    QReadLocker lock(&m_coreLock);
+    int rc = aero_wallet_save(m_core, m_path.toUtf8().constData(), m_password.toUtf8().constData());
+    if (rc != 0) {
+        m_status = Status_Error;
+        m_errorString = takeLastError();
+        return false;
+    }
+    return true;
+}
+
+bool Wallet::saveWithMetadata(const QString &metaJson) {
+    if (m_path.isEmpty())
+        return false; // nothing to persist (demo/throwaway wallet)
+    {
+        QWriteLocker lock(&m_coreLock);
+        aero_wallet_set_metadata(m_core, metaJson.toUtf8().constData());
+    }
     QReadLocker lock(&m_coreLock);
     int rc = aero_wallet_save(m_core, m_path.toUtf8().constData(), m_password.toUtf8().constData());
     if (rc != 0) {

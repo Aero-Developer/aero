@@ -106,6 +106,10 @@ public:
 
     // ##### Accounts / keys #####
     QString address(quint32 index) const;
+    // True only if addresses [0, count) are ALL already in the derived-address cache, so a caller can
+    // decide whether reading them (e.g. rebuilding the account combos) would derive HD keys on the
+    // calling thread. Cheap (a single mutexed hash lookup per index); no derivation.
+    bool addressesCached(quint32 count) const;
     quint32 numAccounts() const;
     quint32 addAccount();
     // Async variant: derives the next HD account off the UI thread and emits accountAdded(index).
@@ -154,6 +158,11 @@ public:
     // Synchronous (blocks the caller with the full Argon2id encrypt + fsync). Prefer saveAsync()
     // on the UI thread; use this only where blocking is acceptable (e.g. flush on app close).
     bool save();
+    // Apply `metaJson` to the core, then synchronously encrypt+write. Use for a GUARANTEED, prompt
+    // persist of critical state (e.g. right after a funded scan discovers hundreds of accounts) where
+    // the debounced saveAsync() could be lost if the app is killed before the timer fires. Blocks the
+    // caller (run it on a worker / behind a busy dialog).
+    bool saveWithMetadata(const QString &metaJson);
     // Non-blocking save: runs the (slow) encrypt + atomic write on the bounded net pool and emits
     // saved(ok) on the UI thread. Saves are serialized so two encrypt/atomic-writes never overlap;
     // a request made while one is in flight coalesces into a single follow-up save.
