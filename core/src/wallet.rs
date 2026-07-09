@@ -3,6 +3,8 @@
 //! frontend) is built on, mirroring the role of Feather's `libwalletqt` `Wallet` class.
 
 use std::str::FromStr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
 use alloy::eips::eip2718::Encodable2718;
@@ -45,6 +47,20 @@ const OPENOCEAN_API: &str = "https://open-api.openocean.finance";
 const EVM_NATIVE_SENTINEL: &str = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 /// Odos represents the native coin with the zero address.
 const ODOS_NATIVE: &str = "0x0000000000000000000000000000000000000000";
+
+/// Multicall3 — deployed at the same canonical address on every major EVM chain (incl. testnets).
+/// We use `aggregate3Value` to send native coin to many recipients atomically in ONE transaction.
+const MULTICALL3: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
+
+alloy::sol! {
+    struct Call3Value {
+        address target;
+        bool allowFailure;
+        uint256 value;
+        bytes callData;
+    }
+    function aggregate3Value(Call3Value[] calls) payable returns (bytes[] returnData);
+}
 
 /// A router quote/route normalized so the UI is router-agnostic.
 #[derive(serde::Serialize, Clone, Default)]
@@ -121,7 +137,7 @@ pub struct BalanceInfo {
 }
 
 /// Suggested EIP-1559 fee parameters (all in wei, decimal strings).
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct FeeSuggestion {
     pub base_fee: String,
     pub max_priority_fee: String,
@@ -160,6 +176,10 @@ pub struct HistoryItem {
     pub buy_formatted: String, // swap: human amount received
     #[serde(default)]
     pub status: String, // swap: "pending" | "done" | "failed"
+    // Per-tx log index of a token transfer (Etherscan `logIndex`); used only to disambiguate two
+    // legitimate identical transfers in the SAME tx during dedup. Internal to the core.
+    #[serde(skip)]
+    pub log_index: u64,
 }
 
 /// An owned NFT collection (ERC-721 / ERC-1155), as reported by the block explorer.
@@ -191,11 +211,23 @@ struct HwContext {
     passphrase: String, // host-entered (Trezor); empty/ignored for Ledger
 }
 
+/// Short-TTL caches for pure, read-only network lookups that several UI triggers hit repeatedly
+/// (connect, tab switches, per-block refresh). Serving a recent value avoids re-opening a Tor
+/// stream for data that barely changes over a few seconds — fewer requests = a healthier circuit.
+/// Keyed by chain id so a network switch never returns another chain's value. Locks are only ever
+/// held to copy the cached value in/out, NEVER across a network await.
+#[derive(Default)]
+struct NetCaches {
+    native_price: Mutex<Option<(Instant, u64, f64)>>, // (fetched_at, chain_id, usd)
+    fees: Mutex<Option<(Instant, u64, FeeSuggestion)>>, // (fetched_at, chain_id, fee)
+}
+
 pub struct Wallet {
     secrets: WalletSecrets,
     keys: KeySource,
     provider: Option<RpcProvider>,
     provider_cfg: ProviderConfig,
+    caches: NetCaches,
 }
 
 impl Wallet {
@@ -241,6 +273,7 @@ impl Wallet {
             keys: KeySource::Software(seed),
             provider: None,
             provider_cfg: ProviderConfig::default(),
+            caches: NetCaches::default(),
         })
     }
 
@@ -267,6 +300,7 @@ impl Wallet {
             keys: KeySource::Hardware(HwContext { kind, passphrase: passphrase.to_string() }),
             provider: None,
             provider_cfg: ProviderConfig::default(),
+            caches: NetCaches::default(),
         })
     }
 
@@ -286,8 +320,10 @@ impl Wallet {
             let kind = HwKind::parse(&hw.kind)?;
             // Require the device now and verify it derives the same first address.
             let derived = crate::ffi::block_on(hardware::get_address(kind, passphrase, 0))?;
+            // An empty stored address list must NOT skip verification (that would open the wallet
+            // against any connected device/passphrase) — treat it as a mismatch.
             let expected = hw.addresses.first().cloned().unwrap_or_default();
-            if !expected.is_empty() && !derived.eq_ignore_ascii_case(&expected) {
+            if expected.is_empty() || !derived.eq_ignore_ascii_case(&expected) {
                 return Err(CoreError::rpc(
                     "hardware device/passphrase does not match this wallet".to_string(),
                 ));
@@ -297,6 +333,7 @@ impl Wallet {
                 keys: KeySource::Hardware(HwContext { kind, passphrase: passphrase.to_string() }),
                 provider: None,
                 provider_cfg: ProviderConfig::default(),
+                caches: NetCaches::default(),
             });
         }
 
@@ -307,6 +344,7 @@ impl Wallet {
                 provider: None,
                 provider_cfg: ProviderConfig::default(),
                 secrets,
+                caches: NetCaches::default(),
             });
         }
 
@@ -317,6 +355,7 @@ impl Wallet {
             provider: None,
             provider_cfg: ProviderConfig::default(),
             secrets,
+            caches: NetCaches::default(),
         })
     }
 
@@ -352,6 +391,7 @@ impl Wallet {
             keys: KeySource::WatchOnly,
             provider: None,
             provider_cfg: ProviderConfig::default(),
+            caches: NetCaches::default(),
         })
     }
 
@@ -495,7 +535,16 @@ impl Wallet {
     /// Sign a UTF-8 message with EIP-191 (`personal_sign`) using account `index`.
     /// Returns a 0x-prefixed 65-byte signature. Unavailable for hardware wallets here.
     pub fn sign_message(&self, index: u32, message: &str) -> Result<String> {
-        let signer = self.local_signer(index)?;
+        // Hardware wallets: on-device personal_sign isn't wired yet (the Ledger signer's message API
+        // sits behind a conflicting alloy_signer version in the dependency graph). Transaction signing
+        // on-device works; message signing needs a software account for now.
+        if matches!(&self.keys, KeySource::Hardware(_)) {
+            return Err(CoreError::Signing(
+                "message signing on a hardware wallet isn't supported yet — use a software account"
+                    .into(),
+            ));
+        }
+        let signer = self.local_signer(index)?; // errors for watch-only
         let sig = signer
             .sign_message_sync(message.as_bytes())
             .map_err(|e| CoreError::Signing(format!("sign message: {e}")))?;
@@ -1192,6 +1241,19 @@ impl Wallet {
     /// on-chain Chainlink feed; on other chains (where that feed's RPC isn't reachable) it falls
     /// back to CoinGecko over Tor, keyed by the chain's native coin id.
     pub async fn native_usd_price(&self) -> Result<f64> {
+        let chain = self.provider()?.chain_id();
+        // Serve a recent price (≤20s) instead of re-fetching on every connect / tab switch / block.
+        if let Some((t, cid, p)) = *self.caches.native_price.lock().unwrap() {
+            if cid == chain && t.elapsed() < Duration::from_secs(20) {
+                return Ok(p);
+            }
+        }
+        let p = self.native_usd_price_inner().await?;
+        *self.caches.native_price.lock().unwrap() = Some((Instant::now(), chain, p));
+        Ok(p)
+    }
+
+    async fn native_usd_price_inner(&self) -> Result<f64> {
         let info = chain_info(self.provider()?.chain_id());
 
         // Ethereum mainnet: prefer the trustless on-chain Chainlink feed.
@@ -1419,7 +1481,63 @@ impl Wallet {
             .map_err(|e| CoreError::rpc(format!("bad block number: {e}")))
     }
 
+    /// Transaction receipt for `tx_hash`. `Value::Null` until the tx is mined; once mined, an object
+    /// with `status` ("0x1" success / "0x0" reverted) and `blockNumber`. The UI polls this after a
+    /// send so the balance/history confirm the instant the tx lands, not on a fixed timer.
+    pub async fn tx_receipt(&self, tx_hash: &str) -> Result<serde_json::Value> {
+        self.provider()?
+            .call("eth_getTransactionReceipt", serde_json::json!([tx_hash]))
+            .await
+    }
+
+    /// Resolve an ENS name (e.g. "vitalik.eth") to a checksummed address via the ENS registry +
+    /// resolver on Ethereum mainnet. Errors on non-mainnet chains or unresolved names.
+    pub async fn resolve_ens(&self, name: &str) -> Result<String> {
+        let provider = self.provider()?;
+        if provider.chain_id() != 1 {
+            return Err(CoreError::rpc("ENS names resolve on Ethereum mainnet only"));
+        }
+        let node = ens_namehash(name.trim());
+        // ENS registry.resolver(bytes32) -> address (selector 0x0178b8bf).
+        const REGISTRY: &str = "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e";
+        let mut d1 = vec![0x01u8, 0x78, 0xb8, 0xbf];
+        d1.extend_from_slice(&node);
+        let r1 = provider.eth_call(REGISTRY, &format!("0x{}", hex::encode(&d1))).await?;
+        let resolver = word_to_address(r1.as_str().unwrap_or(""))?;
+        if resolver == Address::ZERO {
+            return Err(CoreError::rpc("ENS name has no resolver"));
+        }
+        // resolver.addr(bytes32) -> address (selector 0x3b3b57de).
+        let mut d2 = vec![0x3bu8, 0x3b, 0x57, 0xde];
+        d2.extend_from_slice(&node);
+        let r2 = provider
+            .eth_call(&resolver.to_checksum(None), &format!("0x{}", hex::encode(&d2)))
+            .await?;
+        let addr = word_to_address(r2.as_str().unwrap_or(""))?;
+        if addr == Address::ZERO {
+            return Err(CoreError::rpc("ENS name does not resolve to an address"));
+        }
+        Ok(addr.to_checksum(None))
+    }
+
     pub async fn suggest_fees(&self) -> Result<FeeSuggestion> {
+        let chain = self.provider()?.chain_id();
+        // Fees change at most once per block (~12s on mainnet, faster on L2s); a 5s cache absorbs
+        // the repeated fee refreshes fired by opening/toggling the Send and Swap tabs.
+        {
+            let guard = self.caches.fees.lock().unwrap();
+            if let Some((t, cid, f)) = guard.as_ref() {
+                if *cid == chain && t.elapsed() < Duration::from_secs(5) {
+                    return Ok(f.clone());
+                }
+            }
+        }
+        let f = self.suggest_fees_inner().await?;
+        *self.caches.fees.lock().unwrap() = Some((Instant::now(), chain, f.clone()));
+        Ok(f)
+    }
+
+    async fn suggest_fees_inner(&self) -> Result<FeeSuggestion> {
         let provider = self.provider()?;
 
         // Legacy-gas chains (BSC) have no EIP-1559 base fee: quote a flat `gasPrice`. We map it into
@@ -1460,8 +1578,9 @@ impl Wallet {
                 (gp, U256::from(1_000_000_000u64))
             }
         };
-        // maxFee = 2*baseFee + tip (standard headroom for one base-fee bump)
-        let max_fee = base_fee * U256::from(2u64) + tip;
+        // maxFee = 3*baseFee + tip. Base fee can rise up to 12.5% per block; 3x gives ~9 blocks of
+        // headroom so a tx sent into a rising-fee period doesn't get stuck (2x could underprice).
+        let max_fee = base_fee * U256::from(3u64) + tip;
         Ok(FeeSuggestion {
             base_fee: base_fee.to_string(),
             max_priority_fee: tip.to_string(),
@@ -1520,6 +1639,26 @@ impl Wallet {
     ) -> Result<serde_json::Value> {
         let provider = self.provider()?;
         let from = parse_address(&self.address(from_index)?)?;
+        // ERC-20 pre-flight: make sure the account holds enough of the token for EVERY recipient
+        // before broadcasting anything, so we don't spend gas on the first transfers only to have
+        // later ones revert (native multi-send is atomic via Multicall3 and doesn't need this).
+        if !token.is_empty() {
+            let mut total = U256::ZERO;
+            for (_, amount) in recipients {
+                let a = U256::from_str(amount.trim())
+                    .map_err(|_| CoreError::Amount("invalid token amount".into()))?;
+                total = total
+                    .checked_add(a)
+                    .ok_or_else(|| CoreError::Amount("total overflow".into()))?;
+            }
+            let bal = U256::from_str(&self.erc20_balance(token, from_index).await?.raw)
+                .unwrap_or(U256::ZERO);
+            if bal < total {
+                return Err(CoreError::Amount(format!(
+                    "not enough of this token to pay all recipients (need {total}, have {bal})"
+                )));
+            }
+        }
         let start = parse_hex_u64(&provider.get_transaction_count(&from.to_string()).await?)?;
         let mut out: Vec<serde_json::Value> = Vec::with_capacity(recipients.len());
         for (i, (to, amount)) in recipients.iter().enumerate() {
@@ -1540,6 +1679,41 @@ impl Wallet {
         Ok(serde_json::json!(out))
     }
 
+    /// Atomic native-coin multi-send: pay many recipients in ONE transaction via Multicall3's
+    /// `aggregate3Value` (all-or-nothing — if any transfer would fail, the whole tx reverts, so no
+    /// partial sends / stranded nonces). `recipients` are (address, decimal-wei). Native only.
+    pub async fn send_many_native(
+        &self,
+        from_index: u32,
+        recipients: &[(String, String)],
+        fee: Option<(u128, u128)>,
+    ) -> Result<SendResult> {
+        if recipients.is_empty() {
+            return Err(CoreError::rpc("no recipients"));
+        }
+        let mut calls: Vec<Call3Value> = Vec::with_capacity(recipients.len());
+        let mut total = U256::ZERO;
+        for (to, amount) in recipients {
+            let value = U256::from_str(amount.trim())
+                .map_err(|_| CoreError::Amount("invalid wei amount".into()))?;
+            total = total
+                .checked_add(value)
+                .ok_or_else(|| CoreError::Amount("total overflow".into()))?;
+            calls.push(Call3Value {
+                target: parse_address(to)?,
+                allowFailure: false, // any failed transfer reverts the whole batch
+                value,
+                callData: Bytes::new(), // plain value transfer to an EOA
+            });
+        }
+        let data = aggregate3ValueCall { calls }.abi_encode();
+        // msg.value MUST equal the sum (Multicall3 forwards each call's value; any surplus would be
+        // stuck in the contract) — we send exactly `total`.
+        self.build_sign_send(from_index, parse_address(MULTICALL3)?, total, Bytes::from(data), None,
+                             fee, None)
+            .await
+    }
+
     /// Broadcast an already-signed raw transaction (0x-prefixed RLP). Works for any wallet type
     /// (no keys needed) — this is the "transaction pusher" used to relay an offline-signed tx over
     /// Tor. Returns the resulting tx hash.
@@ -1551,12 +1725,23 @@ impl Wallet {
         } else {
             format!("0x{t}")
         };
+        // Decode the nonce from the signed RLP BEFORE broadcasting so a later speed-up/cancel (which
+        // reuses SendResult.nonce) targets the right nonce instead of 0.
+        let nonce = {
+            use alloy::consensus::{Transaction as _, TxEnvelope};
+            use alloy::eips::eip2718::Decodable2718;
+            hex::decode(raw.trim_start_matches("0x").trim_start_matches("0X"))
+                .ok()
+                .and_then(|bytes| TxEnvelope::decode_2718(&mut bytes.as_slice()).ok())
+                .map(|env| env.nonce())
+                .unwrap_or(0)
+        };
         let result = provider.send_raw_transaction(&raw).await?;
         let tx_hash = result
             .as_str()
             .ok_or_else(|| CoreError::rpc("broadcast returned no hash"))?
             .to_string();
-        Ok(SendResult { tx_hash, nonce: 0 })
+        Ok(SendResult { tx_hash, nonce })
     }
 
     /// Build the fields of an UNSIGNED transaction (resolving nonce + gas + fees over the network),
@@ -1696,6 +1881,75 @@ impl Wallet {
             from_index, self_addr, U256::ZERO, Bytes::new(), Some(21000), fee, Some(nonce),
         )
         .await
+    }
+
+    /// Replace-by-fee an ARBITRARY still-pending transaction of `from_index`, found by hash. When
+    /// `cancel` is true, replace it with a 0-value self-send (cancel); otherwise rebroadcast the SAME
+    /// recipient/value/data at the given (higher) fee (speed-up). Fetches the tx to recover its exact
+    /// nonce + fields, so this works on any unconfirmed tx from history, not just the last one.
+    pub async fn replace_tx(
+        &self,
+        from_index: u32,
+        tx_hash: &str,
+        fee: Option<(u128, u128)>,
+        cancel: bool,
+    ) -> Result<SendResult> {
+        let provider = self.provider()?;
+        let v = provider
+            .call("eth_getTransactionByHash", serde_json::json!([tx_hash]))
+            .await?;
+        if v.is_null() {
+            return Err(CoreError::rpc("transaction not found (may have already confirmed/dropped)"));
+        }
+        if v.get("blockNumber").map(|b| !b.is_null()).unwrap_or(false) {
+            return Err(CoreError::rpc("transaction already confirmed — nothing to replace"));
+        }
+        let self_addr = parse_address(&self.address(from_index)?)?;
+        // Only the sender can replace their own tx (same from + nonce).
+        let from = v.get("from").and_then(|x| x.as_str()).unwrap_or("");
+        if !from.eq_ignore_ascii_case(&self_addr.to_string()) {
+            return Err(CoreError::rpc("this transaction was not sent from the selected account"));
+        }
+        let nonce = parse_hex_u64(&v["nonce"])?;
+        // A node rejects a replacement that isn't ~12.5% above the ORIGINAL fee. Floor the fee at
+        // 115% of the pending tx's own fee (reading it from the fetched tx), so replacing any stuck
+        // tx always succeeds regardless of what the caller passed.
+        let orig_max = parse_hex_u256(&v["maxFeePerGas"])
+            .or_else(|_| parse_hex_u256(&v["gasPrice"]))
+            .unwrap_or(U256::ZERO);
+        let orig_tip = parse_hex_u256(&v["maxPriorityFeePerGas"]).unwrap_or(orig_max);
+        let bump = |x: U256| x * U256::from(115u64) / U256::from(100u64);
+        let (base_max, base_tip) = match fee {
+            Some((mf, mp)) => (U256::from(mf), U256::from(mp)),
+            None => {
+                let s = self.suggest_fees().await?;
+                (
+                    U256::from_str(&s.max_fee).unwrap_or(U256::ZERO),
+                    U256::from_str(&s.max_priority_fee).unwrap_or(U256::ZERO),
+                )
+            }
+        };
+        let final_max = base_max.max(bump(orig_max));
+        let mut final_tip = base_tip.max(bump(orig_tip));
+        if final_tip > final_max {
+            final_tip = final_max;
+        }
+        let fee = Some((final_max.saturating_to::<u128>(), final_tip.saturating_to::<u128>()));
+        if cancel {
+            return self
+                .build_sign_send(from_index, self_addr, U256::ZERO, Bytes::new(), Some(21000), fee,
+                                  Some(nonce))
+                .await;
+        }
+        let to = v.get("to").and_then(|x| x.as_str()).unwrap_or("");
+        let to_addr = if to.is_empty() { self_addr } else { parse_address(to)? };
+        let value = parse_hex_u256(&v["value"]).unwrap_or(U256::ZERO);
+        let input = v.get("input").and_then(|x| x.as_str()).unwrap_or("0x");
+        let data = Bytes::from(
+            hex::decode(input.trim_start_matches("0x").trim_start_matches("0X")).unwrap_or_default(),
+        );
+        self.build_sign_send(from_index, to_addr, value, data, None, fee, Some(nonce))
+            .await
     }
 
     // ---------- CoW Protocol swaps ----------
@@ -1878,9 +2132,12 @@ impl Wallet {
                     "0".to_string()
                 };
                 let buy_amount = d.get("amountOut").map(json_num_str).unwrap_or_default();
+                // On-chain slippage is enforced by Kyber's `slippageTolerance` (above); report the
+                // matching displayed minimum so the confirm dialog doesn't overstate the guarantee.
+                let min_buy_amount = apply_slippage_min(&buy_amount, slippage_bps);
                 Ok(serde_json::json!({
                     "to": router, "data": data, "value": value, "spender": router,
-                    "buy_amount": buy_amount, "min_buy_amount": buy_amount,
+                    "buy_amount": buy_amount, "min_buy_amount": min_buy_amount,
                 }))
             }
             "odos" => {
@@ -1918,9 +2175,12 @@ impl Wallet {
                 let to = tx.get("to").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let data = tx.get("data").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let value = tx.get("value").map(json_num_str).unwrap_or_else(|| "0".into());
+                // On-chain slippage is enforced by Odos's `slippageLimitPercent` (above); report the
+                // matching displayed minimum rather than the un-slipped expected output.
+                let min_buy_amount = apply_slippage_min(&buy_amount, slippage_bps);
                 Ok(serde_json::json!({
                     "to": to.clone(), "data": data, "value": value, "spender": to,
-                    "buy_amount": buy_amount, "min_buy_amount": buy_amount,
+                    "buy_amount": buy_amount, "min_buy_amount": min_buy_amount,
                 }))
             }
             "paraswap" => {
@@ -2589,6 +2849,7 @@ impl Wallet {
                 timestamp: s("timeStamp").parse().unwrap_or(0),
                 fee: String::new(),
                 failed: false,
+                log_index: s("logIndex").parse().unwrap_or(0),
                 ..Default::default()
             });
         }
@@ -2628,7 +2889,13 @@ impl Wallet {
         // e.g. a swap moving two assets in one tx) are preserved.
         let mut seen = std::collections::HashSet::new();
         items.retain(|h| {
-            seen.insert(format!("{}|{}|{}|{}", h.tx_hash, h.token, h.direction, h.amount))
+            // Include the log index so two LEGITIMATE identical transfers of the same token+amount in
+            // one tx (e.g. a batch/airdrop emitting two equal Transfer events) aren't collapsed into
+            // one — while true duplicate rows (same log index) from overlapping pages still dedup.
+            seen.insert(format!(
+                "{}|{}|{}|{}|{}",
+                h.tx_hash, h.token, h.direction, h.amount, h.log_index
+            ))
         });
 
         // Collapse on-chain swaps into a single "Swap A -> B" row: any tx where the owner both sent
@@ -2704,6 +2971,7 @@ impl Wallet {
                 buy_symbol: buy_sym,
                 buy_formatted: format_units(buy_amt, buy_dec),
                 status,
+                log_index: 0,
             });
         }
         Ok(out)
@@ -2770,6 +3038,12 @@ impl Wallet {
     /// Fetch an image URL over Tor and return it hex-encoded (empty on error / oversized). Used for
     /// NFT thumbnails so remote fetches never leak the user's IP.
     pub async fn fetch_image_hex(&self, url: &str) -> Result<String> {
+        // NFT image URLs come from an untrusted explorer response. Only fetch https:// (over Tor this
+        // is safe; but in direct/own-node mode an http://127.0.0.1/... URL would be an SSRF against
+        // local services, and http:// leaks in cleartext). Reject everything else.
+        if !is_safe_image_url(url) {
+            return Err(CoreError::rpc("unsupported or unsafe image URL"));
+        }
         let bytes = self.provider()?.http_get_bytes(url).await?;
         if bytes.len() > 3_000_000 {
             return Err(CoreError::rpc("image too large"));
@@ -3168,6 +3442,7 @@ fn group_swaps(items: Vec<HistoryItem>) -> Vec<HistoryItem> {
             buy_symbol: items[bi].symbol.clone(),
             buy_formatted: items[bi].formatted.clone(),
             status: if failed { "failed".into() } else { "done".into() },
+            log_index: 0,
         });
         for &i in &idxs {
             remove[i] = true; // fold every transfer of this swap tx into the single row
@@ -3186,7 +3461,84 @@ fn group_swaps(items: Vec<HistoryItem>) -> Vec<HistoryItem> {
 }
 
 fn parse_address(s: &str) -> Result<Address> {
-    Address::from_str(s.trim()).map_err(|_| CoreError::Address(s.to_string()))
+    let t = s.trim();
+    // If the input is MIXED-case it carries an EIP-55 checksum — enforce it so a mistyped/corrupted
+    // paste (a wrong checksum) is rejected rather than silently accepted (funds-loss defence). All-
+    // lower / all-upper input has no checksum to verify, so parse it leniently.
+    let hex = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+    let has_lower = hex.chars().any(|c| c.is_ascii_lowercase());
+    let has_upper = hex.chars().any(|c| c.is_ascii_uppercase());
+    if has_lower && has_upper {
+        return Address::parse_checksummed(t, None).map_err(|_| CoreError::Address(s.to_string()));
+    }
+    Address::from_str(t).map_err(|_| CoreError::Address(s.to_string()))
+}
+
+/// EIP-137 ENS namehash of a dotted name ("a.b.eth"): node = keccak256(parent_node ++ keccak256(label)),
+/// folded right-to-left from the zero root.
+fn ens_namehash(name: &str) -> [u8; 32] {
+    use alloy::primitives::keccak256;
+    let mut node = [0u8; 32];
+    if !name.is_empty() {
+        for label in name.split('.').rev() {
+            let label_hash = keccak256(label.as_bytes());
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&node);
+            buf[32..].copy_from_slice(label_hash.as_slice());
+            node = keccak256(buf).0;
+        }
+    }
+    node
+}
+
+/// Extract the 20-byte address from a 32-byte ABI word returned by an `eth_call` (0x + 64 hex).
+fn word_to_address(hex_word: &str) -> Result<Address> {
+    let s = hex_word.trim_start_matches("0x").trim_start_matches("0X");
+    if s.len() < 64 {
+        return Err(CoreError::rpc("bad eth_call result word"));
+    }
+    Address::from_str(&format!("0x{}", &s[24..64])).map_err(|_| CoreError::rpc("bad address word"))
+}
+
+/// Whether an (untrusted) NFT image URL is safe to fetch: https only, and NOT pointing at a
+/// loopback/private host (SSRF defence for direct/own-node mode; over Tor these can't be reached
+/// anyway, but we reject them regardless). data: URLs are handled by the caller before this.
+fn is_safe_image_url(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if u.scheme() != "https" {
+        return false;
+    }
+    match u.host_str() {
+        Some(h) => {
+            let host = h.trim_start_matches('[').trim_end_matches(']');
+            if host.eq_ignore_ascii_case("localhost") {
+                return false;
+            }
+            // Reject loopback/private/link-local IP literals; allow hostnames (resolved via Tor).
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                let bad = ip.is_loopback()
+                    || ip.is_unspecified()
+                    || match ip {
+                        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+                        std::net::IpAddr::V6(_) => false,
+                    };
+                return !bad;
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// Minimum output after `slippage_bps` slippage, as a decimal-wei string: `amount * (10000-bps)/10000`
+/// (bps capped at 50%). Used to display an honest "minimum received" for routers whose calldata
+/// enforces slippage internally.
+fn apply_slippage_min(amount_wei: &str, slippage_bps: u32) -> String {
+    let a = U256::from_str(amount_wei.trim()).unwrap_or(U256::ZERO);
+    let bps = U256::from(10_000u64.saturating_sub(slippage_bps.min(5_000) as u64));
+    (a * bps / U256::from(10_000u64)).to_string()
 }
 
 fn parse_hex_u256(v: &serde_json::Value) -> Result<U256> {
@@ -3353,6 +3705,9 @@ fn parse_openocean_quote(resp: &serde_json::Value) -> Result<RouterQuote> {
 }
 
 pub fn format_units(value: U256, decimals: u8) -> String {
+    // A malicious token can report absurd decimals; 10^decimals overflows U256 past ~77. Clamp so a
+    // crafted token can't panic the formatter (it just displays with fewer places).
+    let decimals = decimals.min(36);
     let base = U256::from(10u64).pow(U256::from(decimals as u64));
     let whole = value / base;
     let frac = value % base;
@@ -3366,6 +3721,7 @@ pub fn format_units(value: U256, decimals: u8) -> String {
 
 /// Parse a decimal string (e.g. "1.25") into an integer amount with `decimals`.
 pub fn parse_units(amount: &str, decimals: u8) -> Result<U256> {
+    let decimals = decimals.min(36); // guard against adversarial token decimals (10^d overflow)
     let amount = amount.trim();
     let (whole, frac) = match amount.split_once('.') {
         Some((w, f)) => (w, f),
@@ -3389,6 +3745,29 @@ pub fn parse_units(amount: &str, decimals: u8) -> Result<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ens_namehash_matches_eip137_vectors() {
+        // Canonical EIP-137 test vectors.
+        assert_eq!(ens_namehash(""), [0u8; 32]);
+        assert_eq!(
+            hex::encode(ens_namehash("eth")),
+            "93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae"
+        );
+        assert_eq!(
+            hex::encode(ens_namehash("foo.eth")),
+            "de9b09fd7c5f901e23a3f19fecc54828e9c848539801e86591bd9801b019f84f"
+        );
+    }
+
+    #[test]
+    fn word_to_address_extracts_low_20_bytes() {
+        let word = "0x000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045";
+        assert_eq!(
+            word_to_address(word).unwrap().to_checksum(None),
+            "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+        );
+    }
 
     #[test]
     fn parse_router_quotes_from_samples() {

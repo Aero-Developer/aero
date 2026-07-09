@@ -1,2 +1,41 @@
-// Windows executable icon (shown in Explorer / taskbar for aero_gui.exe).
+// Windows resources for aero_gui.exe: icon, application manifest, and a full version-info block.
+// A legitimate app always carries publisher/version metadata and a manifest; their ABSENCE is one of
+// the signals machine-learning AV heuristics (e.g. Microsoft Defender "Trojan:Win32/Bearfoos.A!ml")
+// use to false-positive an unsigned binary. Adding them — plus code-signing the release — is what
+// removes those heuristic flags.
+#include <windows.h>
+
 IDI_ICON1 ICON "assets/images/appicons/appicon.ico"
+
+// Application manifest: run as the invoking user (never request elevation — a common malware trait),
+// and declare Windows 10/11 support.
+1 RT_MANIFEST "aero.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Aero Wallet"
+            VALUE "FileDescription", "Aero - private Ethereum wallet (Tor-routed)"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "aero_gui"
+            VALUE "LegalCopyright", "Aero Wallet - BSD-3-Clause. Open source."
+            VALUE "OriginalFilename", "aero_gui.exe"
+            VALUE "ProductName", "Aero Wallet"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -135,6 +135,13 @@ struct Envelope {
 }
 
 fn argon2_with(m_cost: u32, t_cost: u32, p_cost: u32) -> Result<Argon2<'static>> {
+    // The KDF params come from the (attacker-modifiable) file header and are used to allocate memory
+    // BEFORE the AAD/tag can be verified. Reject implausible values so a tampered/corrupt file can't
+    // trigger a multi-gigabyte allocation and OOM-kill the process on open. Legitimate files use
+    // 64 MiB / t=3 / p=1, so these caps (1 GiB / 16 / 8) never reject a real wallet.
+    if m_cost > 1_048_576 || t_cost > 16 || p_cost > 8 {
+        return Err(CoreError::Keystore("implausible KDF parameters".into()));
+    }
     let params = Params::new(m_cost, t_cost, p_cost, None)
         .map_err(|e| CoreError::Keystore(format!("argon2 params: {e}")))?;
     Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
@@ -230,7 +237,8 @@ fn decrypt_v4(data: &[u8], password: &str) -> Result<WalletSecrets> {
     let m = u32be(take(data, 5, 4)?);
     let t = u32be(take(data, 9, 4)?);
     let p = u32be(take(data, 13, 4)?);
-    let salt_len = data[17] as usize;
+    // Bounds-checked (a crafted <18-byte file must not panic via data[17]).
+    let salt_len = *take(data, 17, 1)?.first().unwrap() as usize;
     let salt = take(data, 18, salt_len)?.to_vec();
     let nonce_off = 18 + salt_len;
     let nonce_len = *take(data, nonce_off, 1)?.first().unwrap() as usize;
@@ -331,8 +339,15 @@ mod tests {
         // header byte — e.g. trying to lower the Argon2 memory cost — fails authentication.
         let mut blob = encrypt(&sample(""), "pw").unwrap();
         assert!(decrypt(&blob, "pw").is_ok());
-        blob[6] ^= 0xff; // inside the m_cost field (offset 5..9)
-        assert!(matches!(decrypt(&blob, "pw"), Err(CoreError::BadPassword)));
+        // Flip the LOW m_cost byte (offset 8): the value stays plausible (passes the param clamp), so
+        // AES-GCM AAD authentication is what rejects the tampered header.
+        let mut aad_tampered = blob.clone();
+        aad_tampered[8] ^= 0xff;
+        assert!(matches!(decrypt(&aad_tampered, "pw"), Err(CoreError::BadPassword)));
+        // Flip a HIGH m_cost byte (offset 6): now the value is implausibly large and is rejected up
+        // front by the param clamp (before any multi-GiB allocation) — still a rejection.
+        blob[6] ^= 0xff;
+        assert!(decrypt(&blob, "pw").is_err());
     }
 
     #[test]

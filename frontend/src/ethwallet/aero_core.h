@@ -35,6 +35,12 @@ char *aero_version(void);
 void aero_string_free(char *s);
 
 /**
+ * Free a string that carried SECRET material (mnemonic / exported private key), zeroizing the bytes
+ * first so the plaintext doesn't linger in freed heap.
+ */
+void aero_secret_string_free(char *s);
+
+/**
  * Create a new wallet with a fresh random mnemonic (`word_count` = 12 or 24).
  */
 AeroWallet *aero_wallet_create_new(uint32_t word_count);
@@ -337,6 +343,27 @@ char *aero_wallet_send_many(AeroWallet *w,
                             const char *max_priority_wei);
 
 /**
+ * Atomic native multi-send via Multicall3 (one tx, all-or-nothing). `recipients_json` is a JSON
+ * array of [address, decimal-wei]. Returns JSON SendResult. Caller frees.
+ */
+char *aero_wallet_send_many_native(AeroWallet *w,
+                                   uint32_t from_index,
+                                   const char *recipients_json,
+                                   const char *max_fee_wei,
+                                   const char *max_priority_wei);
+
+/**
+ * Replace-by-fee an arbitrary still-pending tx (by hash): cancel=true self-sends 0 at its nonce,
+ * else rebroadcasts the same tx at a higher fee (speed-up). Returns JSON SendResult. Caller frees.
+ */
+char *aero_wallet_replace_tx(AeroWallet *w,
+                             uint32_t from_index,
+                             const char *tx_hash,
+                             const char *max_fee_wei,
+                             const char *max_priority_wei,
+                             bool cancel);
+
+/**
  * Broadcast an already-signed raw transaction (0x RLP hex) over the wallet's RPC/Tor. Returns JSON
  * `SendResult`. Works for watch-only wallets too (no keys needed). Caller frees the string.
  */
@@ -520,6 +547,20 @@ char *aero_wallet_erc20_history(AeroWallet *w,
  */
 char *aero_wallet_account_history(AeroWallet *w,
                                   uint32_t index);
+
+/**
+ * Transaction receipt JSON for `tx_hash` ("null" until mined; then an object with `status` +
+ * `blockNumber`). Interactive priority (the UI polls this to confirm a send fast). Caller frees.
+ */
+char *aero_wallet_tx_receipt(AeroWallet *w,
+                             const char *tx_hash);
+
+/**
+ * Resolve an ENS name (e.g. "alice.eth") to a checksummed 0x address (Ethereum mainnet only).
+ * Returns the address string, or NULL on error. Caller frees.
+ */
+char *aero_wallet_resolve_ens(AeroWallet *w,
+                              const char *name);
 
 /**
  * CoW Protocol swap orders (pending + historical) for `index` from CoW's order-book API over Tor,

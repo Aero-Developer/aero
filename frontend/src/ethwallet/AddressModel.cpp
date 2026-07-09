@@ -33,7 +33,10 @@ void AddressModel::rebuildVisible() {
 }
 
 quint32 AddressModel::accountAt(int row) const {
-    return (row >= 0 && row < m_visible.size()) ? m_visible.at(row) : static_cast<quint32>(row);
+    // Out-of-range rows (e.g. an empty/filtered model) return an INVALID sentinel rather than the raw
+    // row index — otherwise callers would silently act on "account 0"/garbage. static_cast<int> of the
+    // sentinel is -1, so the int-based guards in callers reject it.
+    return (row >= 0 && row < m_visible.size()) ? m_visible.at(row) : 0xFFFFFFFFu;
 }
 
 int AddressModel::rowForAccount(quint32 index) const {

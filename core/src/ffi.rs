@@ -69,6 +69,20 @@ pub extern "C" fn aero_string_free(s: *mut c_char) {
     }
 }
 
+/// Free a string that carried SECRET material (mnemonic / exported private key), zeroizing the
+/// bytes first so the plaintext doesn't linger in freed heap. Callers use this instead of
+/// `aero_string_free` for `aero_wallet_mnemonic` / `aero_wallet_export_private_key`.
+#[no_mangle]
+pub extern "C" fn aero_secret_string_free(s: *mut c_char) {
+    if !s.is_null() {
+        use zeroize::Zeroize;
+        unsafe {
+            let mut bytes = CString::from_raw(s).into_bytes();
+            bytes.zeroize();
+        }
+    }
+}
+
 // ---------------- wallet lifecycle ----------------
 
 /// Create a new wallet with a fresh random mnemonic (`word_count` = 12 or 24).
@@ -912,6 +926,45 @@ pub extern "C" fn aero_wallet_send_many(
     block_json(w, |w| RUNTIME.block_on(w.send_many(from_index, &recipients, &token, fee)))
 }
 
+/// Atomic native multi-send via Multicall3 (one tx, all-or-nothing). `recipients_json` is a JSON
+/// array of [address, decimal-wei]. Returns JSON `SendResult`. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_send_many_native(
+    w: *mut Wallet,
+    from_index: u32,
+    recipients_json: *const c_char,
+    max_fee_wei: *const c_char,
+    max_priority_wei: *const c_char,
+) -> *mut c_char {
+    let Some(rj) = from_cstr(recipients_json) else {
+        set_error("null recipients");
+        return ptr::null_mut();
+    };
+    let recipients: Vec<(String, String)> = serde_json::from_str(&rj).unwrap_or_default();
+    let fee = parse_fee_override(max_fee_wei, max_priority_wei);
+    block_json(w, |w| RUNTIME.block_on(w.send_many_native(from_index, &recipients, fee)))
+}
+
+/// Replace-by-fee an arbitrary still-pending tx (found by hash) of `from_index`: `cancel`=true does
+/// a 0-value self-send at its nonce; otherwise rebroadcasts the same tx at a higher fee (speed-up).
+/// Returns JSON `SendResult`. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_replace_tx(
+    w: *mut Wallet,
+    from_index: u32,
+    tx_hash: *const c_char,
+    max_fee_wei: *const c_char,
+    max_priority_wei: *const c_char,
+    cancel: bool,
+) -> *mut c_char {
+    let Some(tx_hash) = from_cstr(tx_hash) else {
+        set_error("null tx_hash");
+        return ptr::null_mut();
+    };
+    let fee = parse_fee_override(max_fee_wei, max_priority_wei);
+    block_json(w, |w| RUNTIME.block_on(w.replace_tx(from_index, &tx_hash, fee, cancel)))
+}
+
 /// Broadcast an already-signed raw transaction (0x RLP hex) over the wallet's RPC/Tor. Returns JSON
 /// `SendResult`. Works for watch-only wallets too (no keys needed). Caller frees the string.
 #[no_mangle]
@@ -1299,7 +1352,11 @@ pub extern "C" fn aero_wallet_erc20_history(
         return ptr::null_mut();
     };
     block_json(w, |w| {
-        RUNTIME.block_on(w.erc20_history(&token, index, &from_block))
+        RUNTIME.block_on(crate::provider::background(w.erc20_history(
+            &token,
+            index,
+            &from_block,
+        )))
     })
 }
 
@@ -1307,14 +1364,51 @@ pub extern "C" fn aero_wallet_erc20_history(
 /// explorer over Tor, as a JSON array of `HistoryItem`. Caller frees the string.
 #[no_mangle]
 pub extern "C" fn aero_wallet_account_history(w: *mut Wallet, index: u32) -> *mut c_char {
-    block_json(w, |w| RUNTIME.block_on(w.account_history(index)))
+    block_json(w, |w| {
+        RUNTIME.block_on(crate::provider::background(w.account_history(index)))
+    })
+}
+
+/// Transaction receipt JSON for `tx_hash` ("null" until mined; then an object with `status` +
+/// `blockNumber`). Interactive priority (the UI polls this to confirm a send fast). Caller frees.
+#[no_mangle]
+pub extern "C" fn aero_wallet_tx_receipt(w: *mut Wallet, tx_hash: *const c_char) -> *mut c_char {
+    let Some(tx_hash) = from_cstr(tx_hash) else {
+        set_error("null tx_hash");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| RUNTIME.block_on(w.tx_receipt(&tx_hash)))
+}
+
+/// Resolve an ENS name (e.g. "alice.eth") to a checksummed 0x address (Ethereum mainnet only).
+/// Returns the address string, or NULL on error (see aero_last_error). Caller frees.
+#[no_mangle]
+pub extern "C" fn aero_wallet_resolve_ens(w: *mut Wallet, name: *const c_char) -> *mut c_char {
+    clear_error();
+    let Some(w) = (unsafe { w.as_ref() }) else {
+        set_error("null wallet");
+        return ptr::null_mut();
+    };
+    let Some(name) = from_cstr(name) else {
+        set_error("null name");
+        return ptr::null_mut();
+    };
+    match RUNTIME.block_on(w.resolve_ens(&name)) {
+        Ok(addr) => to_cstr(&addr),
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
 }
 
 /// CoW Protocol swap orders (pending + historical) for `index` from CoW's order-book API over Tor,
 /// as a JSON array of swap `HistoryItem`s (with `status`). Caller frees the string.
 #[no_mangle]
 pub extern "C" fn aero_wallet_cow_orders(w: *mut Wallet, index: u32) -> *mut c_char {
-    block_json(w, |w| RUNTIME.block_on(w.cow_orders(index)))
+    block_json(w, |w| {
+        RUNTIME.block_on(crate::provider::background(w.cow_orders(index)))
+    })
 }
 
 /// Scan every common Ethereum derivation scheme for balances (Electrum-style multi-path recovery),
@@ -1329,7 +1423,7 @@ pub extern "C" fn aero_wallet_scan_funded(w: *mut Wallet, gap_limit: u32) -> *mu
     };
     crate::wallet::SCAN_CHECKED.store(0, std::sync::atomic::Ordering::Relaxed);
     crate::wallet::SCAN_FOUND.store(0, std::sync::atomic::Ordering::Relaxed);
-    match RUNTIME.block_on(w.scan_funded(gap_limit)) {
+    match RUNTIME.block_on(crate::provider::background(w.scan_funded(gap_limit))) {
         Ok(v) => match serde_json::to_string(&v) {
             Ok(s) => to_cstr(&s),
             Err(e) => {
@@ -1386,7 +1480,9 @@ pub extern "C" fn aero_wallet_scan_funded_multi(
             }
         })
         .collect();
-    match RUNTIME.block_on(w.scan_funded_all_chains(configs, gap_limit)) {
+    match RUNTIME.block_on(crate::provider::background(
+        w.scan_funded_all_chains(configs, gap_limit),
+    )) {
         Ok(v) => match serde_json::to_string(&v) {
             Ok(s) => to_cstr(&s),
             Err(e) => {
@@ -1417,7 +1513,9 @@ pub extern "C" fn aero_wallet_scan_found() -> u64 {
 /// Owned NFT collections (ERC-721 + ERC-1155) for an account as a JSON array. Caller frees.
 #[no_mangle]
 pub extern "C" fn aero_wallet_account_nfts(w: *mut Wallet, index: u32) -> *mut c_char {
-    block_json(w, |w| RUNTIME.block_on(w.account_nfts(index)))
+    block_json(w, |w| {
+        RUNTIME.block_on(crate::provider::background(w.account_nfts(index)))
+    })
 }
 
 /// Fetch an image URL over Tor, hex-encoded ("" on error). Caller frees the string.
@@ -1432,7 +1530,7 @@ pub extern "C" fn aero_wallet_fetch_image(w: *mut Wallet, url: *const c_char) ->
         set_error("null url");
         return ptr::null_mut();
     };
-    match RUNTIME.block_on(w.fetch_image_hex(&url)) {
+    match RUNTIME.block_on(crate::provider::background(w.fetch_image_hex(&url))) {
         Ok(hexstr) => to_cstr(&hexstr),
         Err(e) => {
             set_error(e.to_string());

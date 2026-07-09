@@ -12,6 +12,8 @@
 #include <QSet>
 #include <QList>
 
+#include <functional>
+
 #include "ui_MainWindow.h"
 #include "ui_SendWidget.h"
 #include "ui_ReceiveWidget.h"
@@ -132,11 +134,28 @@ private:
     void saveMetadata();              // serialize m_meta into the wallet, then persist (debounced)
     void saveBalanceCache();          // stash the current chain's balances in metadata (for instant reopen)
     void loadBalanceCache();          // show last-known balances instantly, before the Tor refresh
+    void saveHistoryCache();          // persist the current chain's fetched history (debounced)
+    void loadHistoryCache();          // restore the current chain's history instantly (0 requests)
+    void loadHistoricalPrices();      // restore cached per-date prices (immutable) — no re-fetch ever
+    void scheduleHistorySave();       // debounce persisting history after targeted batches arrive
+    void primeZeroBalances();         // show 0 immediately for accounts with no known balance yet
+    // Run a blocking wallet op (Argon2 save/store, or a core-locked read that may wait behind a
+    // running funded scan) OFF the UI thread behind a modal busy dialog, so the UI never freezes.
+    // The work lambda may write results into caller-owned variables (safe: read after this returns).
+    void runBusy(const QString &message, const std::function<void()> &work);
+    void applyOptimisticSend(const QString &amount, const QString &tokenAddr); // instant balance drop
     void scheduleSave();              // debounced, off-thread wallet save (never blocks the UI)
     void migrateLegacyMetadata();     // one-time import from the old plaintext QSettings
     void showCachedBalance(quint32 index); // instant status-bar balance from cache
     void showTransactionDialog(const HistoryItem &tx); // Feather-style tx details (txid + copy)
-    void refreshHistoryView();             // fetch history per the History filter (All / account)
+    void refreshHistoryView();             // full (re)load: clear + fetch viewed + funded accounts
+    void ensureAccountHistory(quint32 index, bool force = false); // targeted fetch (lazy/on-demand)
+    void refreshDirtyHistory();            // refetch only accounts whose balance changed (per block)
+    void onAccountHistoryReady(quint32 index, const QVector<HistoryItem> &items,
+                               quint64 chainId); // append targeted
+    void updatePollCadence();          // fast block poll when focused/sending, slow when idle
+    void startReceiptWatch(const QString &txHash); // fast-poll the tx receipt to confirm a send
+    void onTxReceiptReady(const QString &txHash, bool mined, bool success);
     void rebuildHistoryCombo();            // (re)populate the History account selector
     void updateHistoryPricing();           // push per-symbol USD prices into the History dust filter
     QString fiatStr(double usd) const;     // format a USD value in the user's chosen fiat
@@ -176,6 +195,7 @@ private:
     void swapInlineDone(const QString &summary, const QString &url = QString(),
                         const QString &linkText = QString());
     void addPendingSwap(const QString &id); // optimistic "pending" swap row in History (any network)
+    void startCowPoll();                    // poll swap status while any swap is pending
     quint32 swapSlippageBps() const; // parse the Swap slippage selector
     // MetaMask-style spending-cap approval prompt with an editable cap (exact vs unlimited). Returns
     // the chosen cap as decimal-wei, "max" for unlimited, or an empty string if the user rejects.
@@ -199,6 +219,7 @@ private:
     void updateReceive();
     void ensureMinAddresses(quint32 count);
     void selectAddressRow(quint32 index);
+    void applyReceiveSearch(); // re-hide Receive rows per the search box (survives model resets)
     void populateSendCurrencies();     // reset the Send asset selector to ETH
     void openTokenPicker();            // searchable token picker (held + verified + paste)
     void setSendAsset(const QString &symbol, const QString &address, quint8 decimals);
@@ -208,6 +229,10 @@ private:
     QString currentTokenAddr() const;   // "" == ETH
     double unitPriceUsd(const QString &symbol) const;
     QPixmap renderQr(const QString &text) const;
+    // Air-gapped QR transfer: show a payload as a scannable QR (warns if too big for one code), and
+    // decode a QR from an image file the user picks. Used by the offline sign/broadcast flow.
+    void showQrPopup(const QString &title, const QString &text);
+    QString scanQrFromFile();
     QIcon tokenIcon(const QString &symbol) const; // native coins fall back to the chain icon
 
     Ui::MainWindow ui;
@@ -219,12 +244,18 @@ private:
     quint32 m_account = 0;
 
     void setConnectionState(int mode, const QString &tip); // 2=Tor, 1=Direct, 0=Offline
+    void showConnectionMenu();          // click the status area: status + Reconnect + New circuit
+    void reconnectTor(const QString &reason); // re-establish the connection (restart Tor if it died)
+    void newTorCircuit();               // fresh Tor circuit (restart bundled Tor)
 
     // Custom-node support: return the RPC endpoints / SOCKS proxy to use for `chainId`. If the user
     // saved a custom node for that chain (Settings -> Node) it wins; otherwise the bundled defaults
     // (registry RPCs over the running Tor proxy) are used. socksFor("") == direct/own-node.
     QStringList endpointsFor(quint64 chainId) const;
     QString socksFor(quint64 chainId) const;
+    // If the user opted to share an external Tor (Feather / Tor Browser / system Tor) instead of the
+    // bundled one, returns its SOCKS URL (socks5h://host:port); empty when using the bundled Tor.
+    QString externalSocks() const;
     QString allChainsScanConfig() const; // JSON of every chain's endpoints+socks, for cross-chain scan
     void connectCurrentChain(); // (re)connect the active chain using the resolved node settings
 
@@ -287,21 +318,45 @@ private:
     QLabel *m_homeEthPct = nullptr;
     QHash<quint32, double> m_ethRawByAccount;  // raw ETH balance per account (for combined total)
     QHash<QString, double> m_tokenRawByKey;    // "account|tokenAddr" -> raw token balance
+    // Details of the tx being committed, captured at confirm time so the post-send UI (optimistic
+    // balance drop, history row, notification) uses the ACTUAL token amount — not the raw Amount
+    // field, which may be entered in USD. m_committedIsReplacement suppresses the optimistic drop +
+    // duplicate history row for a speed-up/cancel (a replacement of an already-shown tx).
+    QString m_committedAmount;                 // human token amount (asset units)
+    QString m_committedSymbol;                 // its symbol
+    QString m_committedTokenAddr;              // token contract ("" = native)
+    QString m_committedTo;                     // recipient address
+    quint32 m_committedFrom = 0xFFFFFFFFu;      // account the tx was actually sent FROM (not the live combo)
+    bool m_committedIsReplacement = false;
+    quint32 m_lastSendFrom = 0xFFFFFFFFu;      // account we last sent from (for the optimistic drop)
+    qint64 m_lastSendMs = 0;                   // when we last sent — suppress false "received" while
+                                               // a pre-mine refresh reads the still-higher balance
 
     QTimer *m_refreshTimer = nullptr;
     QTimer *m_blockTimer = nullptr;            // polls the chain head for new blocks
+    QTimer *m_receiptTimer = nullptr;          // fast-polls a just-sent tx's receipt to confirm it
+    QString m_pendingReceiptHash;              // the tx we're watching for confirmation ("" = none)
+    int m_receiptPolls = 0;                    // safety cap on receipt polls
     QTimer *m_saveTimer = nullptr;             // debounces wallet saves (coalesces rapid edits)
+    QTimer *m_histSaveTimer = nullptr;         // debounces persisting the per-chain history cache
     qint64 m_lastBalCacheSaveMs = 0;           // throttles persisting the balance cache (Argon2 cost)
     bool m_balancesFromCache = false;          // suppress "payment received" on the 1st refresh after
                                                // loading stale cached balances (not a live change)
     QTimer *m_homeTotalTimer = nullptr;        // debounces home-total + used-flag recompute
     QTimer *m_scanProgressTimer = nullptr;     // polls live funded-scan progress into the status bar
+    QTimer *m_cowPollTimer = nullptr;          // re-checks CoW/swap status while any swap is pending
     quint64 m_lastBlock = 0;                   // last seen block height
     QSystemTrayIcon *m_tray = nullptr;         // desktop notifications (received / sent)
     TorManager *m_tor = nullptr;               // bundled Tor process supervisor
     HistoryModel *m_historyModel = nullptr;
     QComboBox *m_historyCombo = nullptr;       // History filter: All / a specific account
     int m_historyFilter = -1;                  // -1 = All accounts, else account index
+    // Electrum/Feather-style lazy, status-gated history so we never fan out a fetch over every
+    // (mostly empty) account, and never refetch everything each block.
+    QSet<quint32> m_histFetched;               // accounts whose history is already loaded this session
+    QSet<quint32> m_dirtyHistory;              // accounts whose balance changed -> need a targeted refetch
+    QHash<quint32, double> m_histStatus;       // account balance when its history was last fetched (status gate)
+    quint64 m_historyLoadedChain = ~Q_UINT64_C(0); // chain the history view was (re)loaded for
     QToolButton *m_historyPrev = nullptr;      // pagination: previous 500-row page
     QToolButton *m_historyNext = nullptr;      // pagination: next 500-row page
     QLabel *m_historyPageLabel = nullptr;      // "Page X of Y (N transactions)"
@@ -338,8 +393,12 @@ private:
     bool m_swapCowExecuting = false;           // onSwapQuoteReady should proceed to CoW confirm+exec
     bool m_swapAwaitingApprove = false;        // CoW: waiting for the approve tx to confirm on-chain
     int m_swapApprovePolls = 0;                // CoW: allowance re-check attempts after approving
+    bool m_swapAwaitingRouterApprove = false;  // on-chain router: waiting for approve to mine
+    int m_swapRouterApprovePolls = 0;          // on-chain router: allowance re-check attempts
+    bool m_swapRouterExecuteAfterBuild = false;// on-chain router: routerBuilt should swap immediately
     // Built on-chain tx (from routerBuild), used across confirm -> allowance -> approve -> swap.
     QString m_swapBuiltTo, m_swapBuiltData, m_swapBuiltValue, m_swapBuiltSpender, m_swapBuiltMinBuy;
+    QString m_swapConfirmedMinBuy;             // min-out the user confirmed, to detect a post-approval drop
     QString m_swapSellSymbol = QStringLiteral("ETH");
     QString m_swapSellAddr;                    // "" == native
     quint8 m_swapSellDecimals = 18;
@@ -376,6 +435,9 @@ private:
     bool m_fundedScanned = false;              // a gap-limit scan has completed/was persisted
     int m_connMode = 0;                        // last connection mode (0 off, 1 direct, 2 Tor)
     QString m_connText;                        // last connected status text (to restore after Scanning)
+    int m_connHealthFails = 0;                 // consecutive failed block polls while "connected"
+    bool m_reconnecting = false;               // a self-healing reconnect is in progress
+    bool m_everConnected = false;              // connected at least once (enables drop auto-recovery)
     bool m_fundedScanTried = false;            // guard so auto-scan runs at most once per session
 };
 

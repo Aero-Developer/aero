@@ -327,6 +327,9 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
     }
 
     if (role == Qt::ToolTipRole) {
+        // If a note is shown in place of the counterparty, reveal the real address on hover.
+        if (index.column() == Column_Counterparty && !m_txNotes.value(h.txHash.toLower()).isEmpty())
+            return h.counterparty;
         if (h.failed)
             return tr("This transaction failed (reverted).");
         // Spam/poisoning rows are normally hidden; if visible (toggle off) label them clearly.
@@ -391,10 +394,34 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
             const double val = h.formatted.toDouble() * price * m_fiatRate;
             return QStringLiteral("%1%2").arg(m_fiatSymbol, QString::number(val, 'f', 2));
         }
-        case Column_Counterparty: return h.counterparty;
+        case Column_Counterparty: {
+            const QString note = m_txNotes.value(h.txHash.toLower());
+            return note.isEmpty() ? h.counterparty : note; // note replaces the address (see tooltip)
+        }
         case Column_TxHash:       return h.txHash;
         default:                  return {};
     }
+}
+
+void HistoryModel::setTxNotes(const QHash<QString, QString> &notes) {
+    m_txNotes.clear();
+    for (auto it = notes.constBegin(); it != notes.constEnd(); ++it)
+        if (!it.value().trimmed().isEmpty())
+            m_txNotes.insert(it.key().toLower(), it.value());
+    if (!m_items.isEmpty())
+        emit dataChanged(index(0, Column_Counterparty),
+                         index(m_items.size() - 1, Column_Counterparty));
+}
+
+void HistoryModel::setTxNote(const QString &txHash, const QString &note) {
+    const QString k = txHash.toLower();
+    if (note.trimmed().isEmpty())
+        m_txNotes.remove(k);
+    else
+        m_txNotes.insert(k, note);
+    if (!m_items.isEmpty())
+        emit dataChanged(index(0, Column_Counterparty),
+                         index(m_items.size() - 1, Column_Counterparty));
 }
 
 QVariant HistoryModel::headerData(int section, Qt::Orientation orientation, int role) const {
@@ -416,18 +443,43 @@ void HistoryModel::onHistoryRefreshed(const QVector<HistoryItem> &items) {
     rebuildAll();
 }
 
+void HistoryModel::clearLocal() {
+    m_localSwaps.clear();
+    m_localSends.clear();
+    rebuildAll();
+}
+
+// Stable dedup key for an item, shared by appendBatch (insertion) and loadCachedHistory (seeding) so
+// a cached row is recognised as "already seen" and a later targeted fetch of the same tx dedups.
+QString HistoryModel::dedupKey(const HistoryItem &h) {
+    if (h.kind == QLatin1String("swap") && !h.txHash.isEmpty())
+        return h.txHash.toLower();
+    return QStringLiteral("%1|%2|%3|%4").arg(h.txHash, h.token, h.direction, h.amount);
+}
+
+// Seed the model from persisted (wallet-file) history without any network fetch, and pre-populate the
+// dedup set so a later targeted appendBatch() of the same account merges/dedups correctly.
+void HistoryModel::loadCachedHistory(const QVector<HistoryItem> &items) {
+    m_fetched = items;
+    m_seen.clear();
+    for (const HistoryItem &h : items)
+        m_seen.insert(dedupKey(h));
+    rebuildAll();
+}
+
 // Start of an incremental all-account refresh: clear fetched history + dedup, keep any optimistic
 // local swaps on top, and reset to the first page.
 void HistoryModel::beginFullRefresh() {
     m_fetched.clear();
     m_seen.clear();
-    // Seed dedup with the pending local swaps (by uid) so their settled copies aren't re-added.
-    for (const HistoryItem &h : m_localSwaps)
-        if (!h.txHash.isEmpty())
-            m_seen.insert(h.txHash.toLower());
+    // Show any optimistic pending swaps on top until the fetched (settled) copy arrives, which
+    // appendBatch then reconciles. NOTE: we deliberately do NOT seed m_seen with local swap UIDs —
+    // doing so made appendBatch skip the fetched settled order, so the pending row never flipped to
+    // filled/failed (the "stuck on pending forever" bug).
     m_allItems = m_localSwaps;
+    m_allItems += m_localSends; // keep optimistic pending sends visible across the refresh too
     m_page = 0;
-    rebuildVisible(); // filter + sort + slice page 0 (just the pending swaps at this point)
+    rebuildVisible(); // filter + sort + slice page 0 (just the pending rows at this point)
 }
 
 // Append one account's rows (deduped) to the full set, then schedule a debounced filter/sort/slice.
@@ -436,10 +488,51 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
     QVector<HistoryItem> add;
     add.reserve(items.size());
     for (const HistoryItem &h : items) {
-        // A settled swap whose pending local copy is already shown: skip (keep the local one).
-        if (h.kind == QLatin1String("swap") && !h.txHash.isEmpty() &&
-            m_seen.contains(h.txHash.toLower()))
+        if (h.kind == QLatin1String("swap") && !h.txHash.isEmpty()) {
+            const QString uid = h.txHash.toLower();
+            // Reconcile a fetched (settled/known) swap against a local optimistic pending row of the
+            // same id: drop the pending copy so this real one (with its true status) replaces it.
+            bool wasLocal = false;
+            for (int i = 0; i < m_localSwaps.size(); ++i)
+                if (m_localSwaps.at(i).txHash.toLower() == uid) {
+                    m_localSwaps.removeAt(i);
+                    wasLocal = true;
+                    break;
+                }
+            if (wasLocal)
+                m_allItems.erase(
+                    std::remove_if(m_allItems.begin(), m_allItems.end(),
+                                   [&](const HistoryItem &e) {
+                                       return e.kind == QLatin1String("swap") &&
+                                              e.txHash.toLower() == uid;
+                                   }),
+                    m_allItems.end());
+            if (m_seen.contains(uid)) // cross-account/page dedup of the fetched swap itself
+                continue;
+            m_seen.insert(uid);
+            add.append(h);
             continue;
+        }
+        // Reconcile an optimistic pending SEND against its real mined row (same txHash): drop the
+        // pending local copy so the confirmed row (with block/timestamp/fee) replaces it — no duplicate.
+        if (!h.txHash.isEmpty()) {
+            const QString hx = h.txHash.toLower();
+            bool wasLocal = false;
+            for (int i = 0; i < m_localSends.size(); ++i)
+                if (m_localSends.at(i).txHash.toLower() == hx) {
+                    m_localSends.removeAt(i);
+                    wasLocal = true;
+                    break;
+                }
+            if (wasLocal)
+                m_allItems.erase(std::remove_if(m_allItems.begin(), m_allItems.end(),
+                                                [&](const HistoryItem &e) {
+                                                    return e.block == 0 &&
+                                                           e.kind != QLatin1String("swap") &&
+                                                           e.txHash.toLower() == hx;
+                                                }),
+                                 m_allItems.end());
+        }
         const QString key = QStringLiteral("%1|%2|%3|%4")
                                 .arg(h.txHash, h.token, h.direction, h.amount);
         if (m_seen.contains(key))
@@ -457,20 +550,45 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
 // Compose the unfiltered list as [optimistic pending swaps] + [fetched history], dropping any
 // pending swap that has since appeared in fetched data (matched by tx hash / CoW order uid).
 void HistoryModel::rebuildAll() {
-    if (!m_localSwaps.isEmpty()) {
+    if (!m_localSwaps.isEmpty() || !m_localSends.isEmpty()) {
         QSet<QString> fetchedIds;
         for (const HistoryItem &h : m_fetched)
             if (!h.txHash.isEmpty())
                 fetchedIds.insert(h.txHash.toLower());
-        m_localSwaps.erase(std::remove_if(m_localSwaps.begin(), m_localSwaps.end(),
-                                          [&](const HistoryItem &h) {
-                                              return fetchedIds.contains(h.txHash.toLower());
-                                          }),
-                           m_localSwaps.end());
+        const auto dropReconciled = [&](QVector<HistoryItem> &v) {
+            v.erase(std::remove_if(v.begin(), v.end(),
+                                   [&](const HistoryItem &h) {
+                                       return fetchedIds.contains(h.txHash.toLower());
+                                   }),
+                    v.end());
+        };
+        dropReconciled(m_localSwaps);
+        dropReconciled(m_localSends);
     }
-    m_allItems = m_localSwaps; // pending swaps on top
+    m_allItems = m_localSwaps; // pending swaps + sends on top until their mined rows arrive
+    m_allItems += m_localSends;
     m_allItems += m_fetched;
     rebuildVisible();
+}
+
+void HistoryModel::expireStalePendingSwaps(qint64 maxAgeSecs) {
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    bool changed = false;
+    for (HistoryItem &h : m_localSwaps) {
+        if (h.status != QLatin1String("pending") || h.timestamp <= 0)
+            continue;
+        // Prefer the order's real expiry (validTo): a CoW order is legitimately open until then, so
+        // don't force it to "failed" early. Only when we don't know the expiry do we fall back to a
+        // generous age cutoff. The background cow_orders poll reconciles the true final status.
+        const qint64 cutoff = h.expiry > 0 ? static_cast<qint64>(h.expiry)
+                                           : (static_cast<qint64>(h.timestamp) + maxAgeSecs);
+        if (now > cutoff) {
+            h.status = QStringLiteral("failed");
+            changed = true;
+        }
+    }
+    if (changed)
+        rebuildAll();
 }
 
 void HistoryModel::addLocalSwap(const HistoryItem &h) {
@@ -486,14 +604,19 @@ void HistoryModel::addLocalSwap(const HistoryItem &h) {
 }
 
 void HistoryModel::addLocalSend(const QString &txHash, const QString &to,
-                                const QString &amountFormatted, const QString &symbol) {
+                                const QString &amountFormatted, const QString &symbol,
+                                const QString &token) {
     HistoryItem h;
     h.direction = QStringLiteral("out");
     h.counterparty = to;
     h.formatted = amountFormatted;
     h.symbol = symbol;
+    h.token = token; // "" == native; set so a pending token send shows its own icon (not ETH's)
     h.txHash = txHash;
-    h.block = 0; // pending until confirmed / next log refresh
-    m_allItems.prepend(h);
-    rebuildVisible(); // outgoing sends are never spam, so this always becomes visible
+    h.block = 0; // pending until confirmed
+    h.status = QStringLiteral("pending");
+    // Track it like a local swap so it survives full refreshes and is reconciled away (not duplicated)
+    // once the real mined row is fetched.
+    m_localSends.append(h);
+    rebuildAll();
 }

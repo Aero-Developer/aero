@@ -44,6 +44,9 @@ public:
     QString walletName = "wallet";
     QString walletDir;
     QString walletPath;
+
+private:
+    QString m_defaultNextText; // pristine "Next >" text, restored per-page so labels don't bleed
 };
 
 // ---- pages ----
@@ -96,6 +99,7 @@ private:
     QLineEdit *m_passphrase = nullptr;   // optional BIP39 passphrase ("extension word")
     QLineEdit *m_passConfirm = nullptr;  // confirm (a typo permanently changes the wallet)
     QLabel *m_passError = nullptr;
+    bool m_seedVerified = false;         // user confirmed backup words (create flow); reset on regen
 };
 
 class RestoreSeedPage : public QWizardPage

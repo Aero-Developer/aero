@@ -22,9 +22,24 @@ TorManager::~TorManager() {
 }
 
 bool TorManager::socksPortOpen() const {
+    // Don't just check that SOMETHING is listening — verify it speaks SOCKS5 before we route all
+    // wallet traffic through it. A bare TCP connect would happily "adopt" a malicious/unrelated local
+    // service squatting on our dedicated port; a SOCKS5 greeting/response rejects any non-SOCKS
+    // squatter. (Full Tor-identity proof would need the control port; this closes the common case.)
     QTcpSocket probe;
     probe.connectToHost(QStringLiteral("127.0.0.1"), m_socksPort);
-    return probe.waitForConnected(400);
+    if (!probe.waitForConnected(400))
+        return false;
+    // SOCKS5 client greeting: VER=5, 1 method, method=0x00 (no auth).
+    const char greeting[3] = {0x05, 0x01, 0x00};
+    probe.write(greeting, 3);
+    if (!probe.waitForBytesWritten(300))
+        return false;
+    if (!probe.waitForReadyRead(600))
+        return false;
+    const QByteArray resp = probe.read(2);
+    // A SOCKS5 server replies VER=5 and a selected method (0x00 no-auth, or 0xFF none acceptable).
+    return resp.size() == 2 && static_cast<unsigned char>(resp[0]) == 0x05;
 }
 
 void TorManager::start() {
@@ -33,11 +48,37 @@ void TorManager::start() {
     // unrelated SOCKS service.
     if (socksPortOpen()) {
         m_ready = true;
+        m_pct = 100;
         emit statusChanged(tr("Connected to Tor"));
         emit ready();
         return;
     }
     launchBundled();
+}
+
+bool TorManager::isRunning() const {
+    return m_proc && m_proc->state() != QProcess::NotRunning;
+}
+
+void TorManager::restart() {
+    m_ready = false;
+    m_pct = 0;
+    if (m_proc) {
+        // Kill the process we own and relaunch => a brand-new circuit. Disconnect first so the
+        // deliberate termination doesn't fire failed()/ended().
+        m_restarting = true;
+        m_proc->disconnect(this);
+        m_proc->terminate();
+        if (!m_proc->waitForFinished(3000))
+            m_proc->kill();
+        m_proc->deleteLater();
+        m_proc = nullptr;
+        m_restarting = false;
+        launchBundled();
+    } else {
+        // We were reusing an external Tor we don't own (nothing to kill); best-effort reconnect.
+        start();
+    }
 }
 
 void TorManager::launchBundled() {
@@ -87,10 +128,16 @@ void TorManager::launchBundled() {
     });
     connect(m_proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
             [this](int code, QProcess::ExitStatus) {
+                if (m_restarting)
+                    return; // deliberate restart(); a fresh process is being launched
                 if (!m_ready)
                     emit failed(m_lastError.isEmpty()
                                     ? tr("Tor exited unexpectedly (code %1)").arg(code)
                                     : tr("Tor failed: %1").arg(m_lastError));
+                else {
+                    m_ready = false; // Tor died after being up — let the app recover (auto-reconnect)
+                    emit ended();
+                }
             });
 
     // Give Tor up to 90s to bootstrap before giving up (no clearnet fallback).
@@ -113,6 +160,7 @@ void TorManager::handleLine(const QString &line) {
     if (!m.hasMatch())
         return;
     const int pct = m.captured(1).toInt();
+    m_pct = pct;
     emit statusChanged(tr("Starting Tor… %1%").arg(pct));
     if (pct >= 100 && !m_ready) {
         m_ready = true;

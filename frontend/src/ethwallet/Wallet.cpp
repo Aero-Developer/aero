@@ -22,6 +22,16 @@ QString takeString(char *s) {
     return out;
 }
 
+// Like takeString, but for SECRET material (mnemonic / private key): the core buffer is zeroized on
+// free so the plaintext doesn't linger in freed heap. (The returned QString is still un-scrubbed Qt
+// heap — the reveal dialogs clear it + auto-clear the clipboard — but this closes the Rust-side leak.)
+QString takeSecretString(char *s) {
+    if (!s) return QString();
+    QString out = QString::fromUtf8(s);
+    aero_secret_string_free(s);
+    return out;
+}
+
 BalanceInfo parseBalance(const QString &json) {
     BalanceInfo b;
     const QJsonObject o = QJsonDocument::fromJson(json.toUtf8()).object();
@@ -40,6 +50,9 @@ Wallet::Wallet(AeroWallet *core, QObject *parent)
     // non-essential burst (per-token liquidity checks, NFT/logo image fetches) right behind them —
     // so one SOCKS proxy isn't flooded with dozens of simultaneous circuits.
     m_netPool.setMaxThreadCount(8);
+    // History gets its own small lane so its per-account fan-out can't monopolise the essentials'
+    // threads (balances/prices/fees/block).
+    m_historyPool.setMaxThreadCount(3);
 }
 
 Wallet::~Wallet() {
@@ -48,10 +61,18 @@ Wallet::~Wallet() {
     // this must complete while the object is still valid.
     m_netPool.clear();
     m_netPool.waitForDone();
+    m_historyPool.clear();
+    m_historyPool.waitForDone();
     if (m_core) {
         QWriteLocker lock(&m_coreLock);
         aero_wallet_free(m_core);
         m_core = nullptr;
+    }
+    // Best-effort scrub of the retained password so the plaintext doesn't linger in freed heap
+    // (QString doesn't zero on destruction). fill() overwrites this instance's buffer before clear().
+    if (!m_password.isEmpty()) {
+        m_password.fill(QChar(u'\0'));
+        m_password.clear();
     }
 }
 
@@ -152,7 +173,7 @@ quint32 Wallet::importPrivateKey(const QString &hexKey) {
 
 QString Wallet::exportPrivateKey(quint32 index) const {
     QReadLocker lock(&m_coreLock);
-    return takeString(aero_wallet_export_private_key(m_core, index));
+    return takeSecretString(aero_wallet_export_private_key(m_core, index));
 }
 
 QString Wallet::signMessage(quint32 index, const QString &message) {
@@ -163,6 +184,11 @@ QString Wallet::signMessage(quint32 index, const QString &message) {
         return QString();
     }
     return takeString(j);
+}
+
+QString Wallet::resolveEns(const QString &name) {
+    QReadLocker lock(&m_coreLock);
+    return takeString(aero_wallet_resolve_ens(m_core, name.toUtf8().constData()));
 }
 
 QString Wallet::verifyMessage(const QString &message, const QString &signature) {
@@ -214,7 +240,7 @@ quint32 Wallet::addHardwareAccount() {
 
 QString Wallet::getSeed() const {
     QReadLocker lock(&m_coreLock);
-    return takeString(aero_wallet_mnemonic(m_core));
+    return takeSecretString(aero_wallet_mnemonic(m_core));
 }
 
 bool Wallet::store(const QString &path, const QString &password) {
@@ -334,9 +360,12 @@ void Wallet::connectProvider(quint64 chainId, const QStringList &endpoints, cons
             {
                 QWriteLocker lock(&m_coreLock);
                 const QByteArray p = proxy.toUtf8();
+                // allow_clearnet is ALWAYS false: with no proxy the core permits ONLY local endpoints
+                // (127.0.0.1 / localhost — your own node) and refuses remote ones, so blanking the
+                // proxy while public RPCs are still configured can't silently leak the real IP.
                 const int rc = aero_wallet_set_provider(m_core, chainId, endpointsJson.constData(),
                                                         proxy.isEmpty() ? nullptr : p.constData(),
-                                                        proxy.isEmpty(), 20);
+                                                        false, 20);
                 if (rc != 0)
                     return false;
             }
@@ -517,6 +546,29 @@ void Wallet::refreshBlockNumber() {
     });
 }
 
+void Wallet::txReceipt(const QString &txHash) {
+    QtConcurrent::run(&m_netPool, [this, txHash]() {
+        bool mined = false, success = false;
+        {
+            QReadLocker lock(&m_coreLock);
+            char *j = aero_wallet_tx_receipt(m_core, txHash.toUtf8().constData());
+            if (j) {
+                const QJsonDocument doc = QJsonDocument::fromJson(takeString(j).toUtf8());
+                if (doc.isObject()) {
+                    const QJsonObject o = doc.object();
+                    // A mined receipt carries a blockNumber; status "0x1" = success, "0x0" = reverted.
+                    mined = o.contains(QStringLiteral("blockNumber")) &&
+                            !o.value(QStringLiteral("blockNumber")).isNull();
+                    success = o.value(QStringLiteral("status")).toString() == QLatin1String("0x1");
+                }
+            }
+        }
+        QMetaObject::invokeMethod(
+            this, [this, txHash, mined, success]() { emit txReceiptReady(txHash, mined, success); },
+            Qt::QueuedConnection);
+    });
+}
+
 // Parse a aero_wallet_account_history JSON array (already ownership-taken) into HistoryItems.
 static void parseHistoryArray(const QString &json, QVector<HistoryItem> &out) {
     const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
@@ -546,6 +598,7 @@ void Wallet::refreshHistory(quint32 accountIndex, const QString &fromBlock) {
     Q_UNUSED(fromBlock);
     QtConcurrent::run(&m_netPool, [this, accountIndex]() {
         QReadLocker lock(&m_coreLock);
+        const quint64 chain = m_chainId; // the chain this fetch is for (stable under the read lock)
         // Full native + token history from the block explorer (over Tor) in one call.
         QVector<HistoryItem> items;
         char *j = aero_wallet_account_history(m_core, accountIndex);
@@ -556,7 +609,7 @@ void Wallet::refreshHistory(quint32 accountIndex, const QString &fromBlock) {
         mergeCowOrders(accountIndex, items);
         std::sort(items.begin(), items.end(),
                   [](const HistoryItem &a, const HistoryItem &b) { return a.timestamp > b.timestamp; });
-        QMetaObject::invokeMethod(this, [this, items]() { emit historyRefreshed(items); },
+        QMetaObject::invokeMethod(this, [this, items, chain]() { emit historyRefreshed(items, chain); },
                                   Qt::QueuedConnection);
     });
 }
@@ -603,10 +656,14 @@ void Wallet::refreshHistoryAll(quint32 numAccounts, quint32 priorityIndex) {
     auto done = QSharedPointer<QAtomicInt>::create(0);
     const quint32 total = numAccounts;
     for (quint32 a : order) {
-        QtConcurrent::run(&m_netPool, [this, a, total, done]() {
+        // On the dedicated history pool so this N-task fan-out can't starve the single-task
+        // balance/price/fee/block refreshes running on m_netPool.
+        QtConcurrent::run(&m_historyPool, [this, a, total, done]() {
             QVector<HistoryItem> part;
+            quint64 chain;
             {
                 QReadLocker lock(&m_coreLock);
+                chain = m_chainId;
                 char *j = aero_wallet_account_history(m_core, a);
                 if (j)
                     parseHistoryArray(takeString(j), part);
@@ -614,10 +671,32 @@ void Wallet::refreshHistoryAll(quint32 numAccounts, quint32 priorityIndex) {
             }
             const quint32 d = static_cast<quint32>(done->fetchAndAddOrdered(1)) + 1;
             QMetaObject::invokeMethod(
-                this, [this, part, d, total]() { emit historyBatch(part, d, total); },
+                this, [this, part, d, total, chain]() { emit historyBatch(part, d, total, chain); },
                 Qt::QueuedConnection);
         });
     }
+}
+
+void Wallet::refreshAccountHistory(quint32 accountIndex) {
+    // One account's full history, on the dedicated history pool (Background-gated in the core so it
+    // yields the Tor circuit to interactive work). Appended by the caller — no model clear — so this
+    // is the primitive for lazy/on-demand and status-gated refresh (Electrum's per-address model).
+    QtConcurrent::run(&m_historyPool, [this, accountIndex]() {
+        QVector<HistoryItem> part;
+        quint64 chain;
+        {
+            QReadLocker lock(&m_coreLock);
+            chain = m_chainId;
+            char *j = aero_wallet_account_history(m_core, accountIndex);
+            if (j)
+                parseHistoryArray(takeString(j), part);
+            mergeCowOrders(accountIndex, part);
+        }
+        QMetaObject::invokeMethod(
+            this,
+            [this, accountIndex, part, chain]() { emit accountHistoryReady(accountIndex, part, chain); },
+            Qt::QueuedConnection);
+    });
 }
 
 void Wallet::scanFunded(quint32 gapLimit) {
@@ -960,6 +1039,27 @@ void Wallet::cancelTransaction(quint32 fromIndex, quint64 nonce, const QString &
     });
 }
 
+void Wallet::replaceTx(quint32 fromIndex, const QString &txHash, const QString &maxFeeWei,
+                       const QString &maxPriorityWei, bool cancel) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, txHash, maxFeeWei, maxPriorityWei, cancel]() {
+        QReadLocker lock(&m_coreLock);
+        const QByteArray mf = maxFeeWei.toUtf8();
+        const QByteArray mp = maxPriorityWei.toUtf8();
+        char *res = aero_wallet_replace_tx(m_core, fromIndex, txHash.toUtf8().constData(),
+                                           mf.constData(), mp.constData(), cancel);
+        bool success = res != nullptr;
+        QString newHash, err;
+        if (success)
+            newHash = QJsonDocument::fromJson(takeString(res).toUtf8()).object()
+                          .value("tx_hash").toString();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, success, newHash, err]() {
+            emit transactionCommitted(success, newHash, err);
+        }, Qt::QueuedConnection);
+    });
+}
+
 void Wallet::broadcastRaw(const QString &rawHex) {
     QtConcurrent::run(&m_netPool, [this, rawHex]() {
         QReadLocker lock(&m_coreLock);
@@ -1007,16 +1107,39 @@ void Wallet::sendMany(quint32 fromIndex, const QVector<QPair<QString, QString>> 
             arr.append(pair);
         }
         const QByteArray rj = QJsonDocument(arr).toJson(QJsonDocument::Compact);
+        const int nRecipients = recipients.size();
         QReadLocker lock(&m_coreLock);
         const QByteArray mf = maxFeeWei.toUtf8();
         const QByteArray mp = maxPriorityWei.toUtf8();
-        char *res = aero_wallet_send_many(m_core, fromIndex, rj.constData(),
-                                          token.toUtf8().constData(), mf.constData(), mp.constData());
         QString json, err;
-        if (res)
-            json = takeString(res);
-        else
-            err = takeLastError();
+        if (token.isEmpty()) {
+            // Native: send to everyone ATOMICALLY in one Multicall3 tx (all-or-nothing, no stranded
+            // nonces). Synthesize the same result shape the sequential path emits so the UI handler
+            // is unchanged (one entry = one broadcast tx covering all recipients).
+            char *res = aero_wallet_send_many_native(m_core, fromIndex, rj.constData(),
+                                                     mf.constData(), mp.constData());
+            if (res) {
+                const QString hash = QJsonDocument::fromJson(takeString(res).toUtf8()).object()
+                                         .value("tx_hash").toString();
+                QJsonArray a;
+                QJsonObject o;
+                o["to"] = QStringLiteral("%1 recipients (atomic batch)").arg(nRecipients);
+                o["tx_hash"] = hash;
+                a.append(o);
+                json = QString::fromUtf8(QJsonDocument(a).toJson(QJsonDocument::Compact));
+            } else {
+                err = takeLastError();
+            }
+        } else {
+            // ERC-20: sequential (one transfer per recipient); Multicall can't move your tokens.
+            char *res = aero_wallet_send_many(m_core, fromIndex, rj.constData(),
+                                              token.toUtf8().constData(), mf.constData(),
+                                              mp.constData());
+            if (res)
+                json = takeString(res);
+            else
+                err = takeLastError();
+        }
         QMetaObject::invokeMethod(this, [this, json, err]() { emit manySent(json, err); },
                                   Qt::QueuedConnection);
     });

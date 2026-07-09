@@ -10,6 +10,7 @@
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QRandomGenerator>
 #include <QLabel>
 #include <QLineEdit>
 #include <QEventLoop>
@@ -113,6 +114,9 @@ WalletWizard::WalletWizard(QWidget *parent) : QWizard(parent) {
     setWindowTitle(tr("Welcome to Aero"));
     setWindowIcon(QIcon(":/assets/images/appicons/64x64.png"));
 
+    // Capture the pristine Next label before any page overrides it, so we can restore it per-page.
+    m_defaultNextText = buttonText(QWizard::NextButton);
+
     setPage(Page_Menu, new MenuPage(this));
     setPage(Page_File, new FilePage(this));
     setPage(Page_Seed, new SeedPage(this));
@@ -141,8 +145,14 @@ WalletWizard::WalletWizard(QWidget *parent) : QWizard(parent) {
     auto *settingsButton = new QPushButton(tr("Settings"), this);
     setButton(QWizard::CustomButton1, settingsButton);
     settingsButton->setVisible(false);
-    connect(this, &QWizard::currentIdChanged, this, [settingsButton](int id) {
+    connect(this, &QWizard::currentIdChanged, this, [this, settingsButton](int id) {
         settingsButton->setVisible(id == WalletWizard::Page_Menu);
+        // Keep the Next / Finish labels correct per-page — setButtonText is global, so without this
+        // one page's custom label ("Connect", "Open wallet") bleeds onto later pages.
+        setButtonText(QWizard::NextButton,
+                      id == Page_Hardware ? tr("Connect") : m_defaultNextText);
+        setButtonText(QWizard::FinishButton,
+                      id == Page_Open ? tr("Open wallet") : tr("Create/Open wallet"));
     });
     // Auto-sizes like Feather; we only pin the minimum width to Feather's exact wizard width
     // (client ~562 -> 575px window incl. border) so the layout matches Feather 1:1. This is a
@@ -354,14 +364,54 @@ SeedPage::~SeedPage() { delete ui; }
 
 bool SeedPage::validatePage() {
     m_passError->hide();
-    if (!m_w->wallet)
+    if (!m_w->wallet) {
+        // Seed generation failed earlier — don't dead-end silently on a blank grid.
+        m_passError->setText(tr("Couldn't generate a seed phrase. Go back a step and try again."));
+        m_passError->show();
         return false;
-    const bool usePass =
-        m_usePass && m_usePass->isChecked() && !m_passphrase->text().isEmpty();
+    }
+    // If the passphrase box is ticked it must actually be filled — otherwise we'd silently create a
+    // NO-passphrase wallet, so the user's real addresses would differ from what they intended.
+    const bool passChecked = m_usePass && m_usePass->isChecked();
+    if (passChecked && m_passphrase->text().isEmpty()) {
+        m_passError->setText(tr("You enabled a passphrase but left it blank. Enter one, or uncheck "
+                                "the box to continue without a passphrase."));
+        m_passError->show();
+        return false;
+    }
+    const bool usePass = passChecked && !m_passphrase->text().isEmpty();
     if (usePass && m_passphrase->text() != m_passConfirm->text()) {
         m_passError->setText(tr("Passphrases don't match."));
         m_passError->show();
         return false;
+    }
+    // Seed-backup verification (create flow): make the user prove they wrote the words down by
+    // confirming two random ones before continuing (Electrum/Feather both do this).
+    if (m_w->mode == WalletWizard::Create && !m_seedVerified) {
+        const QStringList sw = m_w->wallet->getSeed().split(QLatin1Char(' '), Qt::SkipEmptyParts);
+        if (sw.size() >= 12) {
+            int i1 = QRandomGenerator::global()->bounded(sw.size());
+            int i2 = QRandomGenerator::global()->bounded(sw.size());
+            while (i2 == i1)
+                i2 = QRandomGenerator::global()->bounded(sw.size());
+            const auto ask = [&](int idx) -> bool {
+                bool ok = false;
+                const QString ans =
+                    QInputDialog::getText(this, tr("Confirm your backup"),
+                                          tr("To confirm you wrote it down, enter word #%1 of your "
+                                             "seed phrase:").arg(idx + 1),
+                                          QLineEdit::Normal, QString(), &ok)
+                        .trimmed();
+                return ok && ans.compare(sw[idx], Qt::CaseInsensitive) == 0;
+            };
+            if (!ask(i1) || !ask(i2)) {
+                m_passError->setText(
+                    tr("That didn't match. Write down your seed phrase (in order) and try again."));
+                m_passError->show();
+                return false;
+            }
+            m_seedVerified = true;
+        }
     }
     // Re-derive from the SAME seed words with the current passphrase state so the wallet always
     // reflects the checkbox (covers unchecking after a passphrase was set on a previous visit).
@@ -388,6 +438,12 @@ void SeedPage::initializePage() {
 void SeedPage::regenerate() {
     delete m_w->wallet;
     m_w->wallet = WalletManager::instance()->createWallet(12);
+    m_seedVerified = false; // a new seed must be re-confirmed
+    if (!m_w->wallet) {
+        m_passError->setText(tr("Couldn't generate a seed phrase: %1")
+                                 .arg(WalletManager::instance()->errorString()));
+        m_passError->show();
+    }
     showSeedWords(m_w->wallet ? m_w->wallet->getSeed() : QString());
 }
 
@@ -477,7 +533,8 @@ int RestoreSeedPage::expectedWordCount() const {
 }
 
 void RestoreSeedPage::updatePlaceholder() {
-    m_seed->setPlaceholderText(tr("Enter your %1 word seed…").arg(expectedWordCount()));
+    // Any valid BIP39 length is accepted; the radios are just a hint for the common cases.
+    m_seed->setPlaceholderText(tr("Enter your seed (12, 15, 18, 21, or 24 words)…"));
 }
 
 bool RestoreSeedPage::validatePage() {
@@ -485,9 +542,11 @@ bool RestoreSeedPage::validatePage() {
     QString phrase = m_seed->toPlainText().replace('\n', ' ').replace('\r', "").simplified();
     const QStringList seedWords = phrase.split(' ', Qt::SkipEmptyParts);
 
-    if (seedWords.size() != expectedWordCount()) {
-        m_error->setText(tr("The seed should be %1 words (got %2).")
-                             .arg(expectedWordCount()).arg(seedWords.size()));
+    // Accept every valid BIP39 length (12/15/18/21/24), not just 12 or 24 — an 18-word seed from
+    // another wallet is perfectly valid. The core still verifies the checksum in recoveryWallet().
+    const int n = seedWords.size();
+    if (n != 12 && n != 15 && n != 18 && n != 21 && n != 24) {
+        m_error->setText(tr("A BIP39 seed is 12, 15, 18, 21, or 24 words (got %1).").arg(n));
         m_error->show();
         return false;
     }
@@ -555,6 +614,17 @@ bool PasswordPage::validatePage() {
     // freeze the wizard. Run it off-thread behind a busy dialog so the UI stays responsive.
     Wallet *w = m_w->wallet;
     const QString pw = ui->widget_password->password();
+    // An empty password means the keys are effectively unprotected on disk — allow it (some users
+    // want it) but make them confirm, so it's never a silent accident.
+    if (pw.isEmpty()) {
+        const auto r = QMessageBox::warning(
+            this, tr("Create without a password?"),
+            tr("You didn't set a password. Anyone with access to this computer will be able to open "
+               "this wallet and spend its funds.\n\nCreate the wallet without a password?"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (r != QMessageBox::Yes)
+            return false;
+    }
     const bool ok = runBusy(this, tr("Creating wallet…"), [w, path, pw]() { return w->store(path, pw); });
     if (!ok) {
         QMessageBox::warning(this, tr("Error"), m_w->wallet->errorString());
@@ -826,7 +896,10 @@ bool OpenPage::validatePage() {
     // Determine the file password (empty first, then prompt). fileIsHardware also validates it:
     // -1 = can't decrypt (wrong password), 0 = software, 1 = hardware.
     QString password;
-    int kind = wm->fileIsHardware(m_walletFile, password);
+    int kind = -1;
+    // fileIsHardware() decrypts the file (Argon2id) — run it off the UI thread so it never freezes.
+    runBusy(this, tr("Opening wallet…"),
+            [&]() { kind = wm->fileIsHardware(m_walletFile, password); return true; });
     if (kind == -1) {
         bool ok = false;
         password = QInputDialog::getText(
@@ -834,7 +907,8 @@ bool OpenPage::validatePage() {
             tr("Password for %1:").arg(QFileInfo(m_walletFile).fileName()),
             QLineEdit::Password, QString(), &ok);
         if (!ok) return false;
-        kind = wm->fileIsHardware(m_walletFile, password);
+        runBusy(this, tr("Opening wallet…"),
+                [&]() { kind = wm->fileIsHardware(m_walletFile, password); return true; });
         if (kind == -1) {
             QMessageBox::warning(this, tr("Open failed"), tr("Incorrect password."));
             return false;

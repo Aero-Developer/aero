@@ -127,7 +127,38 @@ const CHAINS: &[ChainInfo] = &[
         eth_flow: None,
         wrapped_native: "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7",
     },
+    // ---- Testnets (for safe testing). coingecko_id is "" so no misleading USD price is shown for
+    // worthless testnet ETH; no swaps (CoW/routers not offered). ----
+    ChainInfo {
+        chain_id: 11155111,
+        name: "Sepolia (testnet)",
+        native_symbol: "SepoliaETH",
+        coingecko_id: "",
+        blockscout_base: Some("https://eth-sepolia.blockscout.com"),
+        dexscreener_slug: None,
+        legacy_gas: false,
+        cow_network: None,
+        eth_flow: None,
+        wrapped_native: "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
+    },
+    ChainInfo {
+        chain_id: 17000,
+        name: "Holesky (testnet)",
+        native_symbol: "HoleskyETH",
+        coingecko_id: "",
+        blockscout_base: Some("https://eth-holesky.blockscout.com"),
+        dexscreener_slug: None,
+        legacy_gas: false,
+        cow_network: None,
+        eth_flow: None,
+        wrapped_native: "",
+    },
 ];
+
+/// True for chains that are test networks (worthless coins) — the UI marks them and can hide them.
+pub fn is_testnet(chain_id: u64) -> bool {
+    matches!(chain_id, 11155111 | 17000)
+}
 
 // ---- Keyless swap-router support (multi-router aggregator) --------------------------------
 // Each router uses a different chain identifier in its API path; a `None` means the router is not

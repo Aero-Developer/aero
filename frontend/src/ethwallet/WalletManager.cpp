@@ -111,7 +111,7 @@ Wallet *WalletManager::createHardwareWallet(const QString &kind, const QString &
         m_errorString = takeError();
         return nullptr;
     }
-    return new Wallet(core);
+    return anchoredWallet(core); // GUI-thread affinity, so queued signals reach the UI (see comment)
 }
 
 Wallet *WalletManager::openHardwareWallet(const QString &path, const QString &password,
@@ -122,7 +122,7 @@ Wallet *WalletManager::openHardwareWallet(const QString &path, const QString &pa
         m_errorString = takeError();
         return nullptr;
     }
-    Wallet *w = new Wallet(core);
+    Wallet *w = anchoredWallet(core); // GUI-thread affinity (may be created from a runBusy worker)
     w->setWalletPath(path);
     w->setPassword(password);
     return w;

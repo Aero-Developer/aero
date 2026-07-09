@@ -70,6 +70,8 @@ struct HistoryItem {
     QString buySymbol;     // asset received
     QString buyFormatted;  // human amount received
     QString status;        // "pending" | "done" | "failed"
+    quint64 expiry = 0;    // swap order validTo (unix secs); 0 = unknown. A pending swap isn't marked
+                           // failed before this — CoW orders can legitimately stay open for minutes.
 };
 
 struct NftCollection {
@@ -132,12 +134,20 @@ public:
     // on error (bad signature). Pure function — no keys involved.
     QString verifyMessage(const QString &message, const QString &signature);
 
+    // Resolve an ENS name ("alice.eth") to a checksummed 0x address (Ethereum mainnet only); ""
+    // on failure. Blocking (network) — call from a worker (runBusy).
+    QString resolveEns(const QString &name);
+
     // ##### Persistence #####
     bool store(const QString &path, const QString &password);
     void setWalletPath(const QString &path) { m_path = path; }
     QString walletPath() const { return m_path; }
     // Retain the password so the wallet can be re-encrypted/saved after in-memory changes.
-    void setPassword(const QString &password) { m_password = password; }
+    void setPassword(const QString &password) {
+        if (!m_password.isEmpty())
+            m_password.fill(QChar(u'\0')); // scrub the previous password before replacing it
+        m_password = password;
+    }
     bool hasPassword() const { return !m_password.isEmpty(); }
     bool passwordMatches(const QString &pw) const { return pw == m_password; }
     // Re-save the wallet to its known path with its retained password. No-op if no path is set.
@@ -179,6 +189,11 @@ public:
     // historyBatch(items, done, total) per account as it completes. `priorityIndex` (the currently
     // selected account) is fetched first so its rows appear near-instantly.
     void refreshHistoryAll(quint32 numAccounts, quint32 priorityIndex = 0);
+
+    // Async: full history (native + tokens + CoW swaps) for a SINGLE account. Emits
+    // accountHistoryReady(index, items) — the caller appends it to the model (no clear), enabling
+    // Electrum-style lazy/on-demand and status-gated refresh instead of an all-account fan-out.
+    void refreshAccountHistory(quint32 accountIndex);
 
     // Async: gap-limit scan of HD addresses (current chain); emits fundedScanned().
     void scanFunded(quint32 gapLimit = 20);
@@ -223,6 +238,11 @@ public:
     // Async: poll the chain head; emits blockNumberUpdated() so the UI can refresh on new blocks.
     void refreshBlockNumber();
 
+    // Async: fetch the receipt for a just-broadcast tx; emits txReceiptReady(txHash, mined, success).
+    // `mined` = the tx is in a block; `success` = it didn't revert. The UI polls this after a send so
+    // the balance/history confirm the instant the tx lands (not on a fixed timer).
+    void txReceipt(const QString &txHash);
+
     // ##### Per-wallet metadata (labels/contacts/notes/funded) — encrypted inside the wallet file #####
     // Opaque JSON blob owned by the UI. Read once on open; setMetadata()+save() persists it.
     QString metadata() const;
@@ -258,6 +278,12 @@ public:
     // Emits transactionCommitted().
     void cancelTransaction(quint32 fromIndex, quint64 nonce, const QString &maxFeeWei,
                            const QString &maxPriorityWei);
+
+    // Replace-by-fee an ARBITRARY still-pending tx of `fromIndex`, found by hash: cancel=true does a
+    // 0-value self-send at its nonce; else rebroadcasts the same tx at the higher fee (speed-up).
+    // Emits transactionCommitted(). Used by the History right-click "Speed up / Cancel".
+    void replaceTx(quint32 fromIndex, const QString &txHash, const QString &maxFeeWei,
+                   const QString &maxPriorityWei, bool cancel);
 
     // Broadcast an already-signed raw tx (0x RLP hex) over Tor; emits transactionCommitted().
     void broadcastRaw(const QString &rawHex);
@@ -343,7 +369,9 @@ signals:
     void unsignedTxReady(const QString &json, const QString &error);
     // Emitted when sendMany() finishes: `resultJson` is an array of {to, tx_hash|error}.
     void manySent(const QString &resultJson, const QString &error);
-    void historyRefreshed(const QVector<HistoryItem> &items);
+    // `chainId` = the chain this history was fetched for, so the UI can drop a late batch that
+    // arrives after a network switch (otherwise a previous chain's rows leak into the new chain).
+    void historyRefreshed(const QVector<HistoryItem> &items, quint64 chainId);
     // Emitted (synchronously, on the caller/UI thread) at the very start of an all-account refresh,
     // before any batch is dispatched — the UI clears the model + resets dedup here. This must NOT be
     // driven off "done==1", because with parallel per-account fetches batches complete out of order
@@ -351,7 +379,9 @@ signals:
     void historyRefreshStarted();
     // Incremental all-account history: one batch per account (delivered as each completes, so in
     // arbitrary order). `done`/`total` drive the progress indicator; done==total is the end.
-    void historyBatch(const QVector<HistoryItem> &items, quint32 done, quint32 total);
+    void historyBatch(const QVector<HistoryItem> &items, quint32 done, quint32 total, quint64 chainId);
+    // Targeted single-account history (refreshAccountHistory): appended to the model, not cleared.
+    void accountHistoryReady(quint32 accountIndex, const QVector<HistoryItem> &items, quint64 chainId);
     void addressesWarmed(); // emitted after warmAddresses() finishes populating the address cache
     void fundedScanned(const QList<quint32> &indices);
     void accountAdded(quint32 index); // a new HD account was derived (addAccountAsync)
@@ -365,6 +395,7 @@ signals:
     void ethUsdPriceUpdated(double usdPerEth);
     void marketPricesUpdated(double xmrUsd, double xmrChangePct, double ethUsd, double ethChangePct);
     void blockNumberUpdated(quint64 block);
+    void txReceiptReady(const QString &txHash, bool mined, bool success);
     void feesUpdated(const QString &baseFeeWei, const QString &tipWei);
     void connectionStatusChanged(int status);
     void providerConnected(int mode, const QString &message); // 2=Tor, 1=Direct, 0=Offline
@@ -418,6 +449,11 @@ private:
     // arrive in stuttering waves. A modest bound lets the essentials run together and queues the
     // rest right behind them.
     QThreadPool m_netPool;
+    // A SEPARATE, smaller pool for the all-account history fan-out. History fans out one task per
+    // account; on a shared pool that starved the single-task balance/price/fee/block refreshes
+    // (balances took minutes to update after a send). Its own bounded lane keeps history off the
+    // essentials' threads; the core RPC semaphore still caps total Tor concurrency.
+    QThreadPool m_historyPool;
 
     // Serialize async saves: only one encrypt/atomic-write runs at a time; a request arriving while
     // one is in flight sets m_saveQueued so exactly one follow-up save runs afterwards (coalescing a

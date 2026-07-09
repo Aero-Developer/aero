@@ -152,6 +152,7 @@ pub async fn ledger_sign_tx(
         .map_err(|e| CoreError::Signing(format!("Ledger sign: {e}")))
 }
 
+
 /// Sign a transaction with a Trezor (host-entered passphrase). Fields are the same ones the wallet
 /// used to build the tx; Trezor re-encodes internally and returns r/s/v.
 #[allow(clippy::too_many_arguments)]
