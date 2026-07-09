@@ -135,6 +135,7 @@ private:
     void saveBalanceCache();          // stash the current chain's balances in metadata (for instant reopen)
     void loadBalanceCache();          // show last-known balances instantly, before the Tor refresh
     void saveHistoryCache();          // persist the current chain's fetched history (debounced)
+    void foldHistoryCacheIntoMeta();  // build history snapshot into m_meta without saving (close path)
     void loadHistoryCache();          // restore the current chain's history instantly (0 requests)
     void loadHistoricalPrices();      // restore cached per-date prices (immutable) — no re-fetch ever
     void scheduleHistorySave();       // debounce persisting history after targeted batches arrive

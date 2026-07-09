@@ -462,37 +462,59 @@ void AeroMainWindow::closeEvent(QCloseEvent *event) {
     // the window appears to hang on the X until the in-flight scan/history finishes. The loops poll
     // this flag between requests (and wake early from backoff sleeps), so they bail within ~1s.
     Wallet::requestShutdown();
-    // Fold the latest fetched history into m_meta so this chain's cache is persisted on exit (the
-    // debounced history save may not have fired yet). Must run before we stop the save timer + flush.
-    if (m_wallet && m_historyModel) {
-        if (m_histSaveTimer)
-            m_histSaveTimer->stop();
-        saveHistoryCache();
-    }
-    // Cancel any pending debounced save so it can't race the authoritative flush below.
+    // Stop the debounced timers so they can't race the authoritative final save.
+    if (m_histSaveTimer)
+        m_histSaveTimer->stop();
     if (m_saveTimer)
         m_saveTimer->stop();
-    // Queue the latest UI metadata (labels/contacts/notes + the throttled balance cache) and apply
-    // it so the final save below persists it — the balance cache may not have been written yet.
-    if (m_wallet) {
-        m_wallet->queueMetadata(
-            QString::fromUtf8(QJsonDocument(m_meta).toJson(QJsonDocument::Compact)));
-        m_wallet->flushPendingMetadata();
-    }
-    // Flush any in-memory changes (created addresses, imported keys, tokens) to the wallet file.
-    // This one blocking save on exit is acceptable; it writes the complete current state. If it
-    // fails, changes since the last successful save (notably imported keys, which aren't recoverable
-    // from the seed) would be lost — so let the user cancel the close and fix the problem.
-    if (m_wallet && !m_wallet->walletPath().isEmpty() && !m_wallet->save()) {
-        const auto choice = QMessageBox::warning(
-            this, tr("Could not save wallet"),
-            tr("Your wallet could not be saved:\n\n%1\n\nAny recently imported keys or new addresses "
-               "may be lost if you close now. Close anyway?")
-                .arg(m_wallet->errorString()),
-            QMessageBox::Close | QMessageBox::Cancel, QMessageBox::Cancel);
-        if (choice != QMessageBox::Close) {
-            event->ignore();
-            return;
+
+    if (m_wallet && !m_wallet->walletPath().isEmpty()) {
+        // Assemble the FINAL metadata snapshot on the UI thread (cheap: just building JSON in memory —
+        // history cache + labels/contacts/notes/balance cache). No core lock is taken here.
+        if (m_historyModel)
+            foldHistoryCacheIntoMeta();
+        const QString metaJson =
+            QString::fromUtf8(QJsonDocument(m_meta).toJson(QJsonDocument::Compact));
+
+        // Then do the one blocking encrypt+write (apply metadata + save) on a WORKER thread, pumping
+        // a local event loop so the window keeps repainting and NEVER freezes. Previously this ran on
+        // the UI thread and took the core lock directly — so closing while a scan/history load held
+        // the lock hung the window until that finished (the "freezes on close" bug). requestShutdown()
+        // above makes those background reads bail promptly, so the worker gets the lock within a beat.
+        // A safety timer caps the wait: the periodic saves already persisted almost everything, and
+        // the wallet write is atomic, so closing before a slow final save can't corrupt the file.
+        // `saved` is heap-allocated (shared with the worker) so that if the safety timer fires and
+        // this function returns while the worker is still running, the worker doesn't write to a
+        // destroyed stack variable.
+        QSharedPointer<QAtomicInt> saved = QSharedPointer<QAtomicInt>::create(0);
+        QProgressDialog prog(tr("Saving…"), QString(), 0, 0, this);
+        prog.setWindowModality(Qt::ApplicationModal);
+        prog.setCancelButton(nullptr);
+        prog.setMinimumDuration(400); // don't flash the dialog for a fast save
+        QFutureWatcher<void> watcher;
+        QEventLoop loop;
+        connect(&watcher, &QFutureWatcher<void>::finished, &loop, &QEventLoop::quit);
+        watcher.setFuture(QtConcurrent::run([this, metaJson, saved]() {
+            saved->storeRelease(m_wallet->saveWithMetadata(metaJson) ? 1 : 0);
+        }));
+        QTimer::singleShot(12000, &loop, &QEventLoop::quit); // hard cap so close can't hang
+        prog.show();
+        loop.exec();
+        prog.close();
+
+        // Only prompt on a real, completed save failure — never on the timeout (the background write
+        // will finish on its own; blocking the close on it is exactly what we're avoiding).
+        if (watcher.isFinished() && saved->loadAcquire() == 0) {
+            const auto choice = QMessageBox::warning(
+                this, tr("Could not save wallet"),
+                tr("Your wallet could not be saved:\n\n%1\n\nAny recently imported keys or new "
+                   "addresses may be lost if you close now. Close anyway?")
+                    .arg(m_wallet->errorString()),
+                QMessageBox::Close | QMessageBox::Cancel, QMessageBox::Cancel);
+            if (choice != QMessageBox::Close) {
+                event->ignore();
+                return;
+            }
         }
     }
     QMainWindow::closeEvent(event);
@@ -4416,6 +4438,15 @@ void AeroMainWindow::scheduleHistorySave() {
 }
 
 void AeroMainWindow::saveHistoryCache() {
+    foldHistoryCacheIntoMeta();
+    if (m_wallet && m_historyModel)
+        saveMetadata();
+}
+
+// Build this chain's history snapshot into m_meta WITHOUT triggering a save. closeEvent uses this to
+// assemble the final metadata on the UI thread, then persists it once on a worker (so the UI-thread
+// save can't freeze the close).
+void AeroMainWindow::foldHistoryCacheIntoMeta() {
     if (!m_wallet || !m_historyModel) return;
     QVector<HistoryItem> items = m_historyModel->fetchedItems();
     // Bound the file, but generously: a wallet with many funded accounts legitimately has thousands
@@ -4443,7 +4474,6 @@ void AeroMainWindow::saveHistoryCache() {
     QJsonObject cache = m_meta.value(QStringLiteral("histcache")).toObject();
     cache[QString::number(m_chainId)] = snap;
     m_meta[QStringLiteral("histcache")] = cache;
-    saveMetadata();
 }
 
 void AeroMainWindow::loadHistoryCache() {
