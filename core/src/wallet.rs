@@ -60,6 +60,20 @@ alloy::sol! {
         bytes callData;
     }
     function aggregate3Value(Call3Value[] calls) payable returns (bytes[] returnData);
+
+    // Read-only aggregation used to fetch EVERY account's native + token balances in a SINGLE
+    // eth_call (one Tor round-trip for hundreds of balances) instead of one JSON-RPC call each.
+    struct Call3 {
+        address target;
+        bool allowFailure;
+        bytes callData;
+    }
+    struct MultiResult {
+        bool success;
+        bytes returnData;
+    }
+    function aggregate3(Call3[] calls) returns (MultiResult[] returnData);
+    function getEthBalance(address addr) returns (uint256 balance);
 }
 
 /// A router quote/route normalized so the UI is router-agnostic.
@@ -743,93 +757,98 @@ impl Wallet {
         }
         let per_addr = 1 + tokens.len();
 
-        // Chunk accounts so each batch stays comfortably under public-RPC limits (~40 calls).
-        let per_chunk = (40usize / per_addr).max(1);
-        let mut accounts_json: Vec<serde_json::Value> = Vec::with_capacity(addrs.len());
+        // TURBO PATH: fetch every balance through Multicall3 in ONE eth_call per big group, instead
+        // of one JSON-RPC call per (account, asset). For N accounts × per_addr assets, the old path
+        // issued N×per_addr calls across many rate-limited batches (which is why accounts past the
+        // first chunk silently failed to load); this issues ~ceil(N×per_addr / MC_CALLS) eth_calls
+        // total — typically 1–2 round-trips for a whole wallet. Sub-calls are flattened in account
+        // order [acct0_native, acct0_tok0, …, acct1_native, …] so the per_addr indexing below still
+        // maps results straight back to each account.
+        use alloy::primitives::Bytes;
+        let mc_addr = parse_address(MULTICALL3)?;
+        let mut subcalls: Vec<Call3> = Vec::with_capacity(addrs.len() * per_addr);
+        for (_, a) in &addrs {
+            subcalls.push(Call3 {
+                target: mc_addr,
+                allowFailure: true,
+                callData: getEthBalanceCall { addr: *a }.abi_encode().into(),
+            });
+            for (_, _, _, taddr) in &tokens {
+                subcalls.push(Call3 {
+                    target: *taddr,
+                    allowFailure: true,
+                    callData: Bytes::from(erc20::encode_balance_of(*a)),
+                });
+            }
+        }
 
-        for group in addrs.chunks(per_chunk) {
+        // Each entry becomes Some(balance) on success, None if that sub-call failed/was unreachable.
+        const MC_CALLS: usize = 400; // sub-calls per eth_call — bounds response size / eth_call gas
+        let mut balances: Vec<Option<U256>> = vec![None; subcalls.len()];
+        let mut off = 0usize;
+        for group in subcalls.chunks(MC_CALLS) {
             if crate::provider::shutting_down() {
                 break;
             }
-            let mut calls: Vec<(String, serde_json::Value)> =
-                Vec::with_capacity(group.len() * per_addr);
-            for (_, a) in group {
-                calls.push((
-                    "eth_getBalance".to_string(),
-                    serde_json::json!([a.to_string(), "latest"]),
-                ));
-                for (_, _, _, taddr) in &tokens {
-                    let data = format!("0x{}", hex::encode(erc20::encode_balance_of(*a)));
-                    calls.push((
-                        "eth_call".to_string(),
-                        serde_json::json!([{ "to": taddr.to_string(), "data": data }, "latest"]),
-                    ));
-                }
-            }
-            // Retry this chunk with backoff on a rate-limit / transient failure instead of aborting
-            // the WHOLE balance refresh with `?`. Every account shares one Tor exit, so a burst of
-            // per-chunk batches reliably trips the RPC rate limit. Two failure shapes must be retried:
-            //   1) the whole request errors (call_batch -> empty vec), OR
-            //   2) the RPC returns HTTP 200 but rate-limits SOME calls inside the batch, leaving their
-            //      results `null`. That's a NON-empty vec, so a plain is_empty() check missed it and
-            //      those accounts were skipped — the "one loads, one skips" pattern. So we consider a
-            //      chunk failed if ANY account's native balance came back non-numeric (null), and retry
-            //      the whole chunk (re-reading a balance is idempotent). On persistent failure we skip
-            //      just this chunk (those accounts keep their cached balance) and continue.
-            let native_missing = |r: &[serde_json::Value]| -> bool {
-                if r.is_empty() {
-                    return true;
-                }
-                (0..group.len()).any(|p| {
-                    r.get(p * per_addr).and_then(|v| parse_hex_u256(v).ok()).is_none()
-                })
-            };
-            let mut results = provider.call_batch(&calls).await.unwrap_or_default();
+            let data = format!("0x{}", hex::encode(aggregate3Call { calls: group.to_vec() }.abi_encode()));
+            // Retry the (single) multicall on a transient/rate-limited failure with backoff.
             let mut tries = 0u32;
-            while native_missing(&results) && tries < 6 && !crate::provider::shutting_down() {
+            loop {
+                let ok = match provider.eth_call(&mc_addr.to_string(), &data).await {
+                    Ok(v) => hex_bytes(&v)
+                        .ok()
+                        .and_then(|b| aggregate3Call::abi_decode_returns(&b).ok())
+                        .map(|ret| {
+                            for (k, r) in ret.iter().enumerate() {
+                                if r.success && r.returnData.len() >= 32 {
+                                    balances[off + k] =
+                                        Some(U256::from_be_slice(&r.returnData[r.returnData.len() - 32..]));
+                                }
+                            }
+                            true
+                        })
+                        .unwrap_or(false),
+                    Err(_) => false,
+                };
+                if ok || tries >= 6 || crate::provider::shutting_down() {
+                    break;
+                }
                 tries += 1;
                 crate::provider::interruptible_sleep(backoff_delay(tries)).await;
-                results = provider.call_batch(&calls).await.unwrap_or_default();
             }
-            if results.is_empty() {
-                continue; // total failure; keep cached balances for these accounts
-            }
+            off += group.len();
+        }
 
-            for (p, (idx, _)) in group.iter().enumerate() {
-                let base = p * per_addr;
-                // A failed/absent RPC read (Value::Null) must NOT be reported as a real 0 balance —
-                // otherwise a transient Tor/RPC hiccup makes the balance flicker to 0 and the next
-                // successful read looks like an incoming payment. Mark it not-ok so the UI keeps its
-                // cached value instead of clobbering it (and spamming "received" notifications).
-                let native_res = results.get(base).and_then(|v| parse_hex_u256(v).ok());
-                let native_ok = native_res.is_some();
-                let wei = native_res.unwrap_or(U256::ZERO);
-                let mut toks_json: Vec<serde_json::Value> = Vec::with_capacity(tokens.len());
-                for (j, (taddr_s, tsym, tdec, _)) in tokens.iter().enumerate() {
-                    let tok_res = results
-                        .get(base + 1 + j)
-                        .and_then(|v| hex_bytes(v).ok())
-                        .and_then(|b| erc20::decode_u256(&b));
-                    let ok = tok_res.is_some();
-                    let bal = tok_res.unwrap_or(U256::ZERO);
-                    toks_json.push(serde_json::json!({
-                        "address": taddr_s,
-                        "symbol": tsym,
-                        "decimals": tdec,
-                        "raw": bal.to_string(),
-                        "formatted": format_units(bal, *tdec),
-                        "ok": ok,
-                    }));
-                }
-                accounts_json.push(serde_json::json!({
-                    "index": idx,
-                    "native_raw": wei.to_string(),
-                    "native_formatted": format_units(wei, 18),
-                    "native_symbol": native_symbol,
-                    "native_ok": native_ok,
-                    "tokens": toks_json,
+        let mut accounts_json: Vec<serde_json::Value> = Vec::with_capacity(addrs.len());
+        for (p, (idx, _)) in addrs.iter().enumerate() {
+            let base = p * per_addr;
+            // None => the read didn't succeed; mark not-ok so the UI keeps its cached value instead of
+            // flashing 0 (and firing a spurious "payment received" on the next good read).
+            let native_res = balances.get(base).copied().flatten();
+            let native_ok = native_res.is_some();
+            let wei = native_res.unwrap_or(U256::ZERO);
+            let mut toks_json: Vec<serde_json::Value> = Vec::with_capacity(tokens.len());
+            for (j, (taddr_s, tsym, tdec, _)) in tokens.iter().enumerate() {
+                let tok_res = balances.get(base + 1 + j).copied().flatten();
+                let ok = tok_res.is_some();
+                let bal = tok_res.unwrap_or(U256::ZERO);
+                toks_json.push(serde_json::json!({
+                    "address": taddr_s,
+                    "symbol": tsym,
+                    "decimals": tdec,
+                    "raw": bal.to_string(),
+                    "formatted": format_units(bal, *tdec),
+                    "ok": ok,
                 }));
             }
+            accounts_json.push(serde_json::json!({
+                "index": idx,
+                "native_raw": wei.to_string(),
+                "native_formatted": format_units(wei, 18),
+                "native_symbol": native_symbol,
+                "native_ok": native_ok,
+                "tokens": toks_json,
+            }));
         }
 
         Ok(serde_json::json!({
