@@ -120,6 +120,17 @@ void Wallet::invalidateMetaCache() {
     QMutexLocker c(&m_metaCacheMutex);
     ++m_metaGen; // signals any in-flight getter not to cache the value it's about to read
     m_numAccountsCache = -1;
+    // NOTE: the TOKENS cache is intentionally NOT cleared here. Adding an HD account, importing a key,
+    // and a funded scan all change the account COUNT but NOT the tracked-token list. Clearing the
+    // tokens cache on those operations forced the next tokens() call to re-read under the core lock —
+    // which BLOCKS the UI thread whenever a scan holds the write lock (a balance-update signal ->
+    // showCachedBalance() -> tokens() froze the whole app for the entire multi-minute scan). Only
+    // addToken()/removeToken() actually change tokens; they clear this cache explicitly.
+}
+
+void Wallet::invalidateTokensCache() {
+    QMutexLocker c(&m_metaCacheMutex);
+    ++m_metaGen;
     m_tokensCacheValid = false;
     m_tokensCache.clear();
 }
@@ -132,12 +143,17 @@ quint32 Wallet::numAccounts() const {
             return static_cast<quint32>(m_numAccountsCache);
         gen = m_metaGen;
     }
-    quint32 n;
-    {
-        QReadLocker lock(&m_coreLock);
-        n = aero_wallet_account_count(m_core);
+    // Cache miss. NEVER block the UI thread on the core lock: a scan holds it exclusively for minutes.
+    // Try to read without waiting; if a writer holds the lock, return the last known count (stale by
+    // at most the pending mutation) rather than freezing. The next call after the writer refreshes it.
+    if (!m_coreLock.tryLockForRead()) {
+        QMutexLocker c(&m_metaCacheMutex);
+        return static_cast<quint32>(m_numAccountsLast);
     }
+    const quint32 n = aero_wallet_account_count(m_core);
+    m_coreLock.unlock();
     QMutexLocker c(&m_metaCacheMutex);
+    m_numAccountsLast = static_cast<int>(n);
     if (m_metaGen == gen) // no mutation raced us — safe to cache
         m_numAccountsCache = static_cast<int>(n);
     return n;
@@ -907,7 +923,7 @@ void Wallet::addToken(const TokenInfo &t) {
         aero_wallet_add_token(m_core, t.address.toUtf8().constData(),
                                t.symbol.toUtf8().constData(), t.decimals);
     }
-    invalidateMetaCache();
+    invalidateTokensCache(); // the tracked-token list actually changed here
 }
 
 void Wallet::removeToken(const QString &address) {
@@ -915,7 +931,7 @@ void Wallet::removeToken(const QString &address) {
         QWriteLocker lock(&m_coreLock); // mutates secrets.tokens
         aero_wallet_remove_token(m_core, address.toUtf8().constData());
     }
-    invalidateMetaCache();
+    invalidateTokensCache(); // the tracked-token list actually changed here
 }
 
 QVector<TokenInfo> Wallet::tokens() const {
@@ -926,9 +942,16 @@ QVector<TokenInfo> Wallet::tokens() const {
             return m_tokensCache;
         gen = m_metaGen;
     }
+    // Cache miss. NEVER block the UI thread on the core lock (a scan holds it exclusively for minutes:
+    // a balance-update signal -> showCachedBalance() -> tokens() would otherwise freeze the whole app).
+    // Try to read without waiting; if a writer holds the lock, return the last-known tokens (stale is
+    // fine — the tracked list rarely changes; the next call after the writer refreshes it).
+    if (!m_coreLock.tryLockForRead()) {
+        QMutexLocker c(&m_metaCacheMutex);
+        return m_tokensCache;
+    }
     QVector<TokenInfo> out;
     {
-        QReadLocker lock(&m_coreLock);
         const QString json = takeString(aero_wallet_tokens(m_core));
         const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
         for (const QJsonValue &v : arr) {
@@ -940,6 +963,7 @@ QVector<TokenInfo> Wallet::tokens() const {
             out.append(t);
         }
     }
+    m_coreLock.unlock();
     {
         QMutexLocker c(&m_metaCacheMutex);
         if (m_metaGen == gen) { // no mutation raced us — safe to cache

@@ -488,7 +488,8 @@ private:
     // any tokens()/numAccounts() call on the UI thread during the scan would block on that lock and
     // freeze the app ("not responding"). Populated before the scan, invalidated on mutation.
     mutable QMutex m_metaCacheMutex;
-    mutable int m_numAccountsCache = -1;         // -1 = unknown
+    mutable int m_numAccountsCache = -1;         // -1 = unknown (must re-read)
+    mutable int m_numAccountsLast = 1;           // last successfully read count; non-blocking fallback
     mutable QVector<TokenInfo> m_tokensCache;
     mutable bool m_tokensCacheValid = false;
     mutable int m_watchOnlyCache = -1;           // -1 = unknown (immutable once computed)
@@ -496,7 +497,8 @@ private:
     // the result if it hasn't changed since — so a mutation that races an in-flight read can never
     // poison the cache with a stale value (the read simply isn't cached and re-runs next call).
     mutable quint64 m_metaGen = 0;
-    void invalidateMetaCache(); // clears the account-count + tokens caches
+    void invalidateMetaCache();   // clears the account-count cache (NOT tokens — see .cpp)
+    void invalidateTokensCache(); // clears the tracked-tokens cache (addToken/removeToken only)
 
     // Metadata queued from the UI thread (lock-free); applied to the core off-thread by saveAsync.
     QMutex m_pendingMetaMutex;
