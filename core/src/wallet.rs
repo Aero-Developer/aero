@@ -768,19 +768,31 @@ impl Wallet {
             }
             // Retry this chunk with backoff on a rate-limit / transient failure instead of aborting
             // the WHOLE balance refresh with `?`. Every account shares one Tor exit, so a burst of
-            // per-chunk batches reliably trips the RPC rate limit; the old `?` meant the first
-            // rate-limited chunk dropped balances for every account after it (the "only the first few
-            // show a balance" bug). On persistent failure we skip just this chunk (those accounts keep
-            // their cached balance) and continue with the rest.
+            // per-chunk batches reliably trips the RPC rate limit. Two failure shapes must be retried:
+            //   1) the whole request errors (call_batch -> empty vec), OR
+            //   2) the RPC returns HTTP 200 but rate-limits SOME calls inside the batch, leaving their
+            //      results `null`. That's a NON-empty vec, so a plain is_empty() check missed it and
+            //      those accounts were skipped — the "one loads, one skips" pattern. So we consider a
+            //      chunk failed if ANY account's native balance came back non-numeric (null), and retry
+            //      the whole chunk (re-reading a balance is idempotent). On persistent failure we skip
+            //      just this chunk (those accounts keep their cached balance) and continue.
+            let native_missing = |r: &[serde_json::Value]| -> bool {
+                if r.is_empty() {
+                    return true;
+                }
+                (0..group.len()).any(|p| {
+                    r.get(p * per_addr).and_then(|v| parse_hex_u256(v).ok()).is_none()
+                })
+            };
             let mut results = provider.call_batch(&calls).await.unwrap_or_default();
             let mut tries = 0u32;
-            while results.is_empty() && tries < 6 && !crate::provider::shutting_down() {
+            while native_missing(&results) && tries < 6 && !crate::provider::shutting_down() {
                 tries += 1;
                 crate::provider::interruptible_sleep(backoff_delay(tries)).await;
                 results = provider.call_batch(&calls).await.unwrap_or_default();
             }
             if results.is_empty() {
-                continue; // give up on this chunk; keep cached balances for these accounts
+                continue; // total failure; keep cached balances for these accounts
             }
 
             for (p, (idx, _)) in group.iter().enumerate() {
