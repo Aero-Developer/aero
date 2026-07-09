@@ -6744,7 +6744,17 @@ void AeroMainWindow::onSendClicked() {
         tokenAmount = QString::number(usd / price, 'f', 8);
     }
 
-    const QPair<QString, QString> fee = chosenFeeWei(); // (maxFee, priority) wei, empty = automatic
+    QPair<QString, QString> fee = chosenFeeWei(); // (maxFee, priority) wei, empty = automatic
+    // Fill an "automatic" fee from the LIVE cached estimate that's ALREADY shown on the Send tab, so
+    // the confirm dialog appears INSTANTLY. Otherwise createTransaction() fetched a fresh fee suggestion
+    // over Tor before the prompt could show — several seconds normally, and up to ~40s while the
+    // history load saturates the connection. The tx broadcasts with this same fee (what the user saw).
+    if (fee.first.isEmpty()) {
+        const double maxFeeWei = m_feeBaseWei > 0 ? m_feeBaseWei * 3.0 + qMax(m_feeTipWei, 1e9) : 30e9;
+        const double tipWei = m_feeTipWei > 0 ? m_feeTipWei : 1e9;
+        fee.first = QString::number(static_cast<qulonglong>(maxFeeWei));
+        fee.second = QString::number(static_cast<qulonglong>(tipWei));
+    }
 
     // Gas-aware balance checks (the network fee is always paid in the native coin).
     const bool isNativeSend = currentTokenAddr().isEmpty();
