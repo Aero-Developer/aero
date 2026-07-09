@@ -99,7 +99,11 @@ void TorManager::launchBundled() {
     QFile::remove(QDir(dataDir).filePath(QStringLiteral("lock")));
 
     QStringList args;
-    args << QStringLiteral("--SocksPort") << QString::number(m_socksPort)
+    // IsolateSOCKSAuth (Tor default, made explicit): each distinct SOCKS username gets its OWN circuit
+    // and exit. Aero uses this to spread bulk per-address fetches (block-explorer history) over many
+    // circuits so they don't all share — and rate-limit against — one exit IP.
+    args << QStringLiteral("--SocksPort")
+         << QStringLiteral("%1 IsolateSOCKSAuth").arg(m_socksPort)
          << QStringLiteral("--DataDirectory") << dataDir
          << QStringLiteral("--GeoIPFile") << QDir(torDir).filePath(QStringLiteral("geoip"))
          << QStringLiteral("--GeoIPv6File") << QDir(torDir).filePath(QStringLiteral("geoip6"))

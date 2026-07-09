@@ -80,12 +80,12 @@ pub async fn interruptible_sleep(d: Duration) {
 /// Hard cap on how many Tor requests may be in flight at once across the WHOLE app. A single Tor
 /// circuit degrades if flooded, so every outbound request (JSON-RPC calls/batches, explorer/price/
 /// image HTTP) takes a permit here first.
-static TOTAL: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(12));
+static TOTAL: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(20));
 /// Sub-cap on `Background` requests. Background work must first take a slot here, THEN a TOTAL slot,
 /// so at most this many bulk requests ever compete for TOTAL at once — leaving `TOTAL - BG` slots
 /// that only Interactive work contends for. That's what stops a burst of dozens of scan/history
 /// requests from queuing ahead of the fee/balance refresh the user is actually waiting on.
-static BG: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(4));
+static BG: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(ISO_CIRCUITS));
 /// Set the `AERO_NOPRIO` env var to fall back to the old flat single-queue behaviour (used by the
 /// bench to measure the before/after of the priority gate). Off in normal builds.
 static NOPRIO: Lazy<bool> = Lazy::new(|| std::env::var_os("AERO_NOPRIO").is_some());
@@ -253,10 +253,20 @@ impl Default for ProviderConfig {
 /// A Tor-routed JSON-RPC client with endpoint rotation.
 pub struct RpcProvider {
     http: reqwest::Client,
+    /// Pool of clients on ISOLATED Tor circuits (distinct SOCKS auth => distinct exit IP). Bulk,
+    /// per-address HTTP GETs (block-explorer history, price APIs) round-robin across these so that
+    /// many concurrent fetches leave through DIFFERENT exits and don't all trip one exit's per-IP
+    /// rate limit — turning a slow, rate-limited, one-at-a-time history load into a parallel one.
+    /// Empty when running without Tor (clearnet), in which case the main `http` client is used.
+    iso_http: Vec<reqwest::Client>,
+    iso_cursor: AtomicUsize,
     endpoints: Vec<String>,
     cursor: AtomicUsize,
     chain_id: u64,
 }
+
+/// How many isolated Tor circuits to spread bulk GETs over.
+const ISO_CIRCUITS: usize = 8;
 
 impl RpcProvider {
     pub fn new(cfg: &ProviderConfig) -> Result<Self> {
@@ -296,12 +306,54 @@ impl RpcProvider {
             .build()
             .map_err(|e| CoreError::rpc(format!("http client: {e}")))?;
 
+        // Build the isolated-circuit pool (only when going through Tor). Each client uses a distinct
+        // SOCKS username, and Tor's IsolateSOCKSAuth (on by default) gives each its own circuit/exit,
+        // so concurrent bulk GETs leave through different IPs and don't share a per-IP rate limit.
+        let mut iso_http: Vec<reqwest::Client> = Vec::new();
+        if let Some(proxy) = &cfg.socks_proxy {
+            let norm = normalize_socks(proxy); // socks5h://[user:pass@]host:port
+            let hostport = norm
+                .strip_prefix("socks5h://")
+                .unwrap_or(&norm)
+                .rsplit('@')
+                .next()
+                .unwrap_or("127.0.0.1:9050")
+                .to_string();
+            for k in 0..ISO_CIRCUITS {
+                // Distinct username per client => distinct Tor circuit (password is irrelevant to Tor).
+                let url = format!("socks5h://aeroiso{k}:x@{hostport}");
+                if let Ok(p) = reqwest::Proxy::all(&url) {
+                    if let Ok(c) = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(cfg.timeout_secs))
+                        .user_agent("aero/0.1")
+                        .no_proxy()
+                        .proxy(p)
+                        .build()
+                    {
+                        iso_http.push(c);
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             http,
+            iso_http,
+            iso_cursor: AtomicUsize::new(0),
             endpoints: cfg.endpoints.clone(),
             cursor: AtomicUsize::new(0),
             chain_id: cfg.chain_id,
         })
+    }
+
+    /// Round-robin one of the isolated-circuit clients for a bulk GET; falls back to the main client
+    /// when there's no isolation pool (clearnet mode).
+    fn iso_client(&self) -> &reqwest::Client {
+        if self.iso_http.is_empty() {
+            return &self.http;
+        }
+        let i = self.iso_cursor.fetch_add(1, Ordering::Relaxed) % self.iso_http.len();
+        &self.iso_http[i]
     }
 
     pub fn chain_id(&self) -> u64 {
@@ -330,7 +382,7 @@ impl RpcProvider {
         let _gate = gate().await; // priority-aware Tor concurrency gate
         let _probe = ReqProbe::begin(format!("GET  bytes {}", host_of(url)), w0.elapsed());
         let resp = self
-            .http
+            .iso_client()
             .get(url)
             .send()
             .await
@@ -348,7 +400,7 @@ impl RpcProvider {
         let _gate = gate().await; // priority-aware Tor concurrency gate
         let _probe = ReqProbe::begin(format!("GET  {}", host_of(url)), w0.elapsed());
         let resp = self
-            .http
+            .iso_client()
             .get(url)
             .header("accept", "application/json")
             .send()
