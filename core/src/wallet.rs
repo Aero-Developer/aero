@@ -748,6 +748,9 @@ impl Wallet {
         let mut accounts_json: Vec<serde_json::Value> = Vec::with_capacity(addrs.len());
 
         for group in addrs.chunks(per_chunk) {
+            if crate::provider::shutting_down() {
+                break;
+            }
             let mut calls: Vec<(String, serde_json::Value)> =
                 Vec::with_capacity(group.len() * per_addr);
             for (_, a) in group {
@@ -763,7 +766,22 @@ impl Wallet {
                     ));
                 }
             }
-            let results = provider.call_batch(&calls).await?;
+            // Retry this chunk with backoff on a rate-limit / transient failure instead of aborting
+            // the WHOLE balance refresh with `?`. Every account shares one Tor exit, so a burst of
+            // per-chunk batches reliably trips the RPC rate limit; the old `?` meant the first
+            // rate-limited chunk dropped balances for every account after it (the "only the first few
+            // show a balance" bug). On persistent failure we skip just this chunk (those accounts keep
+            // their cached balance) and continue with the rest.
+            let mut results = provider.call_batch(&calls).await.unwrap_or_default();
+            let mut tries = 0u32;
+            while results.is_empty() && tries < 6 && !crate::provider::shutting_down() {
+                tries += 1;
+                crate::provider::interruptible_sleep(backoff_delay(tries)).await;
+                results = provider.call_batch(&calls).await.unwrap_or_default();
+            }
+            if results.is_empty() {
+                continue; // give up on this chunk; keep cached balances for these accounts
+            }
 
             for (p, (idx, _)) in group.iter().enumerate() {
                 let base = p * per_addr;

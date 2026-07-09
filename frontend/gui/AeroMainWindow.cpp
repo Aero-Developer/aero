@@ -4192,10 +4192,13 @@ void AeroMainWindow::onFundedScanned(const QList<quint32> &indices) {
             fundedArr.append(static_cast<double>(i));
         m_meta[QStringLiteral("funded")] = fundedArr;
         m_meta[QStringLiteral("funded_done")] = true;
-        const QString metaJson =
-            QString::fromUtf8(QJsonDocument(m_meta).toJson(QJsonDocument::Compact));
-        runBusy(tr("Saving discovered accounts…"),
-                [this, metaJson]() { m_wallet->saveWithMetadata(metaJson); });
+        // Persist NON-BLOCKING. Do NOT use a modal blocking save here: the moment the scan releases
+        // the core write lock, the herd of balance/history reader tasks that queued up during the
+        // scan grabs read locks, which would starve a UI-thread write-lock save — freezing the app
+        // "as soon as scanning finishes". queueMetadata + saveAsync applies this metadata and writes
+        // off the UI thread as soon as the lock is free; closeEvent also flushes on exit.
+        m_wallet->queueMetadata(QString::fromUtf8(QJsonDocument(m_meta).toJson(QJsonDocument::Compact)));
+        m_wallet->saveAsync();
     }
     // Warm the address cache off-thread REGARDLESS of the funded count: the scan invalidated the
     // cache and grew account_order, so the next rebuildAccountCombos() (and the setWallet path) would
