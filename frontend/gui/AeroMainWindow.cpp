@@ -41,6 +41,8 @@
 #include <QClipboard>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QCompleter>
+#include <QStandardItemModel>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QEvent>
@@ -691,6 +693,12 @@ void AeroMainWindow::setupTabs() {
     m_recvBalanceLabel->setFixedWidth(240);
     recvUi.verticalLayout_2->insertWidget(1, m_recvBalanceLabel); // just below the QR
 
+    // Show balances in USD instead of the native coin. Defaults ON so the value of each address is
+    // obvious at a glance; toggled from the Receive "options" menu (built below). Remembered per install.
+    m_recvUsd = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
+                    .value(QStringLiteral("receive/showUsd"), true)
+                    .toBool();
+
     // Combined total across all accounts (like Home), pinned at the very bottom of the Receive tab.
     m_recvTotalLabel = new QLabel(tr("Total balance: —"), ui.tabReceive);
     m_recvTotalLabel->setAlignment(Qt::AlignHCenter);
@@ -748,6 +756,17 @@ void AeroMainWindow::setupTabs() {
             if (m_addressModel->rowCount() > 0)
                 selectAddressRow(m_addressModel->accountAt(0));
         });
+        // Show balances in USD (default on) — applies to the address list + the per-address breakdown.
+        auto *usdAct = menu->addAction(tr("Show balances in USD"));
+        usdAct->setCheckable(true);
+        usdAct->setChecked(m_recvUsd);
+        connect(usdAct, &QAction::toggled, this, [this](bool on) {
+            m_recvUsd = on;
+            QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
+                .setValue(QStringLiteral("receive/showUsd"), on);
+            updateReceive();                 // per-address breakdown under the QR
+            refreshAddressBalancesDisplay(); // the address list's Balance column
+        });
         connect(menu->addAction(tr("Rescan for funded addresses (all chains)")), &QAction::triggered,
                 this, [this]() {
                     if (m_wallet) {
@@ -775,6 +794,34 @@ void AeroMainWindow::setupTabs() {
     // "From" account selector at the top of the Send form (which account funds the send).
     m_fromCombo = new QComboBox(ui.tabSend);
     sendUi.formLayout->insertRow(0, tr("From"), m_fromCombo);
+
+    // Make "From" searchable: type an account number, label, or (full/partial) address to find it —
+    // essential once a wallet has many accounts. A custom completer model carries the full address as
+    // searchable text while the field still shows the friendly label; picking a match selects it.
+    m_fromCombo->setEditable(true);
+    m_fromCombo->setInsertPolicy(QComboBox::NoInsert);
+    m_fromCombo->setMaxVisibleItems(24);
+    if (m_fromCombo->lineEdit())
+        m_fromCombo->lineEdit()->setPlaceholderText(tr("Search account, label, or address"));
+    m_fromSearchModel = new QStandardItemModel(this);
+    auto *fromCompleter = new QCompleter(m_fromSearchModel, this);
+    fromCompleter->setCaseSensitivity(Qt::CaseInsensitive);
+    fromCompleter->setFilterMode(Qt::MatchContains);
+    fromCompleter->setCompletionMode(QCompleter::PopupCompletion);
+    m_fromCombo->setCompleter(fromCompleter);
+    connect(fromCompleter, QOverload<const QModelIndex &>::of(&QCompleter::activated), this,
+            [this](const QModelIndex &idx) {
+                const int acct = idx.data(Qt::UserRole + 1).toInt();
+                if (acct >= 0 && acct < m_fromCombo->count())
+                    m_fromCombo->setCurrentIndex(acct); // fires onAccountChanged; shows the label
+            });
+    // If the user typed a search but didn't pick a match, snap the text back to the selected account.
+    if (m_fromCombo->lineEdit())
+        connect(m_fromCombo->lineEdit(), &QLineEdit::editingFinished, this, [this]() {
+            const int cur = m_fromCombo->currentIndex();
+            if (cur >= 0 && m_fromCombo->currentText() != m_fromCombo->itemText(cur))
+                m_fromCombo->setEditText(m_fromCombo->itemText(cur));
+        });
 
     // The stock .ui uses two dropdowns (a currency combo + an ETH/USD unit toggle). Replace them
     // with a single row of clickable asset buttons (ETH / DAI / USDC / USDT / …): pick one, then
@@ -820,6 +867,8 @@ void AeroMainWindow::setupTabs() {
     m_amountUnit = new QComboBox(ui.tabSend);
     sendUi.horizontalLayout_2->addWidget(m_amountUnit);
     connect(m_amountUnit, &QComboBox::currentIndexChanged, this, &AeroMainWindow::onAmountConversion);
+    connect(m_amountUnit, &QComboBox::currentIndexChanged, this,
+            &AeroMainWindow::updateAvailableLabel); // flip "Available" between token and USD too
 
     // "Available" row (right under Amount) shows the spendable balance for the selected From
     // account + asset, and the Max button fills the amount with it.
@@ -952,6 +1001,20 @@ void AeroMainWindow::setupTabs() {
     customRow->addWidget(new QLabel(tr("gwei"), m_customFeeWidget));
     sendUi.formLayout->insertRow(feeRow >= 0 ? feeRow + 2 : 7, tr("Custom fee"), m_customFeeWidget);
     sendUi.formLayout->setRowVisible(m_customFeeWidget, false);
+
+    // "Pay to contact" picker under the estimated fee: choose a saved address-book contact to fill
+    // the recipient field. Populated from the Contacts tab (refreshSendContacts) and kept in sync.
+    m_sendContactsCombo = new QComboBox(ui.tabSend);
+    m_sendContactsCombo->setToolTip(tr("Fill the recipient from a saved contact"));
+    connect(m_sendContactsCombo, &QComboBox::activated, this, [this](int idx) {
+        if (idx <= 0) return; // row 0 is the placeholder
+        const QString addr = m_sendContactsCombo->itemData(idx).toString();
+        if (!addr.isEmpty())
+            sendUi.lineAddress->setPlainText(addr);
+        m_sendContactsCombo->setCurrentIndex(0); // reset to the placeholder for the next pick
+    });
+    sendUi.formLayout->insertRow(feeRow >= 0 ? feeRow + 3 : 8, tr("Pay to contact"), m_sendContactsCombo);
+    refreshSendContacts();
 
     connect(sendUi.combo_feePriority, &QComboBox::currentIndexChanged, this,
             &AeroMainWindow::onFeeModeChanged);
@@ -2884,19 +2947,35 @@ void AeroMainWindow::showRevokeApprovals() {
     auto *spenderName = new QHash<QString, QString>();
     for (const SpenderDef &s : curatedSpenders())
         spenderName->insert(s.address.toLower(), s.name);
+    // Token -> decimals, so a finite allowance is shown as a human amount (e.g. "1,000 USDC") rather
+    // than raw base units ("1000000000"). -1 == decimals unknown.
+    auto *decimalsFor = new QHash<QString, int>();
+    for (const TokenInfo &t : m_wallet->tokens())
+        decimalsFor->insert(t.address.toLower(), t.decimals);
+    for (const TokenInfo &t : curatedTopTokens(m_chainId))
+        decimalsFor->insert(t.address.toLower(), t.decimals);
     // Pending queue for "Revoke All" (each revoke is a separate tx, sent sequentially so nonces
     // don't collide — the next fires only after the previous is broadcast).
     auto *revokeQueue = new QList<QPair<QString, QString>>();
-    connect(dlg, &QObject::destroyed, [symbolFor, spenderName, revokeQueue]() {
+    connect(dlg, &QObject::destroyed, [symbolFor, spenderName, decimalsFor, revokeQueue]() {
         delete symbolFor;
         delete spenderName;
+        delete decimalsFor;
         delete revokeQueue;
     });
-    // A friendly, shortened allowance label ("Unlimited" for effectively-max approvals).
-    auto allowanceLabel = [](const QString &wei) -> QString {
+    // A friendly allowance label: "Unlimited" for effectively-max approvals, a human token amount
+    // when we know the token's decimals, else the raw base-unit value as a safe fallback.
+    auto allowanceLabel = [decimalsFor](const QString &wei, const QString &token) -> QString {
         if (wei.length() >= 30) // ~1e30+ base units => practically unlimited
             return tr("Unlimited");
-        return wei;
+        const int dec = decimalsFor->value(token.toLower(), -1);
+        if (dec < 0)
+            return wei; // unknown decimals: show raw base units rather than a wrong amount
+        bool ok = false;
+        const double v = wei.toDouble(&ok);
+        if (!ok)
+            return wei;
+        return formatBalance(v / std::pow(10.0, dec));
     };
 
     // Adds/updates one row with a Revoke button.
@@ -2911,7 +2990,9 @@ void AeroMainWindow::showRevokeApprovals() {
         sItem->setToolTip(spender);
         table->setItem(r, 0, tItem);
         table->setItem(r, 1, sItem);
-        table->setItem(r, 2, new QTableWidgetItem(allowanceLabel(wei)));
+        auto *aItem = new QTableWidgetItem(allowanceLabel(wei, token));
+        aItem->setToolTip(tr("%1 base units").arg(wei));
+        table->setItem(r, 2, aItem);
         auto *revoke = new QPushButton(tr("Revoke"), table);
         table->setCellWidget(r, 3, revoke);
         const quint32 idx = static_cast<quint32>(acct->currentIndex());
@@ -3202,6 +3283,7 @@ void AeroMainWindow::setupContactsTab() {
         }
         m_meta[QStringLiteral("contacts")] = arr;
         saveMetadata();
+        refreshSendContacts(); // keep the Send "Pay to contact" picker in sync
     };
 
     connect(addBtn, &QPushButton::clicked, this, [this, persist]() {
@@ -3653,6 +3735,7 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
             return; // a previous chain's fetch that landed after a network switch — ignore it
         // Single-account / one-shot path.
         m_historyModel->setKnownTokens(verifiedTokenAddresses());
+        updateHistoryOwnAddresses();
         m_historyModel->onHistoryRefreshed(items);
         checkUntrackedTokenLiquidity(); // auto-trust unknown-but-liquid tokens (DexScreener/Tor)
         requestHistoricalPrices(items); // value each native-coin tx at its date
@@ -3662,6 +3745,7 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     connect(m_wallet, &Wallet::historyRefreshStarted, this, [this]() {
         m_historyModel->beginFullRefresh();
         m_historyModel->setKnownTokens(verifiedTokenAddresses());
+        updateHistoryOwnAddresses(); // keep the poisoning look-alike index current
     });
     // Incremental all-account path: batches arrive per account (in completion order), appended live.
     connect(m_wallet, &Wallet::historyBatch, this,
@@ -4380,7 +4464,7 @@ void AeroMainWindow::loadBalanceCache() {
         const QString s = it.value().toString();
         m_accountBalances.insert(idx, s);
         if (m_addressModel)
-            m_addressModel->setBalance(idx, s);
+            m_addressModel->setBalance(idx, addressListBalance(idx));
         if (m_fromCombo && static_cast<int>(idx) < m_fromCombo->count()) {
             QSignalBlocker b(m_fromCombo);
             m_fromCombo->setItemText(static_cast<int>(idx), accountLabel(idx));
@@ -4547,7 +4631,7 @@ void AeroMainWindow::applyOptimisticSend(const QString &amount, const QString &t
         const QString disp = tr("%1 %2").arg(formatBalance(nv), m_nativeSymbol);
         m_accountBalances.insert(fromIdx, disp);
         if (m_addressModel)
-            m_addressModel->setBalance(fromIdx, disp);
+            m_addressModel->setBalance(fromIdx, addressListBalance(fromIdx));
     } else {
         // Token send: find this account's balance for the token (case-insensitive key match) and drop it.
         const QString prefix = QStringLiteral("%1|").arg(fromIdx);
@@ -4596,7 +4680,7 @@ void AeroMainWindow::applyOptimisticSwap() {
         const QString disp = tr("%1 %2").arg(formatBalance(nv), m_nativeSymbol);
         m_accountBalances.insert(fromIdx, disp);
         if (m_addressModel)
-            m_addressModel->setBalance(fromIdx, disp);
+            m_addressModel->setBalance(fromIdx, addressListBalance(fromIdx));
         m_swapPendingSellToken.clear();
     } else {
         const QString prefix = QStringLiteral("%1|").arg(fromIdx);
@@ -4632,6 +4716,29 @@ void AeroMainWindow::applyOptimisticSwap() {
     scheduleHomeRecompute();
 }
 
+// Repopulate the Send "Pay to contact" picker from the address book (m_contactsTable). Row 0 is a
+// placeholder; the rest carry the contact's address in itemData. Disabled when there are no contacts.
+void AeroMainWindow::refreshSendContacts() {
+    if (!m_sendContactsCombo)
+        return;
+    QSignalBlocker b(m_sendContactsCombo);
+    m_sendContactsCombo->clear();
+    m_sendContactsCombo->addItem(tr("Select a saved contact…"), QString());
+    if (m_contactsTable) {
+        for (int r = 0; r < m_contactsTable->rowCount(); ++r) {
+            const QString name = m_contactsTable->item(r, 0) ? m_contactsTable->item(r, 0)->text() : QString();
+            const QString addr = m_contactsTable->item(r, 1) ? m_contactsTable->item(r, 1)->text() : QString();
+            if (addr.isEmpty())
+                continue;
+            const QString label =
+                name.isEmpty() ? shortAddr(addr) : tr("%1  ·  %2").arg(name, shortAddr(addr));
+            m_sendContactsCombo->addItem(label, addr);
+        }
+    }
+    m_sendContactsCombo->setCurrentIndex(0);
+    m_sendContactsCombo->setEnabled(m_sendContactsCombo->count() > 1);
+}
+
 void AeroMainWindow::primeZeroBalances() {
     if (!m_wallet) return;
     const QString zero = tr("0 %1").arg(m_nativeSymbol);
@@ -4641,7 +4748,7 @@ void AeroMainWindow::primeZeroBalances() {
             continue;
         m_accountBalances.insert(i, zero);
         if (m_addressModel)
-            m_addressModel->setBalance(i, zero);
+            m_addressModel->setBalance(i, addressListBalance(i));
     }
     showCachedBalance(m_account);
     updateReceive();
@@ -4693,6 +4800,7 @@ void AeroMainWindow::loadMetadata() {
             m_contactsTable->setItem(r, 1, new QTableWidgetItem(c.value(QStringLiteral("address")).toString()));
         }
     }
+    refreshSendContacts(); // populate the Send "Pay to contact" picker for this wallet
     ui.notes->setPlainText(m_meta.value(QStringLiteral("notes")).toString());
     // Per-transaction notes (txHash -> note) into the History model.
     if (m_historyModel) {
@@ -4847,9 +4955,28 @@ void AeroMainWindow::onAvailableBalance(quint32 index, const QString &token,
     if (static_cast<int>(index) != fromIndex || token != currentTokenAddr())
         return;
     m_availAmount = formatted; // raw (no separators) so Max can fill the amount field
-    if (m_availLabel)
-        m_availLabel->setText(formatted.isEmpty() ? tr("—")
-                                                  : tr("%1 %2").arg(formatBalance(formatted), symbol));
+    updateAvailableLabel();
+}
+
+// Show the Send "Available" balance in the token, or in USD when the amount unit toggle is set to
+// USD (ETH/WETH), so it matches what the user is typing amounts in.
+void AeroMainWindow::updateAvailableLabel() {
+    if (!m_availLabel)
+        return;
+    if (m_availAmount.isEmpty()) {
+        m_availLabel->setText(tr("—"));
+        return;
+    }
+    const QString sym = currentSymbol();
+    const double amt = m_availAmount.toDouble();
+    const bool inUsd =
+        m_amountUnit && m_amountUnit->isVisible() &&
+        m_amountUnit->currentText().compare(QStringLiteral("USD"), Qt::CaseInsensitive) == 0;
+    const double price = unitPriceUsd(sym);
+    if (inUsd && price > 0.0)
+        m_availLabel->setText(fiatStr(amt * price));
+    else
+        m_availLabel->setText(tr("%1 %2").arg(formatBalance(amt), sym));
 }
 
 QString AeroMainWindow::accountLabel(quint32 index) const {
@@ -4902,7 +5029,41 @@ void AeroMainWindow::rebuildAccountCombos() {
     }
     if (m_addressModel)
         m_addressModel->refresh();
+    rebuildFromSearchModel();    // keep the Send "From" search index in sync with the accounts
     rebuildHistoryCombo();
+    updateHistoryOwnAddresses(); // addresses are hot here — refresh the poisoning look-alike index
+}
+
+// Repopulate the Send "From" search completer. Each entry's searchable text includes the account
+// number, its label, and the full address so the user can find an account by any of them; the
+// account index rides along in a data role so a pick selects the right combo row.
+void AeroMainWindow::rebuildFromSearchModel() {
+    if (!m_fromSearchModel || !m_wallet)
+        return;
+    m_fromSearchModel->clear();
+    const quint32 n = m_wallet->numAccounts();
+    for (quint32 i = 0; i < n; ++i) {
+        auto *it = new QStandardItem(
+            tr("Account #%1  ·  %2  ·  %3").arg(i).arg(accountLabel(i), m_wallet->address(i)));
+        it->setData(static_cast<int>(i), Qt::UserRole + 1);
+        m_fromSearchModel->appendRow(it);
+    }
+}
+
+// Feed the wallet's own receive addresses to the history model so it can flag vanity look-alike
+// address-poisoning. Only runs when the address cache is already hot, so it never derives HD keys on
+// the UI thread (see the freeze note in rebuildAccountCombos).
+void AeroMainWindow::updateHistoryOwnAddresses() {
+    if (!m_wallet || !m_historyModel)
+        return;
+    const quint32 n = m_wallet->numAccounts();
+    if (n == 0 || !m_wallet->addressesCached(n))
+        return;
+    QSet<QString> addrs;
+    addrs.reserve(static_cast<int>(n));
+    for (quint32 i = 0; i < n; ++i)
+        addrs.insert(m_wallet->address(i).toLower());
+    m_historyModel->setOwnAddresses(addrs);
 }
 
 void AeroMainWindow::rebuildHistoryCombo() {
@@ -5045,7 +5206,7 @@ void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, c
     const QString display = tr("%1 %2").arg(formatBalance(formatted), symbol);
     m_accountBalances.insert(index, display);
     if (m_addressModel)
-        m_addressModel->setBalance(index, display);
+        m_addressModel->setBalance(index, addressListBalance(index));
     if (m_fromCombo && static_cast<int>(index) < m_fromCombo->count()) {
         QSignalBlocker block(m_fromCombo);
         m_fromCombo->setItemText(static_cast<int>(index), accountLabel(index));
@@ -5061,6 +5222,29 @@ void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, c
     }
 }
 
+// The Balance shown in the Receive address list for one account: native coin by default, or its USD
+// value when the "Show values in USD" toggle is on (falling back to the native string until a price
+// is known).
+QString AeroMainWindow::addressListBalance(quint32 index) const {
+    if (m_recvUsd && m_nativeUsd > 0.0 && m_ethRawByAccount.contains(index))
+        return fiatStr(m_ethRawByAccount.value(index) * m_nativeUsd);
+    return m_accountBalances.value(index);
+}
+
+// Re-format every known account's Balance cell (e.g. when the USD toggle flips) so the address list
+// switches between native and USD without waiting for the next balance refresh.
+void AeroMainWindow::refreshAddressBalancesDisplay() {
+    if (!m_addressModel)
+        return;
+    QSet<quint32> idxs;
+    for (auto it = m_accountBalances.constBegin(); it != m_accountBalances.constEnd(); ++it)
+        idxs.insert(it.key());
+    for (auto it = m_ethRawByAccount.constBegin(); it != m_ethRawByAccount.constEnd(); ++it)
+        idxs.insert(it.key());
+    for (quint32 i : idxs)
+        m_addressModel->setBalance(i, addressListBalance(i));
+}
+
 void AeroMainWindow::updateReceive() {
     if (!m_wallet) return;
     const QString addr = m_wallet->address(m_account);
@@ -5069,12 +5253,28 @@ void AeroMainWindow::updateReceive() {
     recvUi.qrCode->setFixedSize(qr.size());
     recvUi.qrCode->setToolTip(tr("Click to copy"));
 
-    // Full per-address balance: native coin + every tracked token, each with its logo.
-    auto row = [](const QString &iconPath, const QString &symbol, double balance) {
+    // Full per-address balance: native coin + every tracked token, each with its logo. When the USD
+    // toggle is on we show each asset's fiat value (falling back to units when no price is known, e.g.
+    // an untracked token) plus a combined per-address USD total so the address value is obvious.
+    const bool usd = m_recvUsd;
+    double addrUsdTotal = 0.0;
+    auto row = [&](const QString &iconPath, const QString &symbol, double balance) {
+        QString valueText;
+        if (usd) {
+            const double price = unitPriceUsd(symbol);
+            if (price > 0.0) {
+                addrUsdTotal += balance * price;
+                valueText = fiatStr(balance * price);
+            } else {
+                valueText = formatBalance(balance) + QStringLiteral(" ") + symbol; // no price: show units
+            }
+        } else {
+            valueText = formatBalance(balance) + QStringLiteral(" ") + symbol;
+        }
         return QStringLiteral(
-                   "<tr><td><img src='%3' width='16' height='16'></td>"
-                   "<td>&nbsp;%2 %1</td></tr>")
-            .arg(symbol, formatBalance(balance), iconPath);
+                   "<tr><td><img src='%2' width='16' height='16'></td>"
+                   "<td>&nbsp;%1</td></tr>")
+            .arg(valueText.toHtmlEscaped(), iconPath);
     };
     QString html = QStringLiteral("<div align='center'>%1<br><br><table align='center' cellspacing='2'>")
                        .arg(addr.toHtmlEscaped());
@@ -5088,7 +5288,10 @@ void AeroMainWindow::updateReceive() {
         if (bal > 0.0)
             html += row(QStringLiteral(":/assets/images/tokens/%1.png").arg(t.symbol), t.symbol, bal);
     }
-    html += QStringLiteral("</table></div>");
+    html += QStringLiteral("</table>");
+    if (usd)
+        html += QStringLiteral("<br><b>%1</b>").arg(tr("This address: %1").arg(fiatStr(addrUsdTotal)));
+    html += QStringLiteral("</div>");
 
     m_recvBalanceLabel->setTextFormat(Qt::RichText);
     m_recvBalanceLabel->setText(html);
@@ -5214,7 +5417,7 @@ void AeroMainWindow::onAccountAdded(quint32 idx) {
     const QString zero = tr("0 %1").arg(m_nativeSymbol);
     m_accountBalances.insert(idx, zero);
     if (m_addressModel)
-        m_addressModel->setBalance(idx, zero);
+        m_addressModel->setBalance(idx, addressListBalance(idx));
     updateReceive();
     showCachedBalance(idx);
     m_wallet->refreshAccountBalance(idx); // 1 request: confirm the new account's native balance

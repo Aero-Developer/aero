@@ -10,9 +10,12 @@
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QMenu>
 #include <QRandomGenerator>
 #include <QLabel>
 #include <QLineEdit>
+#include <QStandardItemModel>
+#include <algorithm>
 #include <QEventLoop>
 #include <QFutureWatcher>
 #include <QMessageBox>
@@ -820,6 +823,9 @@ OpenPage::OpenPage(WalletWizard *w) : m_w(w), ui(new Ui::PageOpenWallet) {
     connect(ui->walletTable->selectionModel(), &QItemSelectionModel::currentRowChanged, this,
             [this](const QModelIndex &, const QModelIndex &) { updatePath(); });
     connect(ui->walletTable, &QTreeView::doubleClicked, this, [this]() { finishNow(); });
+    // Right-click to pin a wallet to the top of the list (favorites).
+    ui->walletTable->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(ui->walletTable, &QWidget::customContextMenuRequested, this, &OpenPage::showListMenu);
     connect(ui->btnBrowse, &QPushButton::clicked, this, [this]() {
         const QString start = QDir(walletsRoot()).exists() ? walletsRoot() : aeroLegacyRoot();
         const QString f = QFileDialog::getOpenFileName(this, tr("Select your wallet file"), start,
@@ -855,14 +861,58 @@ void OpenPage::refreshList() {
     const QString legacy = aeroLegacyRoot();
     files += QDir(legacy).entryInfoList({QStringLiteral("*.aero"), QStringLiteral("*.plume")},
                                         QDir::Files, QDir::Time);
+    // Pinned wallets float to the top (see the right-click menu); each group keeps its existing
+    // most-recent-first order.
+    std::stable_sort(files.begin(), files.end(), [this](const QFileInfo &a, const QFileInfo &b) {
+        return isPinned(a.absoluteFilePath()) && !isPinned(b.absoluteFilePath());
+    });
     for (const QFileInfo &fi : files) {
-        auto *name = new QStandardItem(fi.completeBaseName());
+        const bool pinned = isPinned(fi.absoluteFilePath());
+        auto *name = new QStandardItem(
+            (pinned ? QStringLiteral("\U0001F4CC  ") : QString()) + fi.completeBaseName());
         name->setEditable(false);
         auto *modified = new QStandardItem(fi.lastModified().toString(QStringLiteral("yyyy-MM-dd HH:mm")));
         modified->setEditable(false);
         auto *path = new QStandardItem(fi.absoluteFilePath());
         m_model->appendRow({name, modified, path});
     }
+}
+
+bool OpenPage::isPinned(const QString &path) const {
+    QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+    return s.value(QStringLiteral("wallet/pinned")).toStringList().contains(path, Qt::CaseInsensitive);
+}
+
+void OpenPage::setPinned(const QString &path, bool pinned) {
+    QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+    QStringList list = s.value(QStringLiteral("wallet/pinned")).toStringList();
+    for (int i = list.size() - 1; i >= 0; --i)
+        if (list.at(i).compare(path, Qt::CaseInsensitive) == 0)
+            list.removeAt(i);
+    if (pinned)
+        list.prepend(path); // newest pin first
+    s.setValue(QStringLiteral("wallet/pinned"), list);
+}
+
+void OpenPage::showListMenu(const QPoint &pos) {
+    const QModelIndex idx = ui->walletTable->indexAt(pos);
+    if (!idx.isValid())
+        return;
+    const QString path = m_model->item(idx.row(), 2)->text();
+    const bool pinned = isPinned(path);
+    QMenu menu(this);
+    QAction *toggle = menu.addAction(pinned ? tr("Unpin from top") : tr("Pin to top"));
+    if (menu.exec(ui->walletTable->viewport()->mapToGlobal(pos)) != toggle)
+        return;
+    setPinned(path, !pinned);
+    refreshList();
+    // Keep the same wallet selected after the list reorders.
+    for (int r = 0; r < m_model->rowCount(); ++r)
+        if (m_model->item(r, 2)->text() == path) {
+            ui->walletTable->setCurrentIndex(m_model->index(r, 0));
+            break;
+        }
+    updatePath();
 }
 
 void OpenPage::updatePath() {

@@ -36,6 +36,7 @@ class QTimer;
 class QSystemTrayIcon;
 class QAction;
 class QSortFilterProxyModel;
+class QStandardItemModel;
 class QListWidget;
 class QTableWidget;
 class QTreeWidget;
@@ -99,6 +100,7 @@ private slots:
     void onFeeModeChanged();
     void updateFeeEstimate();
     void updateAvailable();
+    void updateAvailableLabel(); // format the Send "Available" line in the token or USD per the unit toggle
     // Swap (multi-router) tab.
     void onSwapConfirm();
     void onSwapQuoteReady(const QString &quoteJson, const QString &error);
@@ -122,6 +124,7 @@ private:
     void switchChain(quint64 chainId); // reconnect + relabel native coin + refresh for a new chain
     void relabelNative();              // update native-coin labels (Home ticker, status) after switch
     void rebuildAccountCombos();
+    void updateHistoryOwnAddresses(); // feed the wallet's own addresses to the history poisoning filter
     void refreshAllBalances();
     void recomputeHomeTotal();
     void scheduleHomeRecompute();     // debounced recompute (coalesces bulk balance updates)
@@ -267,7 +270,12 @@ private:
     QLabel *m_connIcon = nullptr;  // green/gray connection indicator (bottom-right)
     QLabel *m_recvBalanceLabel = nullptr; // Receive: address + balance shown under the QR
     QLabel *m_recvTotalLabel = nullptr;   // Receive: combined total across accounts (like Home)
+    bool m_recvUsd = true;                // Receive: show balances in USD (default on); toggled in the options menu
+    QString addressListBalance(quint32 index) const; // native or USD per the Receive USD toggle
+    void refreshAddressBalancesDisplay();             // re-format the address-list balance column
     QComboBox *m_fromCombo = nullptr;     // Send: which account to send from
+    QStandardItemModel *m_fromSearchModel = nullptr; // Send: searchable account/label/address index
+    void rebuildFromSearchModel();                   // repopulate the Send "From" search completer
     QToolButton *m_assetButton = nullptr;    // Send: opens the searchable token picker
     QString m_sendSymbol = QStringLiteral("ETH"); // selected Send asset
     QString m_sendTokenAddr;                 // "" == ETH
@@ -275,6 +283,8 @@ private:
     QString m_pendingSendAsset;              // contract being resolved on-chain for the picker
     QComboBox *m_amountUnit = nullptr;       // Send: ETH/USD entry unit (ETH & WETH only)
     QLabel *m_feeEstimateLabel = nullptr;    // Send: "≈ X ETH ($Y) · ETA ~Z"
+    QComboBox *m_sendContactsCombo = nullptr; // Send: pick a saved contact to fill the recipient
+    void refreshSendContacts();               // repopulate the Send contacts picker from the address book
     QLineEdit *m_customMaxFee = nullptr;     // Send: custom max fee per gas (gwei)
     QLineEdit *m_customPriority = nullptr;   // Send: custom priority fee per gas (gwei)
     QWidget *m_customFeeWidget = nullptr;    // Send: container for the custom-fee inputs

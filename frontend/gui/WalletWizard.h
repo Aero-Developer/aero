@@ -192,6 +192,9 @@ private:
     void refreshList();
     void updatePath();
     void finishNow();
+    void showListMenu(const QPoint &pos); // right-click: pin/unpin a wallet
+    bool isPinned(const QString &path) const;
+    void setPinned(const QString &path, bool pinned);
     WalletWizard *m_w;
     Ui::PageOpenWallet *ui;
     QStandardItemModel *m_model;

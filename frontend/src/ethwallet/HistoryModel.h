@@ -125,6 +125,11 @@ public slots:
     // *other* ERC-20 are treated as unsolicited spam/airdrops and hidden.
     void setKnownTokens(const QSet<QString> &tokens);
 
+    // The wallet's own receive addresses (lower-case). Used to detect vanity/look-alike
+    // address-poisoning: an attacker crafts an address sharing the same first/last hex characters as
+    // one of these (or of a real counterparty) so it blends into history and gets copy-pasted later.
+    void setOwnAddresses(const QSet<QString> &addrs);
+
     // When true (default), address-poisoning and spam-token transfers are removed from the list
     // entirely rather than shown; toggled from the History options menu.
     void setHideSpam(bool hide);
@@ -156,6 +161,8 @@ signals:
 private:
     static QString dedupKey(const HistoryItem &h); // stable per-row key for m_seen
     bool isSpamToken(const HistoryItem &h) const;
+    bool isVanityLookalike(const HistoryItem &h) const; // look-alike address-poisoning
+    void rebuildPoisonRefs();                           // recompute m_poisonRefSigs/Addrs
     bool isHiddenSpam(const HistoryItem &h) const; // rows removed when m_hideSpam is on
     bool matchesSearch(const HistoryItem &h) const;
     bool lessThan(const HistoryItem &a, const HistoryItem &b) const; // by current sort column
@@ -173,6 +180,9 @@ private:
     QVector<HistoryItem> m_filtered;   // full filtered + sorted result (all pages)
     QVector<HistoryItem> m_items;    // the CURRENT PAGE slice of m_filtered (what the view renders)
     QSet<QString> m_knownTokens;
+    QSet<QString> m_ownAddresses;   // wallet's own addresses (lower-case) — poisoning targets
+    QSet<QString> m_poisonRefAddrs; // legit addresses (own + real counterparties), lower-case
+    QSet<QString> m_poisonRefSigs;  // first4+last4 hex signatures of the above (look-alike index)
     bool m_hideSpam = true;
     double m_dustUsd = 0.0;              // hide incoming worth less than this many USD (0 = off)
     QHash<QString, double> m_prices;     // symbol (upper) -> USD, for dust valuation

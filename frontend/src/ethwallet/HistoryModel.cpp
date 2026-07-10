@@ -2,13 +2,22 @@
 #include "HistoryModel.h"
 
 #include <algorithm>
+#include <cctype>
 
 #include <QBrush>
 #include <QColor>
 #include <QDateTime>
 #include <QFileInfo>
 #include <QIcon>
+#include <QLocale>
 #include <QTimer>
+
+// Format a number with thousands separators (commas) at 2 decimals for USD or a given precision for
+// token amounts. Uses a fixed en-US locale so grouping is always commas regardless of system locale.
+static QString grouped2(double v, int decimals) {
+    static const QLocale kUs(QLocale::English, QLocale::UnitedStates);
+    return kUs.toString(v, 'f', decimals);
+}
 
 // A token symbol is an impersonation if it isn't plain ASCII. Scam tokens use Cyrillic/Greek
 // look-alikes (e.g. "ЕТН"/"ΕΤΗ" for "ETH") to dodge naive symbol checks and fool the eye; every
@@ -44,7 +53,7 @@ static QString capAmount(const QString &raw) {
         return raw;
     const double a = qAbs(v);
     const int dec = (a != 0.0 && a < 0.0001) ? 8 : 4;
-    QString s = QString::number(v, 'f', dec);
+    QString s = grouped2(v, dec); // thousands separators so big amounts read cleanly
     if (s.contains(QLatin1Char('.'))) {
         while (s.endsWith(QLatin1Char('0')))
             s.chop(1);
@@ -54,17 +63,92 @@ static QString capAmount(const QString &raw) {
     return s;
 }
 
-// Zero-value incoming transfers are the classic address-poisoning pattern (dust/$0 from look-alike
-// addresses). These are not real payments and are hidden along with spam tokens.
+// Zero-value transfers are address-poisoning, not real activity. Two flavours:
+//   * incoming $0/dust from a look-alike address (the classic pattern), and
+//   * spoofed zero-value ERC-20 Transfer events of REAL tokens (DAI/USDT/EURC/…) where YOUR address
+//     is spoofed as the sender, so they'd otherwise show as bogus "Sent 0 DAI" rows. You never
+//     legitimately send 0 of a token, so any zero-value token transfer (either direction) is spam.
+// A zero-value NATIVE transaction is kept — that's a genuine contract call (approve/swap/revoke).
 static bool isPoisoning(const HistoryItem &h) {
-    return h.direction == QLatin1String("in") && (h.amount.isEmpty() || h.amount == QLatin1String("0"));
+    const bool zero = h.amount.isEmpty() || h.amount == QLatin1String("0");
+    if (!zero)
+        return false;
+    if (h.direction == QLatin1String("in"))
+        return true;
+    return !h.token.isEmpty(); // zero-value token transfer in any direction => poisoning
+}
+
+// True if `s` looks like a 0x… EVM address (0x + 40 hex chars). Counterparties can also be a
+// contract name / CoW label, which we skip for look-alike analysis.
+static bool isEvmAddress(const QString &s) {
+    if (s.size() != 42 || !s.startsWith(QLatin1String("0x"), Qt::CaseInsensitive))
+        return false;
+    for (int i = 2; i < 42; ++i)
+        if (!std::isxdigit(static_cast<unsigned char>(s.at(i).toLatin1())))
+            return false;
+    return true;
+}
+
+// Look-alike signature of an address: its first 4 + last 4 hex characters (lower-case). Vanity
+// address-poisoning brute-forces exactly this prefix/suffix so a spoof address renders identically
+// to a real one in the truncated "0x1234…abcd" form shown in wallets/explorers.
+static QString addrSignature(const QString &addrLower) {
+    if (addrLower.size() != 42)
+        return QString();
+    return addrLower.mid(2, 4) + addrLower.right(4);
+}
+
+// Rebuild the reference index of legitimate addresses (the wallet's own addresses + counterparties of
+// genuine, non-spam transfers of value). A transfer whose counterparty matches one of these
+// signatures but ISN'T one of the real addresses is a vanity look-alike (poisoning). Recomputed per
+// rebuild; O(N) over history.
+void HistoryModel::rebuildPoisonRefs() {
+    m_poisonRefAddrs.clear();
+    m_poisonRefSigs.clear();
+    const auto addRef = [this](const QString &addrLower) {
+        if (!isEvmAddress(addrLower))
+            return;
+        m_poisonRefAddrs.insert(addrLower);
+        const QString sig = addrSignature(addrLower);
+        if (!sig.isEmpty())
+            m_poisonRefSigs.insert(sig);
+    };
+    for (const QString &a : m_ownAddresses)
+        addRef(a.toLower());
+    for (const HistoryItem &h : m_allItems) {
+        if (h.kind == QLatin1String("swap"))
+            continue;
+        const bool nonzero = !(h.amount.isEmpty() || h.amount == QLatin1String("0"));
+        // Only trust a counterparty as "real" if it moved value and isn't itself a spam token — so a
+        // poisoning entry can never seed its own look-alike reference.
+        if (nonzero && !isSpamToken(h))
+            addRef(h.counterparty.toLower());
+    }
+}
+
+// True if this transfer's counterparty is a vanity look-alike of a known-legit address: same
+// first4/last4 hex as a real address, but not that address. This is the defining signature of
+// address-poisoning and catches spoofs that carry a nonzero/dust value (which the zero-value and
+// unknown-token filters miss).
+bool HistoryModel::isVanityLookalike(const HistoryItem &h) const {
+    const QString a = h.counterparty.toLower();
+    if (!isEvmAddress(a) || m_poisonRefAddrs.contains(a))
+        return false; // not an address, or an exact legit address — not a look-alike
+    return m_poisonRefSigs.contains(addrSignature(a));
 }
 
 bool HistoryModel::isHiddenSpam(const HistoryItem &h) const {
     if (h.kind == QLatin1String("swap"))
         return false; // swaps are user-initiated, never spam
+    // Never hide the user's own just-broadcast (pending) send — it must appear in history instantly.
+    if (h.status == QLatin1String("pending") && h.direction == QLatin1String("out"))
+        return false;
     if (isPoisoning(h) || isSpamToken(h))
         return true;
+    // Look-alike poisoning is an inbound attack (a spoof address sent to you). Only gate incoming
+    // transfers so a genuine outgoing send to a coincidentally-similar address is never hidden.
+    if (h.direction == QLatin1String("in") && isVanityLookalike(h))
+        return true; // spoof address mimicking a real one (poisoning), any value
     // Dust filter: hide incoming transfers worth less than the configured USD threshold. Only
     // applied when we actually have a positive price for the asset, so legit transfers aren't
     // hidden just because prices haven't loaded yet.
@@ -113,13 +197,23 @@ bool HistoryModel::lessThan(const HistoryItem &a, const HistoryItem &b) const {
     switch (m_sortColumn) {
     case Column_Date:
         return (a.timestamp ? a.timestamp : a.block) < (b.timestamp ? b.timestamp : b.block);
-    case Column_Amount:
     case Column_Value: {
-        const double ap = unitPriceFor(a);
-        const double bp = unitPriceFor(b);
-        const double av = a.formatted.toDouble() * (ap > 0.0 ? ap : 1.0);
-        const double bv = b.formatted.toDouble() * (bp > 0.0 ? bp : 1.0);
+        // Strictly by USD worth; an asset with no known price ranks as 0 so a huge-count, low-value
+        // token (e.g. an unpriced meme coin) can never sit above a genuinely high-value transfer.
+        const double ap = unitPriceFor(a), bp = unitPriceFor(b);
+        const double av = ap > 0.0 ? a.formatted.toDouble() * ap : 0.0;
+        const double bv = bp > 0.0 ? b.formatted.toDouble() * bp : 0.0;
         return av < bv;
+    }
+    case Column_Amount: {
+        // Rank by USD worth too (so $1.5M outranks $400 of a meme coin). Unpriced assets have no
+        // comparable value and rank below all priced ones, ordered among themselves by quantity.
+        const double ap = unitPriceFor(a), bp = unitPriceFor(b);
+        const double av = ap > 0.0 ? a.formatted.toDouble() * ap : 0.0;
+        const double bv = bp > 0.0 ? b.formatted.toDouble() * bp : 0.0;
+        if (av != bv)
+            return av < bv;
+        return a.formatted.toDouble() < b.formatted.toDouble();
     }
     case Column_Direction: {
         const int ak = a.failed ? 2 : (a.direction == QLatin1String("in") ? 0 : 1);
@@ -144,6 +238,7 @@ void HistoryModel::sortFiltered() {
 
 // Recompute the full filtered + sorted result set, then show only the current page.
 void HistoryModel::rebuildVisible() {
+    rebuildPoisonRefs(); // refresh the legit-address index before filtering (look-alike detection)
     m_filtered.clear();
     m_filtered.reserve(m_allItems.size());
     for (const HistoryItem &h : m_allItems) {
@@ -291,6 +386,17 @@ void HistoryModel::setKnownTokens(const QSet<QString> &tokens) {
     rebuildVisible();
 }
 
+void HistoryModel::setOwnAddresses(const QSet<QString> &addrs) {
+    QSet<QString> lower;
+    lower.reserve(addrs.size());
+    for (const QString &a : addrs)
+        lower.insert(a.toLower());
+    if (lower == m_ownAddresses)
+        return; // unchanged — avoid a needless re-filter
+    m_ownAddresses = lower;
+    rebuildVisible(); // look-alike detection references the wallet's own addresses
+}
+
 QVariant HistoryModel::data(const QModelIndex &index, int role) const {
     if (!index.isValid() || index.row() >= m_items.size())
         return {};
@@ -352,7 +458,9 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
         case Column_Value: {
             const double amt = h.formatted.toDouble();
             const double price = unitPriceFor(h);
-            return price > 0.0 ? amt * price : amt; // sort by USD value when known, else raw amount
+            // Sort by USD value; unpriced assets rank as 0 so a huge unpriced token count can't
+            // outrank a genuinely high-value transfer.
+            return price > 0.0 ? amt * price : 0.0;
         }
         case Column_Direction:
             return h.failed ? 2 : (h.direction == QLatin1String("in") ? 0 : 1);
@@ -370,10 +478,15 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
 
     switch (index.column()) {
         case Column_Date:
-            if (h.timestamp == 0)
-                return h.block == 0 ? tr("pending") : QString::number(h.block);
-            return QDateTime::fromSecsSinceEpoch(static_cast<qint64>(h.timestamp))
-                .toString(QStringLiteral("yyyy-MM-dd HH:mm"));
+            // Unconfirmed rows show "pending" even though we stamp a sort timestamp so they float to
+            // the top. Keyed on status (not block==0) because settled CoW orders also carry block 0
+            // but have a real creation timestamp to display.
+            if (h.status == QLatin1String("pending"))
+                return tr("pending");
+            if (h.timestamp != 0)
+                return QDateTime::fromSecsSinceEpoch(static_cast<qint64>(h.timestamp))
+                    .toString(QStringLiteral("yyyy-MM-dd HH:mm"));
+            return h.block == 0 ? tr("pending") : QString::number(h.block);
         case Column_Direction:
             if (h.kind == QLatin1String("swap")) {
                 if (h.status == QLatin1String("pending")) return tr("Swap · pending");
@@ -392,7 +505,7 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
             if (price <= 0.0)
                 return QStringLiteral("—"); // price not known (yet) for this asset
             const double val = h.formatted.toDouble() * price * m_fiatRate;
-            return QStringLiteral("%1%2").arg(m_fiatSymbol, QString::number(val, 'f', 2));
+            return QStringLiteral("%1%2").arg(m_fiatSymbol, grouped2(val, 2));
         }
         case Column_Counterparty: {
             const QString note = m_txNotes.value(h.txHash.toLower());
@@ -490,21 +603,43 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
     for (const HistoryItem &h : items) {
         if (h.kind == QLatin1String("swap") && !h.txHash.isEmpty()) {
             const QString uid = h.txHash.toLower();
-            // Reconcile a fetched (settled/known) swap against a local optimistic pending row of the
-            // same id: drop the pending copy so this real one (with its true status) replaces it.
-            bool wasLocal = false;
+            // Reconcile a fetched (settled/known) swap against a local optimistic pending row: drop
+            // the pending copy so this real one (with its true status) replaces it. Match by id
+            // first; if that fails, fall back to a content match. The fallback is essential for CoW
+            // eth-flow (native-ETH) swaps: we place the pending row under the on-chain tx hash, but
+            // the settled order comes back from cow_orders keyed by the CoW order UID, so the ids
+            // never match — without this the successful swap would linger "pending" and then wrongly
+            // flip to "failed".
+            QString removedLocalHash;
             for (int i = 0; i < m_localSwaps.size(); ++i)
                 if (m_localSwaps.at(i).txHash.toLower() == uid) {
+                    removedLocalHash = m_localSwaps.at(i).txHash.toLower();
                     m_localSwaps.removeAt(i);
-                    wasLocal = true;
                     break;
                 }
-            if (wasLocal)
+            if (removedLocalHash.isEmpty()) {
+                for (int i = 0; i < m_localSwaps.size(); ++i) {
+                    const HistoryItem &l = m_localSwaps.at(i);
+                    // Same sell/buy assets, and the fetched order happened around/after we placed the
+                    // local row (allowing a little clock skew). The window keeps an older settled
+                    // order of the same pair from reconciling a freshly-placed pending row.
+                    const qint64 dt =
+                        static_cast<qint64>(h.timestamp) - static_cast<qint64>(l.timestamp);
+                    if (l.symbol == h.symbol && l.buySymbol == h.buySymbol && h.timestamp > 0 &&
+                        l.timestamp > 0 && dt >= -300 && dt <= 6 * 3600) {
+                        removedLocalHash = l.txHash.toLower();
+                        m_localSwaps.removeAt(i);
+                        break;
+                    }
+                }
+            }
+            if (!removedLocalHash.isEmpty())
                 m_allItems.erase(
                     std::remove_if(m_allItems.begin(), m_allItems.end(),
                                    [&](const HistoryItem &e) {
                                        return e.kind == QLatin1String("swap") &&
-                                              e.txHash.toLower() == uid;
+                                              (e.txHash.toLower() == uid ||
+                                               e.txHash.toLower() == removedLocalHash);
                                    }),
                     m_allItems.end());
             if (m_seen.contains(uid)) // cross-account/page dedup of the fetched swap itself
@@ -564,6 +699,24 @@ void HistoryModel::rebuildAll() {
         };
         dropReconciled(m_localSwaps);
         dropReconciled(m_localSends);
+        // Content-match fallback for swaps whose ids differ from the fetched copy (CoW eth-flow — see
+        // appendBatch), so a settled order also clears its optimistic pending row here.
+        m_localSwaps.erase(
+            std::remove_if(m_localSwaps.begin(), m_localSwaps.end(),
+                           [&](const HistoryItem &l) {
+                               for (const HistoryItem &f : m_fetched) {
+                                   if (f.kind != QLatin1String("swap"))
+                                       continue;
+                                   const qint64 dt = static_cast<qint64>(f.timestamp) -
+                                                     static_cast<qint64>(l.timestamp);
+                                   if (l.symbol == f.symbol && l.buySymbol == f.buySymbol &&
+                                       f.timestamp > 0 && l.timestamp > 0 && dt >= -300 &&
+                                       dt <= 6 * 3600)
+                                       return true;
+                               }
+                               return false;
+                           }),
+            m_localSwaps.end());
     }
     m_allItems = m_localSwaps; // pending swaps + sends on top until their mined rows arrive
     m_allItems += m_localSends;
@@ -614,6 +767,10 @@ void HistoryModel::addLocalSend(const QString &txHash, const QString &to,
     h.token = token; // "" == native; set so a pending token send shows its own icon (not ETH's)
     h.txHash = txHash;
     h.block = 0; // pending until confirmed
+    // Stamp "now" so the pending row sorts to the TOP (newest-first) immediately; the Date column
+    // still shows "pending" while block == 0. Without this it defaulted to timestamp 0 and sank to
+    // the bottom of the list, so a just-sent tx looked like it wasn't detected.
+    h.timestamp = static_cast<quint64>(QDateTime::currentSecsSinceEpoch());
     h.status = QStringLiteral("pending");
     // Track it like a local swap so it survives full refreshes and is reconciled away (not duplicated)
     // once the real mined row is fetched.
