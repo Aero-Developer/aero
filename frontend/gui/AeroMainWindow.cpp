@@ -2653,6 +2653,7 @@ void AeroMainWindow::onRouterSwapSent(const QString &txHash, const QString &erro
     // receipt to refresh balances the instant it confirms (same fast path as a send). Clear the
     // send-optimistic marker so its balance clamp doesn't misapply to this swap.
     m_lastSendFrom = 0xFFFFFFFFu;
+    applyOptimisticSwap(); // instantly drop the sold asset (the mined receipt then reconciles it)
     startReceiptWatch(txHash);
     swapInlineDone(tr("Swap sent via %1 — %2 → %3. Tracking in History.")
                        .arg(m_swapSelLabel, m_swapSellSymbol, m_swapBuySymbol),
@@ -2762,6 +2763,7 @@ void AeroMainWindow::onSwapSubmitted(const QString &orderUid, const QString &err
     }
     m_swapExecQuote.clear();
     addPendingSwap(orderUid); // show it as pending in History right away (reconciled via cow_orders)
+    applyOptimisticSwap();    // instantly drop the sold asset so a follow-up swap sees it reduced
     const QString url = QStringLiteral("https://explorer.cow.fi/orders/%1").arg(orderUid);
     swapInlineDone(tr("Order placed — %1 → %2. Tracking in History.")
                        .arg(m_swapSellSymbol, m_swapBuySymbol),
@@ -2783,6 +2785,7 @@ void AeroMainWindow::onSwapEthFlowSent(const QString &txHash, const QString &err
     // pending History row now and start the CoW status poll (reads m_swapExecQuote, so do it BEFORE
     // clearing that below).
     addPendingSwap(txHash);
+    applyOptimisticSwap(); // instantly drop the sold native coin (eth-flow) so it doesn't linger
     m_swapExecQuote.clear();
     swapInlineDone(tr("Swap sent — %1 → %2. Tracking in History.")
                        .arg(m_swapSellSymbol, m_swapBuySymbol),
@@ -4574,6 +4577,61 @@ void AeroMainWindow::applyOptimisticSend(const QString &amount, const QString &t
     scheduleHomeRecompute();
 }
 
+// Instantly drop the SOLD asset from the balance the moment a swap is submitted (like the send
+// optimistic drop), so a follow-up swap sees the reduced "Available" and the sold token doesn't
+// linger. A clamp (see onAccountBalance/onAvailableBalance) then keeps it dropped until the swap
+// actually settles, instead of a pre-settle refresh flickering it back up for ~a minute.
+void AeroMainWindow::applyOptimisticSwap() {
+    if (!m_wallet)
+        return;
+    const quint32 fromIdx = m_swapExecFrom;
+    const bool sellNative = m_swapExecNative;
+    const quint8 dec = sellNative ? 18 : m_swapSellDecimals;
+    const double amt = m_swapExecSellAmountWei.toDouble() / std::pow(10.0, dec);
+    if (amt <= 0.0)
+        return;
+    if (sellNative) {
+        const double nv = qMax(0.0, m_ethRawByAccount.value(fromIdx, 0.0) - amt);
+        m_ethRawByAccount.insert(fromIdx, nv);
+        const QString disp = tr("%1 %2").arg(formatBalance(nv), m_nativeSymbol);
+        m_accountBalances.insert(fromIdx, disp);
+        if (m_addressModel)
+            m_addressModel->setBalance(fromIdx, disp);
+        m_swapPendingSellToken.clear();
+    } else {
+        const QString prefix = QStringLiteral("%1|").arg(fromIdx);
+        const QString addrLc = m_swapExecSellAddr.toLower();
+        for (auto it = m_tokenRawByKey.begin(); it != m_tokenRawByKey.end(); ++it) {
+            if (!it.key().startsWith(prefix))
+                continue;
+            if (!it.key().mid(prefix.size()).toLower().contains(addrLc))
+                continue;
+            it.value() = qMax(0.0, it.value() - amt);
+            break;
+        }
+        m_swapPendingSellToken = addrLc;
+    }
+    // Arm the clamp so a pre-settle balance refresh can't revert the drop (5 min ceiling — CoW
+    // auctions/settlement can take a few minutes; on-chain/eth-flow settle much faster).
+    m_swapPendingFrom = fromIdx;
+    m_swapPendingUntilMs = QDateTime::currentMSecsSinceEpoch() + 5 * 60 * 1000;
+
+    if (m_fromCombo && static_cast<int>(fromIdx) < m_fromCombo->count()) {
+        QSignalBlocker b(m_fromCombo);
+        m_fromCombo->setItemText(static_cast<int>(fromIdx), accountLabel(fromIdx));
+    }
+    if (m_swapFrom && static_cast<int>(fromIdx) < m_swapFrom->count()) {
+        QSignalBlocker b(m_swapFrom);
+        m_swapFrom->setItemText(static_cast<int>(fromIdx), accountLabel(fromIdx));
+    }
+    if (fromIdx == m_account) {
+        showCachedBalance(m_account);
+        updateReceive();
+    }
+    updateSwapAvailable(); // so an immediate follow-up swap sees the reduced available balance
+    scheduleHomeRecompute();
+}
+
 void AeroMainWindow::primeZeroBalances() {
     if (!m_wallet) return;
     const QString zero = tr("0 %1").arg(m_nativeSymbol);
@@ -4751,6 +4809,15 @@ void AeroMainWindow::onAvailableBalance(quint32 index, const QString &token,
             token.compare(m_committedTokenAddr, Qt::CaseInsensitive) == 0 && oldBal >= 0.0 &&
             newBal > oldBal + 1e-12)
             return;
+        // Same clamp for a pending TOKEN-selling swap: ignore a pre-settle read that would raise this
+        // sold token's balance back above the optimistic drop; release once it settles (or expires).
+        if (m_swapPendingFrom == index && token.toLower() == m_swapPendingSellToken) {
+            if (QDateTime::currentMSecsSinceEpoch() < m_swapPendingUntilMs) {
+                if (oldBal >= 0.0 && newBal > oldBal + 1e-12)
+                    return;
+            }
+            m_swapPendingFrom = 0xFFFFFFFFu; // settled or expired
+        }
         m_tokenRawByKey.insert(key, newBal);
         // Instant red for a positive balance; the full/authoritative recompute is debounced so a
         // bulk refresh of hundreds of accounts doesn't run recomputeHomeTotal thousands of times.
@@ -4931,6 +4998,15 @@ void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, c
     if (index == m_lastSendFrom && !m_pendingReceiptHash.isEmpty() && oldBal >= 0.0 &&
         newBal > oldBal + 1e-12)
         return;
+    // Same clamp for a pending NATIVE-selling swap: ignore a pre-settle read that would raise the
+    // balance back above the optimistic drop; release the clamp once it genuinely settles (or expires).
+    if (m_swapPendingFrom == index && m_swapPendingSellToken.isEmpty()) {
+        if (QDateTime::currentMSecsSinceEpoch() < m_swapPendingUntilMs) {
+            if (oldBal >= 0.0 && newBal > oldBal + 1e-12)
+                return;
+        }
+        m_swapPendingFrom = 0xFFFFFFFFu; // settled or expired
+    }
     m_ethRawByAccount.insert(index, newBal); // raw, for the combined total
     // Instant red for a positive balance; full recompute is debounced (see scheduleHomeRecompute).
     if (newBal > 0.0 && m_addressModel)

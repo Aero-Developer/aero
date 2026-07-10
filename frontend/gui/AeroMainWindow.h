@@ -333,6 +333,16 @@ private:
     qint64 m_lastSendMs = 0;                   // when we last sent — suppress false "received" while
                                                // a pre-mine refresh reads the still-higher balance
 
+    // Optimistic swap-sell state: when a swap is submitted, the sold asset is dropped from the
+    // balance immediately. Until the swap actually settles, a balance refresh would read the
+    // still-unspent (higher) balance and flicker the drop back up (the "token lingers ~1 min /
+    // duplicate" bug), so while this clamp is active we ignore a refresh that would RAISE the sold
+    // asset's balance for this account. Cleared when the balance genuinely drops or after a timeout.
+    void applyOptimisticSwap();
+    quint32 m_swapPendingFrom = 0xFFFFFFFFu;   // account the pending swap sells from
+    QString m_swapPendingSellToken;            // sold token contract lowercased ("" = native)
+    qint64 m_swapPendingUntilMs = 0;           // clamp expiry (ms since epoch)
+
     QTimer *m_refreshTimer = nullptr;
     QTimer *m_blockTimer = nullptr;            // polls the chain head for new blocks
     QTimer *m_receiptTimer = nullptr;          // fast-polls a just-sent tx's receipt to confirm it
