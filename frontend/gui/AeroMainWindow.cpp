@@ -40,9 +40,9 @@
 #include <QToolButton>
 #include <QClipboard>
 #include <QCloseEvent>
+#include <QBoxLayout>
 #include <QComboBox>
-#include <QCompleter>
-#include <QStandardItemModel>
+#include <QListView>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QEvent>
@@ -349,6 +349,71 @@ QString shortAddr(const QString &a) {
     return a.left(8) + QStringLiteral("…") + a.right(6);
 }
 
+// A normal (non-editable) combo box that, when its dropdown opens, shows a search box PINNED AT THE
+// TOP of the popup. Typing filters the rows live (matching each row's display text plus the full
+// address stashed in Qt::UserRole). Clicking the field opens the dropdown as usual. Used for the Send
+// "From" account selector, which can hold hundreds of accounts. No Q_OBJECT needed — it only
+// overrides virtuals and wires a child line edit.
+class SearchableComboBox : public QComboBox {
+public:
+    explicit SearchableComboBox(QWidget *parent = nullptr) : QComboBox(parent) {
+        setMaxVisibleItems(18);
+        m_filter = new QLineEdit(this);
+        m_filter->setPlaceholderText(QObject::tr("Search account, label, or address…"));
+        m_filter->setClearButtonEnabled(true);
+        m_filter->hide();
+        connect(m_filter, &QLineEdit::textChanged, this, [this](const QString &t) { filterRows(t); });
+        // Enter selects the first matching row (so you can type + press Enter without reaching for the
+        // mouse).
+        connect(m_filter, &QLineEdit::returnPressed, this, [this]() {
+            auto *lv = qobject_cast<QListView *>(view());
+            if (!lv)
+                return;
+            for (int i = 0; i < count(); ++i)
+                if (!lv->isRowHidden(i)) {
+                    setCurrentIndex(i);
+                    hidePopup();
+                    return;
+                }
+        });
+    }
+
+protected:
+    void showPopup() override {
+        QComboBox::showPopup();
+        // Inject the search box at the top of the popup container the first time, then reuse it.
+        if (QWidget *container = view() ? view()->parentWidget() : nullptr) {
+            if (m_filter->parentWidget() != container) {
+                m_filter->setParent(container);
+                if (auto *box = qobject_cast<QBoxLayout *>(container->layout()))
+                    box->insertWidget(0, m_filter);
+            }
+            setAllRowsVisible();
+            m_filter->clear();
+            m_filter->show();
+            m_filter->setFocus();
+        }
+    }
+
+private:
+    void setAllRowsVisible() {
+        if (auto *lv = qobject_cast<QListView *>(view()))
+            for (int i = 0; i < count(); ++i)
+                lv->setRowHidden(i, false);
+    }
+    void filterRows(const QString &text) {
+        auto *lv = qobject_cast<QListView *>(view());
+        if (!lv)
+            return;
+        const QString q = text.trimmed().toLower();
+        for (int i = 0; i < count(); ++i) {
+            const QString hay = (itemText(i) + QLatin1Char(' ') + itemData(i).toString()).toLower();
+            lv->setRowHidden(i, !(q.isEmpty() || hay.contains(q)));
+        }
+    }
+    QLineEdit *m_filter = nullptr;
+};
+
 // Insert thousands separators into the integer part of a decimal string ("1234.56" -> "1,234.56").
 QString grouped(const QString &number) {
     QString s = number.trimmed();
@@ -605,7 +670,7 @@ void AeroMainWindow::setupTabs() {
 
     // History account filter: "All accounts" or a single account, placed at the left of the
     // search bar (Feather shows a similar account filter above the history view).
-    m_historyCombo = new QComboBox(histUi.frame_search);
+    m_historyCombo = new SearchableComboBox(histUi.frame_search); // searchable for many-account wallets
     m_historyCombo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     m_historyCombo->setMinimumWidth(200);
     histUi.horizontalLayout_2->insertWidget(0, m_historyCombo);
@@ -791,37 +856,12 @@ void AeroMainWindow::setupTabs() {
     connect(m_addressModel, &QAbstractItemModel::modelReset, this,
             [this]() { applyReceiveSearch(); });
 
-    // "From" account selector at the top of the Send form (which account funds the send).
-    m_fromCombo = new QComboBox(ui.tabSend);
+    // "From" account selector at the top of the Send form (which account funds the send). Uses a
+    // searchable dropdown: open it and a search field sits at the top of the list — type an account
+    // number, label, or (full/partial) address to filter the list live. The full address is stashed
+    // in each item's data role so it's searchable even though the row only shows a shortened form.
+    m_fromCombo = new SearchableComboBox(ui.tabSend);
     sendUi.formLayout->insertRow(0, tr("From"), m_fromCombo);
-
-    // Make "From" searchable: type an account number, label, or (full/partial) address to find it —
-    // essential once a wallet has many accounts. A custom completer model carries the full address as
-    // searchable text while the field still shows the friendly label; picking a match selects it.
-    m_fromCombo->setEditable(true);
-    m_fromCombo->setInsertPolicy(QComboBox::NoInsert);
-    m_fromCombo->setMaxVisibleItems(24);
-    if (m_fromCombo->lineEdit())
-        m_fromCombo->lineEdit()->setPlaceholderText(tr("Search account, label, or address"));
-    m_fromSearchModel = new QStandardItemModel(this);
-    auto *fromCompleter = new QCompleter(m_fromSearchModel, this);
-    fromCompleter->setCaseSensitivity(Qt::CaseInsensitive);
-    fromCompleter->setFilterMode(Qt::MatchContains);
-    fromCompleter->setCompletionMode(QCompleter::PopupCompletion);
-    m_fromCombo->setCompleter(fromCompleter);
-    connect(fromCompleter, QOverload<const QModelIndex &>::of(&QCompleter::activated), this,
-            [this](const QModelIndex &idx) {
-                const int acct = idx.data(Qt::UserRole + 1).toInt();
-                if (acct >= 0 && acct < m_fromCombo->count())
-                    m_fromCombo->setCurrentIndex(acct); // fires onAccountChanged; shows the label
-            });
-    // If the user typed a search but didn't pick a match, snap the text back to the selected account.
-    if (m_fromCombo->lineEdit())
-        connect(m_fromCombo->lineEdit(), &QLineEdit::editingFinished, this, [this]() {
-            const int cur = m_fromCombo->currentIndex();
-            if (cur >= 0 && m_fromCombo->currentText() != m_fromCombo->itemText(cur))
-                m_fromCombo->setEditText(m_fromCombo->itemText(cur));
-        });
 
     // The stock .ui uses two dropdowns (a currency combo + an ETH/USD unit toggle). Replace them
     // with a single row of clickable asset buttons (ETH / DAI / USDC / USDT / …): pick one, then
@@ -1300,8 +1340,9 @@ void AeroMainWindow::setupSwapTab() {
     form->setHorizontalSpacing(12);
     form->setVerticalSpacing(6);
 
-    // From account — fills the (capped) field column, doesn't grow to the long label text.
-    m_swapFrom = new QComboBox(m_swapTab);
+    // From account — fills the (capped) field column, doesn't grow to the long label text. Searchable
+    // like the Send "From" so a many-account wallet is navigable.
+    m_swapFrom = new SearchableComboBox(m_swapTab);
     m_swapFrom->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     m_swapFrom->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
     m_swapFrom->setMinimumContentsLength(10);
@@ -4979,7 +5020,9 @@ void AeroMainWindow::updateAvailableLabel() {
         m_availLabel->setText(tr("%1 %2").arg(formatBalance(amt), sym));
 }
 
-QString AeroMainWindow::accountLabel(quint32 index) const {
+// Build an account row label with a caller-supplied balance string (so callers that already have the
+// account's USD value can avoid recomputing it).
+QString AeroMainWindow::accountLabelWith(quint32 index, const QString &balanceStr) const {
     // Use the address's Receive label if the user has set one; otherwise "Account #i".
     QString name = tr("Account #%1").arg(index);
     if (m_addressModel) {
@@ -4988,9 +5031,34 @@ QString AeroMainWindow::accountLabel(quint32 index) const {
             name = custom;
     }
     QString label = tr("%1  ·  %2").arg(name, shortAddr(m_wallet->address(index)));
-    if (m_accountBalances.contains(index))
-        label += QStringLiteral("  ·  %1").arg(m_accountBalances.value(index));
+    if (!balanceStr.isEmpty())
+        label += QStringLiteral("  ·  %1").arg(balanceStr);
     return label;
+}
+
+QString AeroMainWindow::accountLabel(quint32 index) const {
+    // Match the Receive USD toggle: show the account's FULL value in USD (native + tokens) when it's
+    // on, otherwise the cached native-coin balance string. Until an account's balance has actually
+    // loaded, show no balance suffix (rather than a misleading "$0.00").
+    const bool known = m_ethRawByAccount.contains(index) || m_accountBalances.contains(index);
+    if (m_recvUsd && m_nativeUsd > 0.0)
+        return accountLabelWith(index, known ? fiatStr(accountUsdValue(index)) : QString());
+    return accountLabelWith(index, m_accountBalances.value(index));
+}
+
+// Re-label the Send/Swap "From" combos from accountLabel() (respecting the USD toggle). Skips a combo
+// whose dropdown is open so it never disturbs an in-progress search.
+void AeroMainWindow::refreshAccountCombosText() {
+    auto upd = [this](QComboBox *c) {
+        if (!c || (c->view() && c->view()->isVisible()))
+            return;
+        QSignalBlocker b(c);
+        const int n = c->count();
+        for (int i = 0; i < n; ++i)
+            c->setItemText(i, accountLabel(static_cast<quint32>(i)));
+    };
+    upd(m_fromCombo);
+    upd(m_swapFrom);
 }
 
 void AeroMainWindow::rebuildAccountCombos() {
@@ -5009,45 +5077,33 @@ void AeroMainWindow::rebuildAccountCombos() {
         m_wallet->warmAddresses(n);
         return;
     }
-    // Send's "From" selector lists every address.
+    // Send's "From" selector lists every address. The full address goes into Qt::UserRole so the
+    // searchable dropdown (SearchableComboBox) can match on it even though the row shows a short form.
     if (m_fromCombo) {
         QSignalBlocker block(m_fromCombo);
         const int prev = m_fromCombo->currentIndex();
         m_fromCombo->clear();
-        for (quint32 i = 0; i < n; ++i)
+        for (quint32 i = 0; i < n; ++i) {
             m_fromCombo->addItem(tokenIcon(m_nativeSymbol), accountLabel(i));
+            m_fromCombo->setItemData(static_cast<int>(i), m_wallet->address(i)); // full addr, searchable
+        }
         m_fromCombo->setCurrentIndex(prev >= 0 && prev < static_cast<int>(n) ? prev : 0);
     }
-    // Swap's "From" selector mirrors the Send one.
+    // Swap's "From" selector mirrors the Send one (searchable, full address in UserRole).
     if (m_swapFrom) {
         QSignalBlocker block(m_swapFrom);
         const int prev = m_swapFrom->currentIndex();
         m_swapFrom->clear();
-        for (quint32 i = 0; i < n; ++i)
+        for (quint32 i = 0; i < n; ++i) {
             m_swapFrom->addItem(tokenIcon(m_nativeSymbol), accountLabel(i));
+            m_swapFrom->setItemData(static_cast<int>(i), m_wallet->address(i));
+        }
         m_swapFrom->setCurrentIndex(prev >= 0 && prev < static_cast<int>(n) ? prev : 0);
     }
     if (m_addressModel)
         m_addressModel->refresh();
-    rebuildFromSearchModel();    // keep the Send "From" search index in sync with the accounts
     rebuildHistoryCombo();
     updateHistoryOwnAddresses(); // addresses are hot here — refresh the poisoning look-alike index
-}
-
-// Repopulate the Send "From" search completer. Each entry's searchable text includes the account
-// number, its label, and the full address so the user can find an account by any of them; the
-// account index rides along in a data role so a pick selects the right combo row.
-void AeroMainWindow::rebuildFromSearchModel() {
-    if (!m_fromSearchModel || !m_wallet)
-        return;
-    m_fromSearchModel->clear();
-    const quint32 n = m_wallet->numAccounts();
-    for (quint32 i = 0; i < n; ++i) {
-        auto *it = new QStandardItem(
-            tr("Account #%1  ·  %2  ·  %3").arg(i).arg(accountLabel(i), m_wallet->address(i)));
-        it->setData(static_cast<int>(i), Qt::UserRole + 1);
-        m_fromSearchModel->appendRow(it);
-    }
 }
 
 // Feed the wallet's own receive addresses to the history model so it can flag vanity look-alike
@@ -5073,8 +5129,10 @@ void AeroMainWindow::rebuildHistoryCombo() {
     m_historyCombo->clear();
     m_historyCombo->addItem(tr("All accounts"));
     const quint32 n = m_wallet->numAccounts();
-    for (quint32 i = 0; i < n; ++i)
+    for (quint32 i = 0; i < n; ++i) {
         m_historyCombo->addItem(tokenIcon(m_nativeSymbol), accountLabel(i));
+        m_historyCombo->setItemData(static_cast<int>(i) + 1, m_wallet->address(i)); // full addr, searchable
+    }
     int want = (m_historyFilter < 0) ? 0 : (m_historyFilter + 1);
     if (want >= m_historyCombo->count())
         want = 0;
@@ -5222,27 +5280,50 @@ void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, c
     }
 }
 
-// The Balance shown in the Receive address list for one account: native coin by default, or its USD
-// value when the "Show values in USD" toggle is on (falling back to the native string until a price
-// is known).
+// Total USD value of an account: native coin + every tracked/curated token it holds. Mirrors the
+// per-account slice of recomputeHomeTotal so a single-account update shows the full value at once.
+double AeroMainWindow::accountUsdValue(quint32 index) const {
+    double total = m_ethRawByAccount.value(index, 0.0) * m_nativeUsd;
+    if (!m_tokenRawByKey.isEmpty()) {
+        QHash<QString, QString> symByAddr;
+        if (m_wallet)
+            for (const TokenInfo &t : m_wallet->tokens())
+                symByAddr.insert(t.address.toLower(), t.symbol);
+        for (const TokenInfo &t : curatedTopTokens(m_chainId))
+            symByAddr.insert(t.address.toLower(), t.symbol);
+        const QString prefix = QStringLiteral("%1|").arg(index);
+        for (auto it = m_tokenRawByKey.constBegin(); it != m_tokenRawByKey.constEnd(); ++it) {
+            if (!it.key().startsWith(prefix))
+                continue;
+            const QString addr = it.key().section(QLatin1Char('|'), 1).toLower();
+            total += it.value() * unitPriceUsd(symByAddr.value(addr));
+        }
+    }
+    return total;
+}
+
+// The Balance shown in the Receive address list for one account: native coin by default, or the
+// account's FULL value in USD (native + all tokens) when the "Show values in USD" toggle is on
+// (falling back to the native string until a native price is known).
 QString AeroMainWindow::addressListBalance(quint32 index) const {
-    if (m_recvUsd && m_nativeUsd > 0.0 && m_ethRawByAccount.contains(index))
-        return fiatStr(m_ethRawByAccount.value(index) * m_nativeUsd);
+    if (m_recvUsd && m_nativeUsd > 0.0)
+        return fiatStr(accountUsdValue(index));
     return m_accountBalances.value(index);
 }
 
-// Re-format every known account's Balance cell (e.g. when the USD toggle flips) so the address list
-// switches between native and USD without waiting for the next balance refresh.
+// Re-format the address-list Balance cells (e.g. when the USD toggle flips). In USD mode the full
+// per-account totals are computed in one efficient pass by recomputeHomeTotal; in native mode we
+// just restore the cached native strings.
 void AeroMainWindow::refreshAddressBalancesDisplay() {
     if (!m_addressModel)
         return;
-    QSet<quint32> idxs;
+    if (m_recvUsd) {
+        recomputeHomeTotal(); // one O(N + tokenKeys) pass: sets each account's full USD value + combos
+        return;
+    }
     for (auto it = m_accountBalances.constBegin(); it != m_accountBalances.constEnd(); ++it)
-        idxs.insert(it.key());
-    for (auto it = m_ethRawByAccount.constBegin(); it != m_ethRawByAccount.constEnd(); ++it)
-        idxs.insert(it.key());
-    for (quint32 i : idxs)
-        m_addressModel->setBalance(i, addressListBalance(i));
+        m_addressModel->setBalance(it.key(), it.value());
+    refreshAccountCombosText(); // back to native-coin labels in the From combos
 }
 
 void AeroMainWindow::updateReceive() {
@@ -5282,11 +5363,20 @@ void AeroMainWindow::updateReceive() {
     // the breakdown stays clean (ETH by default, other assets appear as they arrive).
     html += row(chainDefFor(m_chainId).icon, m_nativeSymbol,
                 m_ethRawByAccount.value(m_account, 0.0));
+    // Hide sub-cent priced token dust (e.g. a fraction of WETH worth $0.00) so it doesn't clutter the
+    // breakdown with a duplicate-looking $0.00 row. Tokens with no known price are still shown (we
+    // can't judge their value).
+    const double dustUsd = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
+                               .value(QStringLiteral("history/dustUsd"), 0.005).toDouble();
     for (const TokenInfo &t : m_wallet->tokens()) {
         const double bal =
             m_tokenRawByKey.value(QStringLiteral("%1|%2").arg(m_account).arg(t.address.toLower()), 0.0);
-        if (bal > 0.0)
-            html += row(QStringLiteral(":/assets/images/tokens/%1.png").arg(t.symbol), t.symbol, bal);
+        if (bal <= 0.0)
+            continue;
+        const double price = unitPriceUsd(t.symbol);
+        if (price > 0.0 && bal * price < dustUsd)
+            continue; // sub-cent dust — skip
+        html += row(QStringLiteral(":/assets/images/tokens/%1.png").arg(t.symbol), t.symbol, bal);
     }
     html += QStringLiteral("</table>");
     if (usd)
@@ -6740,9 +6830,15 @@ void AeroMainWindow::onMarketPrices(double xmrUsd, double xmrChangePct, double e
 
 void AeroMainWindow::recomputeHomeTotal() {
     if (!m_homeTotalValue) return;
+    // Accumulate the grand total AND each account's own USD value in the same single pass, so the
+    // Receive address list can show a full per-account value (native + tokens) without extra scans.
+    QHash<quint32, double> perAcct;
     double total = 0.0;
-    for (auto it = m_ethRawByAccount.constBegin(); it != m_ethRawByAccount.constEnd(); ++it)
-        total += it.value() * m_nativeUsd;
+    for (auto it = m_ethRawByAccount.constBegin(); it != m_ethRawByAccount.constEnd(); ++it) {
+        const double v = it.value() * m_nativeUsd;
+        perAcct[it.key()] += v;
+        total += v;
+    }
     // Build an address->symbol map ONCE (was an O(tokens) inner scan per balance key, i.e. O(N*T^2)
     // across a bulk refresh — the main scale freeze). Now O(N + T).
     QHash<QString, QString> symByAddr;
@@ -6752,14 +6848,46 @@ void AeroMainWindow::recomputeHomeTotal() {
     for (const TokenInfo &t : curatedTopTokens(m_chainId))
         symByAddr.insert(t.address.toLower(), t.symbol);
     for (auto it = m_tokenRawByKey.constBegin(); it != m_tokenRawByKey.constEnd(); ++it) {
+        const quint32 idx = it.key().section(QLatin1Char('|'), 0, 0).toUInt();
         const QString tokenAddr = it.key().section(QLatin1Char('|'), 1).toLower();
-        total += it.value() * unitPriceUsd(symByAddr.value(tokenAddr));
+        const double v = it.value() * unitPriceUsd(symByAddr.value(tokenAddr));
+        perAcct[idx] += v;
+        total += v;
     }
     const QString shown = m_hideBalances ? QStringLiteral("\u2022\u2022\u2022\u2022") : fiatStr(total);
     m_homeTotalValue->setText(shown);
     if (m_recvTotalLabel)
         m_recvTotalLabel->setText(m_hideBalances ? tr("Total balance: hidden")
                                                  : tr("Total balance: %1").arg(shown));
+    // Receive address list + Send/Swap "From" combos: show each account's FULL value in USD (native +
+    // tokens) when the toggle is on, reusing perAcct so there's no extra per-account token scan.
+    if (m_recvUsd && m_nativeUsd > 0.0 && !m_hideBalances) {
+        if (m_addressModel) {
+            QSet<quint32> idxs;
+            for (auto it = m_accountBalances.constBegin(); it != m_accountBalances.constEnd(); ++it)
+                idxs.insert(it.key());
+            for (auto it = perAcct.constBegin(); it != perAcct.constEnd(); ++it)
+                idxs.insert(it.key());
+            for (quint32 i : idxs)
+                m_addressModel->setBalance(i, fiatStr(perAcct.value(i, 0.0)));
+        }
+        auto updCombo = [&](QComboBox *c) {
+            if (!c || (c->view() && c->view()->isVisible()))
+                return; // don't disturb an open/searching dropdown
+            QSignalBlocker b(c);
+            const int n = c->count();
+            for (int i = 0; i < n; ++i) {
+                const quint32 idx = static_cast<quint32>(i);
+                const bool known = m_ethRawByAccount.contains(idx) || m_accountBalances.contains(idx);
+                const QString label =
+                    accountLabelWith(idx, known ? fiatStr(perAcct.value(idx, 0.0)) : QString());
+                if (c->itemText(i) != label) // only touch items that actually changed
+                    c->setItemText(i, label);
+            }
+        };
+        updCombo(m_fromCombo);
+        updCombo(m_swapFrom);
+    }
 }
 
 // Debounced home-total + used-flag recompute. Per-balance-signal handlers call this instead of

@@ -220,6 +220,8 @@ private:
     QPair<QString, QString> chosenFeeWei() const; // (maxFee, priority) wei; empty = automatic
     QPair<QString, QString> bumpedFeeWei() const; // generous fee (wei) to replace a stuck tx
     QString accountLabel(quint32 index) const;
+    QString accountLabelWith(quint32 index, const QString &balanceStr) const; // label w/ a given balance
+    void refreshAccountCombosText(); // re-label the Send/Swap "From" combos (native or USD per toggle)
     void updateReceive();
     void ensureMinAddresses(quint32 count);
     void selectAddressRow(quint32 index);
@@ -272,10 +274,9 @@ private:
     QLabel *m_recvTotalLabel = nullptr;   // Receive: combined total across accounts (like Home)
     bool m_recvUsd = true;                // Receive: show balances in USD (default on); toggled in the options menu
     QString addressListBalance(quint32 index) const; // native or USD per the Receive USD toggle
+    double accountUsdValue(quint32 index) const;      // total USD (native + all tokens) for an account
     void refreshAddressBalancesDisplay();             // re-format the address-list balance column
-    QComboBox *m_fromCombo = nullptr;     // Send: which account to send from
-    QStandardItemModel *m_fromSearchModel = nullptr; // Send: searchable account/label/address index
-    void rebuildFromSearchModel();                   // repopulate the Send "From" search completer
+    QComboBox *m_fromCombo = nullptr;     // Send: which account to send from (SearchableComboBox)
     QToolButton *m_assetButton = nullptr;    // Send: opens the searchable token picker
     QString m_sendSymbol = QStringLiteral("ETH"); // selected Send asset
     QString m_sendTokenAddr;                 // "" == ETH
