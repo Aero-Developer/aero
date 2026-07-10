@@ -3390,7 +3390,10 @@ async fn fetch_all_pages(
         );
         let mut attempt = 0u32;
         loop {
-            match provider.http_get_json(&url).await {
+            // Isolated circuit per request: this is the bulk per-address explorer fan-out that would
+            // otherwise rate-limit against a single Tor exit (router/CoW/price APIs stay on the sticky
+            // circuit via plain http_get_json).
+            match provider.http_get_json_isolated(&url).await {
                 Ok(v) => {
                     if let Some(rows) = v.get("result").and_then(|r| r.as_array()) {
                         let n = rows.len();

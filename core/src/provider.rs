@@ -382,7 +382,7 @@ impl RpcProvider {
         let _gate = gate().await; // priority-aware Tor concurrency gate
         let _probe = ReqProbe::begin(format!("GET  bytes {}", host_of(url)), w0.elapsed());
         let resp = self
-            .iso_client()
+            .http
             .get(url)
             .send()
             .await
@@ -395,9 +395,34 @@ impl RpcProvider {
         Ok(bytes.to_vec())
     }
 
+    /// GET+parse JSON over the STABLE (sticky) Tor circuit. Used for APIs that are Tor-hostile and/or
+    /// stateful — DEX router quotes (CoW/Kyber/Odos/ParaSwap/OpenOcean), the CoW order book, and price
+    /// feeds. Those often block or rate-limit random Tor exits behind Cloudflare, so rotating circuits
+    /// (see http_get_json_isolated) made them fail intermittently; a single consistent circuit is far
+    /// more reliable, and these are only a handful of requests (not the per-address history fan-out).
     pub async fn http_get_json(&self, url: &str) -> Result<Value> {
         let w0 = Instant::now();
         let _gate = gate().await; // priority-aware Tor concurrency gate
+        let _probe = ReqProbe::begin(format!("GET  {}", host_of(url)), w0.elapsed());
+        let resp = self
+            .http
+            .get(url)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| CoreError::rpc(format!("http get failed: {e}")))?;
+        let status = resp.status();
+        resp.json()
+            .await
+            .map_err(|e| CoreError::rpc(format!("bad json ({status}): {e}")))
+    }
+
+    /// GET+parse JSON spread across ISOLATED Tor circuits (round-robin distinct exits). ONLY for the
+    /// bulk, per-address block-explorer history fan-out, where hundreds of requests to one endpoint
+    /// would otherwise share and rate-limit against a single exit IP. Do NOT use for router/price APIs.
+    pub async fn http_get_json_isolated(&self, url: &str) -> Result<Value> {
+        let w0 = Instant::now();
+        let _gate = gate().await;
         let _probe = ReqProbe::begin(format!("GET  {}", host_of(url)), w0.elapsed());
         let resp = self
             .iso_client()
