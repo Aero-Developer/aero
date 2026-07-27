@@ -12,6 +12,7 @@
 //! talks to a local Helios light client that cryptographically verifies an untrusted upstream RPC;
 //! without it, requests still go over Tor to user-configured endpoints.
 
+pub mod across;
 pub mod chains;
 pub mod erc20;
 pub mod error;
@@ -20,6 +21,7 @@ pub mod hardware;
 pub mod keys;
 pub mod keystore;
 pub mod provider;
+pub mod thp;
 pub mod wallet;
 
 #[cfg(feature = "helios")]

@@ -83,7 +83,12 @@ void TorManager::restart() {
 
 void TorManager::launchBundled() {
     const QString base = QCoreApplication::applicationDirPath();
+    // Bundled Tor binary: tor/tor.exe on Windows, tor/tor on macOS/Linux.
+#ifdef Q_OS_WIN
     const QString torExe = QDir(base).filePath(QStringLiteral("tor/tor.exe"));
+#else
+    const QString torExe = QDir(base).filePath(QStringLiteral("tor/tor"));
+#endif
     if (!QFileInfo::exists(torExe)) {
         emit failed(tr("Bundled Tor not found at %1").arg(QDir::toNativeSeparators(torExe)));
         return;

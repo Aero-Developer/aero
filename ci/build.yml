@@ -67,6 +67,30 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release -j
 
+      # --- macOS (Apple Silicon) packaging: Aero.app + Qt frameworks + bundled Tor, ad-hoc signed,
+      # zipped. macos-latest runners are arm64, so this produces the Apple-Silicon build. ---
+      - name: Package macOS app (Apple Silicon)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          case "$GITHUB_REF" in refs/tags/v*) : ;; *) VER="${VER}-dev" ;; esac
+          chmod +x ci/package-macos.sh
+          ci/package-macos.sh "$VER"
+      - name: Upload macOS zip
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: aero-macos-arm64
+          path: dist/Aero-*-macOS-arm64.zip
+      - name: Attach macOS zip to release
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/Aero-*-macOS-arm64.zip
+            dist/SHA256SUMS-*-macos.txt
+
       - name: Collect binaries
         shell: bash
         run: |

@@ -62,6 +62,17 @@ aes-gcm = "0.10"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 
+# --- Trezor-Host Protocol (THP) for 2025+ Trezors: Noise_XX_25519_AESGCM_SHA256 + CPace pairing ---
+# (see thp.rs / thp_client.rs)
+sha2 = "0.10"
+hmac = "0.12"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+# Elligator2 map on Curve25519, needed for the CodeEntry (CPace) pairing method. Only an alpha is
+# published (Tor project's obfs4 map); pinned explicitly and used only for the pairing step.
+curve25519-elligator2 = "=0.1.0-alpha.2"
+# Raw USB transport for THP (independent of trezor-client's Codec-v1 transport).
+rusb = "0.9"
+
 # --- HTTP client with SOCKS (Tor) support, shared with alloy transport ---
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",

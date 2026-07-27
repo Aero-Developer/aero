@@ -1338,6 +1338,41 @@ pub extern "C" fn aero_wallet_router_swap(
     block_json(w, |w| RUNTIME.block_on(w.router_swap(from_index, &to, &value, &data)))
 }
 
+/// Across bridge fee quote for sending `amount_wei` of `symbol` from the connected chain to
+/// `dest_chain_id`. Returns normalized JSON (output amount, fees, SpokePool, deposit params).
+/// Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_across_quote(
+    w: *mut Wallet,
+    from_index: u32,
+    symbol: *const c_char,
+    dest_chain_id: u64,
+    amount_wei: *const c_char,
+) -> *mut c_char {
+    let (Some(symbol), Some(amount)) = (from_cstr(symbol), from_cstr(amount_wei)) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| RUNTIME.block_on(w.across_quote(from_index, &symbol, dest_chain_id, &amount)))
+}
+
+/// Build the Across SpokePool `depositV3` transaction (fresh quote). Returns JSON
+/// `{to, spender, data, value, native, output_amount, ...}`. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_across_build(
+    w: *mut Wallet,
+    from_index: u32,
+    symbol: *const c_char,
+    dest_chain_id: u64,
+    amount_wei: *const c_char,
+) -> *mut c_char {
+    let (Some(symbol), Some(amount)) = (from_cstr(symbol), from_cstr(amount_wei)) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| RUNTIME.block_on(w.across_build(from_index, &symbol, dest_chain_id, &amount)))
+}
+
 /// ERC20 transfer history as a JSON array of `HistoryItem`. `from_block` is a hex block number
 /// or "earliest"/"latest". Caller frees the string.
 #[no_mangle]

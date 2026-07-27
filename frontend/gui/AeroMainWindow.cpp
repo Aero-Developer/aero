@@ -2913,6 +2913,426 @@ static const QList<SpenderDef> &curatedSpenders() {
     return defs;
 }
 
+// --- Across cross-chain bridge -------------------------------------------------------------------
+// Chains + symbols mirror core/src/across.rs. Kept minimal here (names come from chainDefFor).
+static QList<quint64> acrossChains() { return {1, 10, 8453, 42161, 137}; }
+static bool acrossSupportedChain(quint64 id) { return acrossChains().contains(id); }
+static quint8 acrossDecimals(const QString &sym) {
+    const QString s = sym.toUpper();
+    if (s == QLatin1String("USDC") || s == QLatin1String("USDT")) return 6;
+    if (s == QLatin1String("WBTC")) return 8;
+    return 18; // ETH / DAI
+}
+// Symbols bridgeable on a chain (WBTC has no Across route on Base).
+static QStringList acrossSymbols(quint64 chainId) {
+    QStringList s = {QStringLiteral("ETH"), QStringLiteral("USDC"), QStringLiteral("USDT"),
+                     QStringLiteral("DAI")};
+    if (chainId != 8453)
+        s << QStringLiteral("WBTC");
+    return s;
+}
+
+void AeroMainWindow::showBridgeDialog() {
+    if (!m_wallet)
+        return;
+    if (m_wallet->isWatchOnly()) {
+        QMessageBox::information(this, tr("Bridge"),
+                                 tr("This is a watch-only wallet; it can't send bridge transactions."));
+        return;
+    }
+    const quint64 origin = m_chainId;
+    if (!acrossSupportedChain(origin)) {
+        QMessageBox::information(
+            this, tr("Bridge (Across)"),
+            tr("Across bridging isn't available on %1. Switch to Ethereum, Arbitrum, Optimism, Base "
+               "or Polygon first.")
+                .arg(chainDefFor(m_chainId).name));
+        return;
+    }
+
+    // Per-dialog state shared by the async signal handlers (freed with the dialog).
+    struct BridgeState {
+        quint64 dest = 0;
+        QString symbol, amountWei;
+        QString to, data, value, spender, inputToken, outputAmount;
+        bool native = false;
+        bool bridging = false;      // a build/approve/send is in flight
+        bool awaitingApprove = false;
+        int approvePolls = 0;
+    };
+    auto *st = new BridgeState;
+
+    auto *dlg = new QDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowTitle(tr("Bridge to another chain — Across"));
+    dlg->resize(500, 0);
+    connect(dlg, &QObject::destroyed, [st]() { delete st; });
+
+    auto *v = new QVBoxLayout(dlg);
+    v->setSpacing(10);
+    auto *info = new QLabel(
+        tr("Move assets to another chain via Across Protocol. Funds arrive at the SAME address on "
+           "the destination chain, usually within a minute."),
+        dlg);
+    info->setWordWrap(true);
+    info->setStyleSheet(QStringLiteral("color:#8a8a8a;"));
+    v->addWidget(info);
+
+    auto *form = new QFormLayout();
+    form->setHorizontalSpacing(12);
+    form->setVerticalSpacing(8);
+    form->addRow(tr("From"), new QLabel(chainDefFor(origin).name, dlg));
+
+    auto *assetCombo = new QComboBox(dlg);
+    for (const QString &s : acrossSymbols(origin))
+        assetCombo->addItem(s);
+    form->addRow(tr("Asset"), assetCombo);
+
+    auto *destCombo = new QComboBox(dlg);
+    form->addRow(tr("To"), destCombo);
+
+    auto *amountEdit = new QLineEdit(dlg);
+    amountEdit->setPlaceholderText(tr("Amount to bridge"));
+    auto *amountRow = new QHBoxLayout();
+    amountRow->addWidget(amountEdit, 1);
+    auto *maxBtn = new QPushButton(tr("Max"), dlg);
+    amountRow->addWidget(maxBtn);
+    auto *amountWrap = new QWidget(dlg);
+    amountWrap->setLayout(amountRow);
+    amountRow->setContentsMargins(0, 0, 0, 0);
+    form->addRow(tr("Amount"), amountWrap);
+    v->addLayout(form);
+
+    auto *status = new QLabel(dlg);
+    status->setWordWrap(true);
+    status->setTextFormat(Qt::RichText);
+    status->setOpenExternalLinks(true);
+    v->addWidget(status);
+
+    auto *btnRow = new QHBoxLayout();
+    auto *quoteBtn = new QPushButton(tr("Get quote"), dlg);
+    auto *bridgeBtn = new QPushButton(tr("Bridge"), dlg);
+    bridgeBtn->setEnabled(false);
+    btnRow->addWidget(quoteBtn);
+    btnRow->addWidget(bridgeBtn);
+    btnRow->addStretch(1);
+    auto *closeBtn = new QPushButton(tr("Close"), dlg);
+    btnRow->addWidget(closeBtn);
+    v->addLayout(btnRow);
+    connect(closeBtn, &QPushButton::clicked, dlg, &QDialog::accept);
+
+    // Populate the destination list for the selected asset (Across chains that carry it, minus origin).
+    auto rebuildDest = [=]() {
+        const QString sym = assetCombo->currentText();
+        destCombo->clear();
+        for (quint64 id : acrossChains()) {
+            if (id == origin)
+                continue;
+            if (id == 8453 && sym == QLatin1String("WBTC"))
+                continue; // no WBTC route on Base
+            destCombo->addItem(chainDefFor(id).name, static_cast<qulonglong>(id));
+        }
+        bridgeBtn->setEnabled(false);
+        status->clear();
+    };
+    connect(assetCombo, &QComboBox::currentIndexChanged, dlg, [=](int) { rebuildDest(); });
+    connect(destCombo, &QComboBox::currentIndexChanged, dlg, [=](int) {
+        bridgeBtn->setEnabled(false);
+        status->clear();
+    });
+    connect(amountEdit, &QLineEdit::textChanged, dlg, [=](const QString &) {
+        bridgeBtn->setEnabled(false); // a new amount needs a fresh quote
+    });
+    rebuildDest();
+
+    // Max: native coin uses the account's balance minus a gas cushion; tokens use the tracked balance.
+    connect(maxBtn, &QPushButton::clicked, dlg, [=]() {
+        const QString sym = assetCombo->currentText();
+        double bal = 0.0;
+        if (sym.compare(m_nativeSymbol, Qt::CaseInsensitive) == 0) {
+            bal = qMax(0.0, m_ethRawByAccount.value(m_account, 0.0) - 0.002); // reserve gas
+        } else {
+            // Best-effort from tracked balances (matched by symbol on the active account).
+            for (const TokenInfo &t : m_wallet->tokens()) {
+                if (t.symbol.compare(sym, Qt::CaseInsensitive) != 0)
+                    continue;
+                const QString key = QStringLiteral("%1|%2").arg(m_account).arg(t.address.toLower());
+                bal = m_tokenRawByKey.value(key, 0.0);
+                break;
+            }
+        }
+        if (bal > 0.0)
+            amountEdit->setText(trimZeros(QString::number(bal, 'f', 8)));
+    });
+
+    auto amountWei = [=]() -> QString {
+        const QString sym = assetCombo->currentText();
+        return Wallet::parseUnits(amountEdit->text().trimmed(), acrossDecimals(sym));
+    };
+    auto geq = [](const QString &a, const QString &b) {
+        const QString x = a.isEmpty() ? QStringLiteral("0") : a;
+        const QString y = b.isEmpty() ? QStringLiteral("0") : b;
+        if (x.length() != y.length())
+            return x.length() > y.length();
+        return x >= y;
+    };
+
+    // --- Quote ---
+    connect(quoteBtn, &QPushButton::clicked, dlg, [=]() {
+        const QString sym = assetCombo->currentText();
+        if (destCombo->currentIndex() < 0) return;
+        st->dest = destCombo->currentData().toULongLong();
+        st->symbol = sym;
+        const QString wei = amountWei();
+        if (wei.isEmpty() || wei == QLatin1String("0")) {
+            status->setText(tr("Enter an amount to bridge."));
+            return;
+        }
+        status->setText(tr("Fetching Across quote…"));
+        quoteBtn->setEnabled(false);
+        m_wallet->acrossQuote(m_account, sym, st->dest, wei);
+    });
+
+    connect(m_wallet, &Wallet::acrossQuoteReady, dlg, [=](const QString &json, const QString &err) {
+        quoteBtn->setEnabled(true);
+        if (!err.isEmpty()) {
+            status->setText(tr("Quote failed: %1").arg(err.toHtmlEscaped()));
+            bridgeBtn->setEnabled(false);
+            return;
+        }
+        const QJsonObject o = QJsonDocument::fromJson(json.toUtf8()).object();
+        const QString sym = o.value(QStringLiteral("symbol")).toString();
+        const quint8 dec = static_cast<quint8>(o.value(QStringLiteral("decimals")).toInt(18));
+        const double outAmt = o.value(QStringLiteral("output_amount")).toString().toDouble()
+                              / std::pow(10.0, dec);
+        const double inAmt = o.value(QStringLiteral("input_amount")).toString().toDouble()
+                             / std::pow(10.0, dec);
+        const double fee = inAmt - outAmt;
+        const int etaSec = o.value(QStringLiteral("est_fill_time_sec")).toInt(0);
+        const bool tooLow = o.value(QStringLiteral("is_amount_too_low")).toBool(false);
+        const double minDep = o.value(QStringLiteral("min_deposit")).toString().toDouble()
+                              / std::pow(10.0, dec);
+        if (tooLow) {
+            status->setText(tr("Amount is below the Across minimum (~%1 %2). Increase it.")
+                                .arg(trimZeros(QString::number(minDep, 'f', 8)), sym));
+            bridgeBtn->setEnabled(false);
+            return;
+        }
+        // Guard the route capacity: depositing above maxDeposit succeeds on-chain but no relayer will
+        // fill it, so the funds would sit until the deadline (then refund on the origin) — a scary
+        // delay. Block it and tell the user the cap.
+        const double maxDep = o.value(QStringLiteral("max_deposit")).toString().toDouble()
+                              / std::pow(10.0, dec);
+        if (maxDep > 0.0 && inAmt > maxDep) {
+            status->setText(tr("Amount exceeds the Across route capacity (~%1 %2). Lower it, or the "
+                               "bridge could be stuck until it's refunded.")
+                                .arg(trimZeros(QString::number(maxDep, 'f', 8)), sym));
+            bridgeBtn->setEnabled(false);
+            return;
+        }
+        const quint64 dst = static_cast<quint64>(o.value(QStringLiteral("dest_chain")).toDouble());
+        status->setText(tr("<b>Send:</b> %1 %2<br><b>Receive on %3:</b> ~%4 %2<br>"
+                           "<b>Bridge fee:</b> ~%5 %2<br><b>ETA:</b> ~%6s")
+                            .arg(trimZeros(QString::number(inAmt, 'f', 8)), sym,
+                                 chainDefFor(dst).name, trimZeros(QString::number(outAmt, 'f', 8)),
+                                 trimZeros(QString::number(fee, 'f', 8)))
+                            .arg(etaSec));
+        bridgeBtn->setEnabled(true);
+    });
+
+    // --- Bridge: build fresh calldata, then confirm + approve/send ---
+    auto sendBuilt = [=]() {
+        status->setText(tr("Sending bridge deposit over Tor…"));
+        m_wallet->bridgeSend(m_account, st->to, st->value, st->data);
+    };
+    connect(bridgeBtn, &QPushButton::clicked, dlg, [=]() {
+        if (st->bridging) return;
+        if (destCombo->currentIndex() < 0) return;
+        const QString wei = amountWei();
+        if (wei.isEmpty() || wei == QLatin1String("0")) return;
+
+        // Balance guard (mirrors the Send tab): don't broadcast a deposit that would revert. The
+        // network fee is always paid in the native coin; a bridge deposit costs ~150k gas.
+        const QString gsym = assetCombo->currentText();
+        const bool isNative = gsym.compare(m_nativeSymbol, Qt::CaseInsensitive) == 0;
+        const double amt = wei.toDouble() / std::pow(10.0, acrossDecimals(gsym));
+        const double nativeBal = m_ethRawByAccount.value(m_account, 0.0);
+        const double maxFeePerGas =
+            m_feeBaseWei > 0 ? m_feeBaseWei * 3.0 + qMax(m_feeTipWei, 1e9) : 30e9;
+        const double feeNative = maxFeePerGas * 150000.0 / 1e18;
+        if (isNative) {
+            if (amt + feeNative > nativeBal + 1e-15) {
+                status->setText(tr("The amount plus the ~%1 %2 network fee exceeds your balance. "
+                                   "Lower the amount (Max already reserves gas).")
+                                    .arg(trimZeros(QString::number(feeNative, 'f', 8)), m_nativeSymbol));
+                return;
+            }
+        } else {
+            if (nativeBal < feeNative) {
+                status->setText(tr("Bridging a token still costs a ~%1 %2 network fee paid in %2, but "
+                                   "this account only has %3 %2. Fund it with a little %2 first.")
+                                    .arg(trimZeros(QString::number(feeNative, 'f', 8)), m_nativeSymbol,
+                                         trimZeros(QString::number(nativeBal, 'f', 8))));
+                return;
+            }
+            // If the token is tracked, make sure the balance covers the amount.
+            double tokBal = -1.0;
+            for (const TokenInfo &t : m_wallet->tokens()) {
+                if (t.symbol.compare(gsym, Qt::CaseInsensitive) != 0)
+                    continue;
+                tokBal = m_tokenRawByKey.value(
+                    QStringLiteral("%1|%2").arg(m_account).arg(t.address.toLower()), 0.0);
+                break;
+            }
+            if (tokBal >= 0.0 && amt > tokBal + 1e-15) {
+                status->setText(tr("Amount exceeds your %1 balance of %2.")
+                                    .arg(gsym, trimZeros(QString::number(tokBal, 'f', 8))));
+                return;
+            }
+        }
+
+        // Re-read the current selection so the built calldata + confirm always match what's on screen
+        // (a fresh quote is fetched inside acrossBuild for exactly this dest/asset/amount).
+        st->dest = destCombo->currentData().toULongLong();
+        st->symbol = assetCombo->currentText();
+        st->amountWei = wei; // freeze the amount for the whole build/approve/send flow
+        st->bridging = true;
+        st->awaitingApprove = false;
+        st->approvePolls = 0;
+        bridgeBtn->setEnabled(false);
+        status->setText(tr("Preparing bridge transaction…"));
+        m_wallet->acrossBuild(m_account, st->symbol, st->dest, wei);
+    });
+
+    connect(m_wallet, &Wallet::acrossBuilt, dlg, [=](const QString &json, const QString &err) {
+        if (!st->bridging) return;
+        if (!err.isEmpty() || json.isEmpty()) {
+            st->bridging = false;
+            bridgeBtn->setEnabled(true);
+            status->setText(tr("Couldn't build the bridge tx: %1")
+                                .arg(err.isEmpty() ? tr("no route") : err.toHtmlEscaped()));
+            return;
+        }
+        const QJsonObject o = QJsonDocument::fromJson(json.toUtf8()).object();
+        st->to = o.value(QStringLiteral("to")).toString();
+        st->data = o.value(QStringLiteral("data")).toString();
+        st->value = o.value(QStringLiteral("value")).toString();
+        st->spender = o.value(QStringLiteral("spender")).toString();
+        st->inputToken = o.value(QStringLiteral("input_token")).toString();
+        st->native = o.value(QStringLiteral("native")).toBool(false);
+        // Confirm (amount/symbol were frozen at click time).
+        const QString sym = st->symbol;
+        const double dec = acrossDecimals(sym);
+        const double amt = st->amountWei.toDouble() / std::pow(10.0, dec);
+        if (QMessageBox::question(
+                dlg, tr("Confirm bridge"),
+                tr("Bridge %1 %2 from %3 to %4?\n\nFunds arrive at your address on %4 via Across.")
+                    .arg(trimZeros(QString::number(amt, 'f', 8)), sym, chainDefFor(origin).name,
+                         chainDefFor(st->dest).name)) != QMessageBox::Yes) {
+            st->bridging = false;
+            bridgeBtn->setEnabled(true);
+            status->setText(tr("Bridge cancelled."));
+            return;
+        }
+        if (st->native) {
+            sendBuilt(); // native deposit sends value directly, no approval
+        } else {
+            status->setText(tr("Checking token approval…"));
+            m_wallet->bridgeAllowance(m_account, st->inputToken, st->spender);
+        }
+    });
+
+    connect(m_wallet, &Wallet::bridgeAllowanceReady, dlg,
+            [=](const QString &token, const QString &spender, const QString &wei, const QString &err) {
+                if (!st->bridging || st->native)
+                    return;
+                if (token.compare(st->inputToken, Qt::CaseInsensitive) != 0 ||
+                    spender.compare(st->spender, Qt::CaseInsensitive) != 0)
+                    return;
+                if (!err.isEmpty()) {
+                    st->bridging = false;
+                    bridgeBtn->setEnabled(true);
+                    status->setText(tr("Approval check failed: %1").arg(err.toHtmlEscaped()));
+                    return;
+                }
+                const bool sufficient = geq(wei, st->amountWei);
+                if (st->awaitingApprove) {
+                    if (sufficient) {
+                        st->awaitingApprove = false;
+                        sendBuilt();
+                    } else if (++st->approvePolls <= 15) {
+                        status->setText(tr("Waiting for the approval to confirm on-chain… (%1)")
+                                            .arg(st->approvePolls));
+                        QTimer::singleShot(8000, dlg, [=]() {
+                            if (st->bridging && st->awaitingApprove)
+                                m_wallet->bridgeAllowance(m_account, st->inputToken, st->spender);
+                        });
+                    } else {
+                        st->bridging = false;
+                        st->awaitingApprove = false;
+                        bridgeBtn->setEnabled(true);
+                        status->setText(tr("Approval hasn't confirmed yet. Press Bridge again once it "
+                                           "does."));
+                    }
+                    return;
+                }
+                if (sufficient) {
+                    sendBuilt();
+                } else {
+                    status->setText(tr("Approving %1 for the bridge…").arg(st->symbol));
+                    m_wallet->bridgeApprove(m_account, st->inputToken, st->spender, st->amountWei);
+                }
+            });
+
+    connect(m_wallet, &Wallet::bridgeApproved, dlg, [=](const QString &txHash, const QString &err) {
+        if (!st->bridging || st->native)
+            return;
+        if (!err.isEmpty() || txHash.isEmpty()) {
+            st->bridging = false;
+            bridgeBtn->setEnabled(true);
+            status->setText(tr("Approval failed: %1").arg(err.toHtmlEscaped()));
+            return;
+        }
+        st->awaitingApprove = true;
+        st->approvePolls = 0;
+        status->setText(tr("Approval sent (%1). Waiting for it to confirm…").arg(shortAddr(txHash)));
+        QTimer::singleShot(8000, dlg, [=]() {
+            if (st->bridging && st->awaitingApprove)
+                m_wallet->bridgeAllowance(m_account, st->inputToken, st->spender);
+        });
+    });
+
+    connect(m_wallet, &Wallet::bridgeSent, dlg, [=](const QString &txHash, const QString &err) {
+        if (!st->bridging)
+            return;
+        st->bridging = false;
+        if (!err.isEmpty() || txHash.isEmpty()) {
+            bridgeBtn->setEnabled(true);
+            status->setText(tr("Bridge failed: %1").arg(err.toHtmlEscaped()));
+            return;
+        }
+        const QString humanAmt = QString::number(
+            st->amountWei.toDouble() / std::pow(10.0, acrossDecimals(st->symbol)), 'f', 8);
+        // Show it immediately as an outgoing pending row (bridge = send to the SpokePool); the receipt
+        // watch reconciles it and drops the balance optimistically.
+        m_historyModel->addLocalSend(txHash, st->to, trimZeros(humanAmt), st->symbol,
+                                     st->native ? QString() : st->inputToken);
+        startReceiptWatch(txHash);
+        applyOptimisticSend(trimZeros(humanAmt), st->native ? QString() : st->inputToken);
+        const QString url = explorerTxUrl(txHash);
+        status->setText(tr("\u2714 Bridge submitted to %1. Funds arrive at your address there "
+                           "shortly.&nbsp;&nbsp;<a href=\"%2\">View transaction</a>")
+                            .arg(chainDefFor(st->dest).name, url));
+        notify(tr("Bridge submitted"),
+               tr("%1 %2 to %3").arg(trimZeros(QString::number(
+                                         st->amountWei.toDouble()
+                                         / std::pow(10.0, acrossDecimals(st->symbol)), 'f', 8)),
+                                     st->symbol, chainDefFor(st->dest).name));
+    });
+
+    dlg->show();
+}
+
 void AeroMainWindow::showRevokeApprovals() {
     if (!m_wallet)
         return;
@@ -3476,6 +3896,8 @@ void AeroMainWindow::setupMenu() {
             &AeroMainWindow::onSendMany);
     connect(ui.menuTools->addAction(tr("Revoke Token Approvals…")), &QAction::triggered, this,
             &AeroMainWindow::showRevokeApprovals);
+    connect(ui.menuTools->addAction(tr("Bridge to another chain (Across)…")), &QAction::triggered,
+            this, &AeroMainWindow::showBridgeDialog);
     ui.menuTools->addSeparator();
     m_speedUpAction = ui.menuTools->addAction(tr("Speed Up Last Transaction"));
     m_cancelTxAction = ui.menuTools->addAction(tr("Cancel Last Transaction"));
@@ -3919,14 +4341,16 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     rebuildAccountCombos();
     populateSendCurrencies();
     // Reopen at the account last selected for THIS wallet (persisted per-wallet), not always #0.
-    quint32 savedAcct = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
-                            .value(selectedAccountKey(m_wallet->walletPath()), 0).toUInt();
+    QSettings accSettings(QStringLiteral("Aero"), QStringLiteral("Aero"));
+    const QString acctKey = selectedAccountKey(m_wallet->walletPath());
+    const bool hasSavedSelection = accSettings.contains(acctKey);
+    quint32 savedAcct = accSettings.value(acctKey, 0).toUInt();
     if (savedAcct >= m_wallet->numAccounts())
         savedAcct = 0;
-    // If that account has no funds but others do, open on the lowest funded account instead — a good
-    // wallet shows your balance + history on open, not an empty account #0. (History then reflects a
-    // funded account rather than looking empty.)
-    if (!m_fundedAccounts.isEmpty() && !m_fundedAccounts.contains(savedAcct)) {
+    // ONLY on the very first open of this wallet (no selection saved yet) do we prefer the lowest
+    // funded account, so a fresh wallet doesn't open on an empty #0. Once the user has selected an
+    // address we ALWAYS restore that exact selection — never override it with a funded/biggest one.
+    if (!hasSavedSelection && !m_fundedAccounts.isEmpty() && !m_fundedAccounts.contains(savedAcct)) {
         quint32 lowest = savedAcct;
         bool found = false;
         for (quint32 i : m_fundedAccounts)
@@ -4375,8 +4799,12 @@ void AeroMainWindow::onFundedScanned(const QList<quint32> &indices) {
         m_addressModel->setUsed(i, true);
     // (The discovered accounts + funded set were already persisted synchronously above.)
     applyFundedFilter();
-    if (m_addressModel->rowCount() > 0)
-        selectAddressRow(m_addressModel->accountAt(0)); // first visible address
+    // Keep the user's current selection if it's still a visible row after the scan; only fall back to
+    // the first visible address when the selected account got filtered out.
+    if (m_addressModel->rowCount() > 0) {
+        const bool stillVisible = m_addressModel->rowForAccount(m_account) >= 0;
+        selectAddressRow(stillVisible ? m_account : m_addressModel->accountAt(0));
+    }
     // Restore the real connected status (Tor/direct). Only when actually connected — never overwrite
     // a "Connecting…"/"Offline" state with a bogus "Connected".
     if (m_connMode > 0)
@@ -6276,6 +6704,7 @@ void AeroMainWindow::onBroadcastRaw() {
     // onTransactionCommitted skips the optimistic "Payment sent"/balance-drop path entirely (never
     // reusing a previous send's committed details).
     m_committedIsReplacement = true;
+    beginSendProgress(tr("Broadcasting the raw transaction over Tor…"));
     m_wallet->broadcastRaw(raw); // result surfaces via onTransactionCommitted
 }
 
@@ -6552,6 +6981,7 @@ void AeroMainWindow::onSpeedUpLast() {
     tx.fee.maxFee = fee.first;
     tx.fee.maxPriorityFee = fee.second;
     m_committedIsReplacement = true; // replaces an already-shown tx — don't re-drop the balance
+    beginSendProgress(tr("Rebroadcasting at a higher fee over Tor…"));
     m_wallet->commitTransaction(tx); // result surfaces via onTransactionCommitted
 }
 
@@ -6565,6 +6995,7 @@ void AeroMainWindow::onCancelLast() {
         return;
     const QPair<QString, QString> fee = bumpedFeeWei();
     m_committedIsReplacement = true; // a 0-value replacement — don't drop the balance or add a row
+    beginSendProgress(tr("Broadcasting the cancel transaction over Tor…"));
     m_wallet->cancelTransaction(m_lastSent.fromIndex, m_lastSent.nonce, fee.first, fee.second);
 }
 
@@ -7123,6 +7554,15 @@ QIcon AeroMainWindow::tokenIcon(const QString &symbol) const {
 
 void AeroMainWindow::onSendClicked() {
     if (!m_wallet) return;
+    // Guard against a double-send: while a previous transaction is still being broadcast (which can
+    // take a while over Tor), refuse a new one so an impatient re-click can't send twice.
+    if (m_sendInFlight) {
+        QMessageBox::information(
+            this, tr("Send in progress"),
+            tr("A transaction is already being broadcast. Please wait for it to finish before "
+               "sending again."));
+        return;
+    }
     QString to = sendUi.lineAddress->text().trimmed();
     // ENS: if the recipient looks like a name (has a dot, not a 0x address), resolve it to an address
     // first (mainnet only). We show the resolved 0x address in the confirm dialog so it's verifiable.
@@ -7394,6 +7834,8 @@ void AeroMainWindow::onTransactionCreated(const PendingEthTx &tx) {
     m_committedTo = tx.to.trimmed();
     m_committedFrom = tx.fromIndex; // the account it's really sent from (the combo may change meanwhile)
     m_committedIsReplacement = false;
+    beginSendProgress(tr("Broadcasting your transaction over Tor…\nThis can take a moment — please "
+                         "don't send again."));
     m_wallet->commitTransaction(tx);
 }
 
@@ -7455,7 +7897,37 @@ void AeroMainWindow::onTxReceiptReady(const QString &txHash, bool mined, bool su
     m_lastSendFrom = 0xFFFFFFFFu;
 }
 
+// Show a modal, non-cancellable "Broadcasting…" spinner and mark a send as in-flight. This both
+// gives the user feedback while the (possibly slow, Tor-routed) broadcast runs AND blocks a second
+// Send from being fired — the double-send bug was caused by re-clicking during this silent window.
+void AeroMainWindow::beginSendProgress(const QString &text) {
+    m_sendInFlight = true;
+    if (sendUi.btnSend)
+        sendUi.btnSend->setEnabled(false);
+    if (!m_sendProgress) {
+        m_sendProgress = new QProgressDialog(text, QString(), 0, 0, this); // no cancel button
+        m_sendProgress->setWindowTitle(tr("Sending"));
+        m_sendProgress->setWindowModality(Qt::ApplicationModal);
+        m_sendProgress->setMinimumDuration(0);
+        m_sendProgress->setAutoClose(false);
+        m_sendProgress->setAutoReset(false);
+    }
+    m_sendProgress->setLabelText(text);
+    m_sendProgress->show();
+}
+
+void AeroMainWindow::endSendProgress() {
+    m_sendInFlight = false;
+    if (sendUi.btnSend)
+        sendUi.btnSend->setEnabled(true);
+    if (m_sendProgress) {
+        m_sendProgress->hide();
+        m_sendProgress->reset();
+    }
+}
+
 void AeroMainWindow::onTransactionCommitted(bool ok, const QString &txHash, const QString &error) {
+    endSendProgress(); // broadcast resolved — clear the in-flight guard + dismiss the spinner
     if (m_deviceDialog)
         m_deviceDialog->hide(); // dismiss the "confirm on device" prompt once the device responded
     if (ok) {

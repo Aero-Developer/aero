@@ -356,6 +356,23 @@ public:
     void routerSwap(quint32 fromIndex, const QString &to, const QString &valueWei,
                     const QString &dataHex);
 
+    // --- Across cross-chain bridge ---
+    // Fee quote for bridging `symbol` from the connected chain to `destChainId`; emits
+    // acrossQuoteReady(json,err).
+    void acrossQuote(quint32 fromIndex, const QString &symbol, quint64 destChainId,
+                     const QString &amountWei);
+    // Build the SpokePool depositV3 tx (fresh quote); emits acrossBuilt(json,err) with
+    // {to,spender,data,value,native,output_amount,...}.
+    void acrossBuild(quint32 fromIndex, const QString &symbol, quint64 destChainId,
+                     const QString &amountWei);
+    // Bridge send legs (reuse the generic router FFI but emit bridge-specific signals so they never
+    // collide with the Swap tab's state): allowance -> approve -> send the depositV3 calldata.
+    void bridgeAllowance(quint32 fromIndex, const QString &token, const QString &spender);
+    void bridgeApprove(quint32 fromIndex, const QString &token, const QString &spender,
+                       const QString &amountWei);
+    void bridgeSend(quint32 fromIndex, const QString &to, const QString &valueWei,
+                    const QString &dataHex);
+
     // The CoW BUY_ETH sentinel (used as buyToken to receive native ETH).
     static QString buyEthSentinel() { return QStringLiteral("0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"); }
     // The CoW Vault Relayer (approval target) — same on every supported chain.
@@ -435,6 +452,13 @@ signals:
                               const QString &allowanceWei, const QString &error);
     void routerApproved(const QString &txHash, const QString &error);
     void routerSwapSent(const QString &txHash, const QString &error);
+    // Across bridge signals (kept separate from the Swap tab's router signals).
+    void acrossQuoteReady(const QString &json, const QString &error);
+    void acrossBuilt(const QString &json, const QString &error);
+    void bridgeAllowanceReady(const QString &token, const QString &spender, const QString &weiOrErr,
+                              const QString &error);
+    void bridgeApproved(const QString &txHash, const QString &error);
+    void bridgeSent(const QString &txHash, const QString &error);
 
 private:
     QString takeLastError() const;

@@ -533,6 +533,26 @@ char *aero_wallet_router_swap(AeroWallet *w,
                               const char *data_hex);
 
 /**
+ * Across bridge fee quote for `amount_wei` of `symbol` from the connected chain to
+ * `dest_chain_id`. Returns normalized JSON. Caller frees the string.
+ */
+char *aero_wallet_across_quote(AeroWallet *w,
+                               uint32_t from_index,
+                               const char *symbol,
+                               uint64_t dest_chain_id,
+                               const char *amount_wei);
+
+/**
+ * Build the Across SpokePool depositV3 transaction (fresh quote). Returns JSON
+ * `{to, spender, data, value, native, output_amount, ...}`. Caller frees the string.
+ */
+char *aero_wallet_across_build(AeroWallet *w,
+                               uint32_t from_index,
+                               const char *symbol,
+                               uint64_t dest_chain_id,
+                               const char *amount_wei);
+
+/**
  * ERC20 transfer history as a JSON array of `HistoryItem`. `from_block` is a hex block number
  * or "earliest"/"latest". Caller frees the string.
  */

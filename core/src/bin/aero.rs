@@ -24,6 +24,17 @@ fn main() {
         return;
     }
 
+    // Headless THP diagnostic: `aero thp-probe` opens a plugged-in 2025+ Trezor (Trezor-Host
+    // Protocol), allocates a channel, and prints the device model + supported pairing methods. This
+    // is the first hardware-testable milestone of THP support (no crypto/pairing yet).
+    if std::env::args().nth(1).as_deref() == Some("thp-probe") {
+        match aero_core::thp::probe() {
+            Ok(s) => println!("{s}"),
+            Err(e) => println!("THP probe failed: {e}"),
+        }
+        return;
+    }
+
     let mut wallet: Option<Wallet> = None;
     let mut account: u32 = 0;
     let mut chain_id: u64 = 1;

@@ -1508,3 +1508,89 @@ void Wallet::routerSwap(quint32 fromIndex, const QString &to, const QString &val
                                   Qt::QueuedConnection);
     });
 }
+
+// --- Across cross-chain bridge -------------------------------------------------------------------
+
+void Wallet::acrossQuote(quint32 fromIndex, const QString &symbol, quint64 destChainId,
+                         const QString &amountWei) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, symbol, destChainId, amountWei]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_across_quote(m_core, fromIndex, symbol.toUtf8().constData(),
+                                             destChainId, amountWei.toUtf8().constData());
+        QString json, err;
+        if (res)
+            json = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, json, err]() { emit acrossQuoteReady(json, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::acrossBuild(quint32 fromIndex, const QString &symbol, quint64 destChainId,
+                         const QString &amountWei) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, symbol, destChainId, amountWei]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_across_build(m_core, fromIndex, symbol.toUtf8().constData(),
+                                             destChainId, amountWei.toUtf8().constData());
+        QString json, err;
+        if (res)
+            json = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, json, err]() { emit acrossBuilt(json, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::bridgeAllowance(quint32 fromIndex, const QString &token, const QString &spender) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, token, spender]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_router_allowance(m_core, fromIndex, token.toUtf8().constData(),
+                                                 spender.toUtf8().constData());
+        QString wei, err;
+        if (res)
+            wei = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, token, spender, wei, err]() {
+            emit bridgeAllowanceReady(token, spender, wei, err);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Wallet::bridgeApprove(quint32 fromIndex, const QString &token, const QString &spender,
+                           const QString &amountWei) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, token, spender, amountWei]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_router_approve(m_core, fromIndex, token.toUtf8().constData(),
+                                               spender.toUtf8().constData(),
+                                               amountWei.toUtf8().constData());
+        QString txHash, err;
+        if (res)
+            txHash = QJsonDocument::fromJson(takeString(res).toUtf8()).object()
+                         .value("tx_hash").toString();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, txHash, err]() { emit bridgeApproved(txHash, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::bridgeSend(quint32 fromIndex, const QString &to, const QString &valueWei,
+                        const QString &dataHex) {
+    QtConcurrent::run(&m_netPool, [this, fromIndex, to, valueWei, dataHex]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_router_swap(m_core, fromIndex, to.toUtf8().constData(),
+                                            valueWei.toUtf8().constData(),
+                                            dataHex.toUtf8().constData());
+        QString txHash, err;
+        if (res)
+            txHash = QJsonDocument::fromJson(takeString(res).toUtf8()).object()
+                         .value("tx_hash").toString();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, txHash, err]() { emit bridgeSent(txHash, err); },
+                                  Qt::QueuedConnection);
+    });
+}

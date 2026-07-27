@@ -37,6 +37,7 @@ class QSystemTrayIcon;
 class QAction;
 class QSortFilterProxyModel;
 class QStandardItemModel;
+class QProgressDialog;
 class QListWidget;
 class QTableWidget;
 class QTreeWidget;
@@ -184,6 +185,7 @@ private:
     double swapAvailable() const;          // cached balance of the selected sell asset (From account)
     void updateSwapPayUsd();               // Swap: refresh the "≈ $X" USD value under "You pay"
     void showRevokeApprovals();            // Tools -> Revoke Token Approvals dialog
+    void showBridgeDialog();               // Tools -> Across cross-chain bridge dialog
     // MetaMask-style detailed confirmation for a swap. Returns true if the user confirms.
     // `cowVerified` reflects CoW's own `verified` quote flag (surfaced as a security badge).
     // For on-chain routers, `routerId`/`routerLabel`/`routerTo`/`routerSpender` describe the router
@@ -358,6 +360,10 @@ private:
     QTimer *m_blockTimer = nullptr;            // polls the chain head for new blocks
     QTimer *m_receiptTimer = nullptr;          // fast-polls a just-sent tx's receipt to confirm it
     QString m_pendingReceiptHash;              // the tx we're watching for confirmation ("" = none)
+    bool m_sendInFlight = false;               // a commit/broadcast is in progress — block re-sends
+    QProgressDialog *m_sendProgress = nullptr; // modal "Broadcasting…" shown while a send is in flight
+    void beginSendProgress(const QString &text); // show the broadcast spinner + set the in-flight guard
+    void endSendProgress();                    // clear the guard + dismiss the spinner
     int m_receiptPolls = 0;                    // safety cap on receipt polls
     QTimer *m_saveTimer = nullptr;             // debounces wallet saves (coalesces rapid edits)
     QTimer *m_histSaveTimer = nullptr;         // debounces persisting the per-chain history cache

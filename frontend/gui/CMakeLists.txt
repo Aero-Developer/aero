@@ -38,7 +38,9 @@ endif()
 
 set(ETHWALLET_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../src/ethwallet)
 
-add_executable(aero_gui WIN32
+# WIN32 => GUI subsystem app on Windows (no console); MACOSX_BUNDLE => a proper Aero.app on macOS.
+# Each flag is ignored on the other platforms.
+add_executable(aero_gui WIN32 MACOSX_BUNDLE
     main.cpp
     AeroMainWindow.cpp
     AeroMainWindow.h
@@ -105,6 +107,25 @@ target_link_libraries(aero_gui PRIVATE
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Network
     ${AERO_CORE_LINK}
 )
+
+# macOS: build Aero.app with sane bundle metadata; the binary + dylib live in Contents/MacOS and the
+# core dylib is found via an @loader_path rpath. (Qt frameworks + Tor are added at package time by
+# macdeployqt / ci/package-macos.sh.)
+if(APPLE)
+    set_target_properties(aero_gui PROPERTIES
+        OUTPUT_NAME "Aero"
+        MACOSX_BUNDLE_BUNDLE_NAME "Aero"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "io.aero.wallet"
+        MACOSX_BUNDLE_BUNDLE_VERSION "1.0"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0")
+    # Optional app icon: use assets/Aero.icns if present (CI can generate it from the logo PNG).
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/assets/Aero.icns")
+        target_sources(aero_gui PRIVATE assets/Aero.icns)
+        set_source_files_properties(assets/Aero.icns PROPERTIES
+            MACOSX_PACKAGE_LOCATION "Resources")
+        set_target_properties(aero_gui PROPERTIES MACOSX_BUNDLE_ICON_FILE "Aero.icns")
+    endif()
+endif()
 
 # Find the core shared library next to the executable at runtime.
 if(APPLE)

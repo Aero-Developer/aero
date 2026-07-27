@@ -194,13 +194,38 @@ pub async fn trezor_sign_tx(
 // -------------------------------------------------------------------------------------------------
 
 fn connect_trezor() -> Result<Trezor> {
-    let mut client = trezor_client::unique(false).map_err(|e| {
-        CoreError::rpc(format!("Trezor not found (connect + unlock the device): {e}"))
-    })?;
-    client
-        .init_device(None)
-        .map_err(|e| CoreError::rpc(format!("Trezor init: {e}")))?;
-    Ok(client)
+    // A previous/interrupted session (or Trezor Suite/Bridge grabbing the device) can leave an
+    // unacknowledged USB packet buffered on the device; the next `Initialize` then trips over that
+    // stale message and the device replies `Failure_InvalidProtocol` (or a malformed-chunk error).
+    // Dropping the handle and reconnecting drains the stale message, so retry a few times with a
+    // fresh connection before giving up — this is what Trezor's own host tools do.
+    let mut last = String::new();
+    for attempt in 0..4 {
+        match trezor_client::unique(false) {
+            Ok(mut client) => match client.init_device(None) {
+                Ok(()) => return Ok(client),
+                Err(e) => last = e.to_string(), // client dropped here -> USB handle released
+            },
+            Err(e) => last = format!("Trezor not found (connect + unlock the device): {e}"),
+        }
+        if attempt + 1 < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    }
+    let low = last.to_ascii_lowercase();
+    let hint = if low.contains("invalidprotocol") || low.contains("invalid protocol") {
+        // The device rejected Codec v1 outright — it speaks only the newer encrypted Trezor-Host
+        // Protocol (THP), used by 2025+ models (Safe 5/7, T3W1). Our Trezor library is Codec v1 only,
+        // so it can't pair with a THP device yet.
+        "  (this is a newer Trezor that uses the encrypted Trezor-Host Protocol, which Aero does not \
+         support yet — older Trezors: Model One/T, Safe 3 work. Use Trezor Suite/MetaMask with a THP \
+         device for now.)"
+    } else if low.contains("protocol") || low.contains("chunk") {
+        "  (unplug and reconnect the Trezor, close Trezor Suite/Bridge if it's open, then retry)"
+    } else {
+        ""
+    };
+    Err(CoreError::rpc(format!("Trezor init: {last}{hint}")))
 }
 
 /// Drive a Trezor response to completion, auto-acking button requests and injecting the

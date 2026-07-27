@@ -137,6 +137,27 @@ sol! {
     interface IEthFlow {
         function createOrder(EthFlowData order) external payable returns (bytes32);
     }
+
+    // Across Protocol SpokePool: cross-chain bridge deposit. Native ETH deposits pass the chain's
+    // WETH as `inputToken` and send `inputAmount` as msg.value; ERC-20 deposits approve the SpokePool
+    // and send value 0.
+    #[allow(missing_docs)]
+    interface ISpokePool {
+        function depositV3(
+            address depositor,
+            address recipient,
+            address inputToken,
+            address outputToken,
+            uint256 inputAmount,
+            uint256 outputAmount,
+            uint256 destinationChainId,
+            address exclusiveRelayer,
+            uint32 quoteTimestamp,
+            uint32 fillDeadline,
+            uint32 exclusivityDeadline,
+            bytes message
+        ) external payable;
+    }
 }
 
 /// A balance reported for display.
@@ -2550,6 +2571,150 @@ impl Wallet {
         let data = Bytes::from(erc20::encode_approve(spender_addr, U256::ZERO));
         self.build_sign_send(from_index, token_addr, U256::ZERO, data, None, None, None)
             .await
+    }
+
+    // ---------- Across Protocol cross-chain bridge ----------
+
+    /// Fetch an Across bridge fee quote for sending `amount_wei` of `symbol` from the CURRENTLY
+    /// CONNECTED chain to `dest_chain_id`, to the same address. Returns a normalized JSON object with
+    /// the output amount, fees, SpokePool address, and the deposit parameters (timestamps, deadlines,
+    /// exclusive relayer) needed to build the `depositV3` calldata.
+    pub async fn across_quote(
+        &self,
+        from_index: u32,
+        symbol: &str,
+        dest_chain_id: u64,
+        amount_wei: &str,
+    ) -> Result<serde_json::Value> {
+        let provider = self.provider()?;
+        let origin = provider.chain_id();
+        if !crate::across::supported(origin) {
+            return Err(CoreError::rpc("bridging is not available from this chain".to_string()));
+        }
+        if !crate::across::supported(dest_chain_id) || dest_chain_id == origin {
+            return Err(CoreError::rpc("choose a different Across-supported destination chain".to_string()));
+        }
+        let input_token = crate::across::token_address(symbol, origin)
+            .ok_or_else(|| CoreError::rpc(format!("{symbol} is not bridgeable from this chain")))?;
+        let output_token = crate::across::token_address(symbol, dest_chain_id)
+            .ok_or_else(|| CoreError::rpc(format!("{symbol} is not bridgeable to that chain")))?;
+        let me = self.address(from_index)?;
+        let url = format!(
+            "https://app.across.to/api/suggested-fees?inputToken={input_token}&outputToken={output_token}\
+             &originChainId={origin}&destinationChainId={dest_chain_id}&amount={amount_wei}&recipient={me}"
+        );
+        let r = provider.http_get_json(&url).await?;
+
+        let output_amount = r.get("outputAmount").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        if output_amount.is_empty() {
+            let msg = r
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("bridge quote unavailable for this pair/amount");
+            return Err(CoreError::rpc(format!("Across: {msg}")));
+        }
+        let str_or_num = |v: &serde_json::Value| json_num_str(v);
+        let total_relay_fee = r
+            .get("totalRelayFee")
+            .and_then(|f| f.get("total"))
+            .map(str_or_num)
+            .unwrap_or_else(|| "0".into());
+        let lp_fee = r
+            .get("lpFee")
+            .and_then(|f| f.get("total"))
+            .map(str_or_num)
+            .unwrap_or_else(|| "0".into());
+        let limits = r.get("limits");
+        let lim = |k: &str| limits.and_then(|l| l.get(k)).map(str_or_num).unwrap_or_else(|| "0".into());
+
+        Ok(serde_json::json!({
+            "symbol": symbol,
+            "origin_chain": origin,
+            "dest_chain": dest_chain_id,
+            "input_token": input_token,
+            "output_token": output_token,
+            "input_is_native": crate::across::is_native(symbol, origin),
+            "decimals": crate::across::decimals(symbol),
+            "input_amount": amount_wei,
+            "output_amount": output_amount,
+            "total_relay_fee": total_relay_fee,
+            "lp_fee": lp_fee,
+            "spoke_pool": r.get("spokePoolAddress").and_then(|v| v.as_str()).unwrap_or_default(),
+            "timestamp": r.get("timestamp").map(str_or_num).unwrap_or_else(|| "0".into()),
+            "fill_deadline": r.get("fillDeadline").map(str_or_num).unwrap_or_else(|| "0".into()),
+            "exclusive_relayer": r.get("exclusiveRelayer").and_then(|v| v.as_str())
+                .unwrap_or("0x0000000000000000000000000000000000000000"),
+            "exclusivity_deadline": r.get("exclusivityDeadline").map(str_or_num).unwrap_or_else(|| "0".into()),
+            "est_fill_time_sec": r.get("estimatedFillTimeSec").and_then(|v| v.as_u64()).unwrap_or(0),
+            "is_amount_too_low": r.get("isAmountTooLow").and_then(|v| v.as_bool()).unwrap_or(false),
+            "min_deposit": lim("minDeposit"),
+            "max_deposit": lim("maxDeposit"),
+        }))
+    }
+
+    /// Fetch a fresh Across quote and build the SpokePool `depositV3` transaction to execute it.
+    /// Returns `{to, spender, data, value, native, output_amount, is_amount_too_low, min_deposit,
+    /// max_deposit}`. For ERC-20 bridges the caller approves `spender` (the SpokePool) then sends the
+    /// calldata with value 0; for native ETH it sends the calldata with `value` = the input amount.
+    pub async fn across_build(
+        &self,
+        from_index: u32,
+        symbol: &str,
+        dest_chain_id: u64,
+        amount_wei: &str,
+    ) -> Result<serde_json::Value> {
+        let q = self.across_quote(from_index, symbol, dest_chain_id, amount_wei).await?;
+        let gs = |k: &str| q.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+
+        let spoke = gs("spoke_pool");
+        if spoke.is_empty() {
+            return Err(CoreError::rpc("Across quote missing the SpokePool address".to_string()));
+        }
+        let me = parse_address(&self.address(from_index)?)?;
+        let input_token = parse_address(&gs("input_token"))?;
+        let output_token = parse_address(&gs("output_token"))?;
+        let input_amount = U256::from_str(amount_wei)
+            .map_err(|_| CoreError::Amount("bad bridge amount".into()))?;
+        let output_amount = U256::from_str(&gs("output_amount")).unwrap_or(U256::ZERO);
+        let relayer_s = gs("exclusive_relayer");
+        let exclusive_relayer = parse_address(if relayer_s.is_empty() {
+            "0x0000000000000000000000000000000000000000"
+        } else {
+            &relayer_s
+        })?;
+        let quote_timestamp: u32 = gs("timestamp").parse().unwrap_or(0);
+        let fill_deadline: u32 = gs("fill_deadline").parse().unwrap_or(0);
+        let exclusivity_deadline: u32 = gs("exclusivity_deadline").parse().unwrap_or(0);
+        let native = q.get("input_is_native").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let calldata = ISpokePool::depositV3Call {
+            depositor: me,
+            recipient: me,
+            inputToken: input_token,
+            outputToken: output_token,
+            inputAmount: input_amount,
+            outputAmount: output_amount,
+            destinationChainId: U256::from(dest_chain_id),
+            exclusiveRelayer: exclusive_relayer,
+            quoteTimestamp: quote_timestamp,
+            fillDeadline: fill_deadline,
+            exclusivityDeadline: exclusivity_deadline,
+            message: Bytes::new(),
+        }
+        .abi_encode();
+
+        Ok(serde_json::json!({
+            "to": spoke,
+            "spender": spoke,
+            "data": format!("0x{}", hex::encode(calldata)),
+            "value": if native { input_amount.to_string() } else { "0".to_string() },
+            "native": native,
+            "input_token": gs("input_token"),
+            "output_amount": gs("output_amount"),
+            "is_amount_too_low": q.get("is_amount_too_low").and_then(|v| v.as_bool()).unwrap_or(false),
+            "min_deposit": gs("min_deposit"),
+            "max_deposit": gs("max_deposit"),
+        }))
     }
 
     /// DefiLlama current prices for a comma-separated list of coin keys
