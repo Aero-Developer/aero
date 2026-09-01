@@ -35,7 +35,7 @@
 
 namespace {
 // Run a slow blocking operation (Argon2id encrypt/decrypt + disk I/O) off the UI thread while a
-// modal, indeterminate "please wait" dialog keeps the wizard painting — so it never shows as
+// modal, indeterminate "please wait" dialog keeps the wizard painting - so it never shows as
 // "Not responding". Returns the operation's bool result.
 template <typename Fn>
 bool runBusy(QWidget *parent, const QString &label, Fn fn) {
@@ -150,7 +150,7 @@ WalletWizard::WalletWizard(QWidget *parent) : QWizard(parent) {
     settingsButton->setVisible(false);
     connect(this, &QWizard::currentIdChanged, this, [this, settingsButton](int id) {
         settingsButton->setVisible(id == WalletWizard::Page_Menu);
-        // Keep the Next / Finish labels correct per-page — setButtonText is global, so without this
+        // Keep the Next / Finish labels correct per-page - setButtonText is global, so without this
         // one page's custom label ("Connect", "Open wallet") bleeds onto later pages.
         setButtonText(QWizard::NextButton,
                       id == Page_Hardware ? tr("Connect") : m_defaultNextText);
@@ -177,13 +177,13 @@ Wallet *WalletWizard::takeWallet() {
 
 MenuPage::MenuPage(WalletWizard *w) : m_w(w), ui(new Ui::PageMenu) {
     ui->setupUi(this);
-    // Feather's menu page has no title/subtitle header — the banner runs full-height from the top.
+    // Feather's menu page has no title/subtitle header - the banner runs full-height from the top.
 
     // Repurpose Feather's "view-only" option as an Ethereum address-only watch wallet.
     ui->radioViewOnly->setText(tr("Watch-only wallet (track an address)"));
     ui->radioCreateFromDevice->setText(tr("Connect hardware wallet (Ledger / Trezor)"));
     ui->frame_seedBump->setVisible(false);
-    ui->label_version->setText(tr("Aero — Ethereum wallet"));
+    ui->label_version->setText(tr("Aero - Ethereum wallet"));
 
     // Default to the last action used; fall back to "Open wallet file" so returning users land
     // straight on their existing wallet.
@@ -212,11 +212,20 @@ int MenuPage::nextId() const {
 
 bool MenuPage::validatePage() {
     QString mode;
+    const WalletWizard::Mode previous = m_w->mode;
     if (ui->radioOpen->isChecked()) { m_w->mode = WalletWizard::Open; mode = QStringLiteral("open"); }
     else if (ui->radioCreateFromDevice->isChecked()) { m_w->mode = WalletWizard::Hardware; mode = QStringLiteral("hardware"); }
     else if (ui->radioViewOnly->isChecked()) { m_w->mode = WalletWizard::Watch; mode = QStringLiteral("watch"); }
     else if (ui->radioSeed->isChecked()) { m_w->mode = WalletWizard::Restore; mode = QStringLiteral("restore"); }
     else { m_w->mode = WalletWizard::Create; mode = QStringLiteral("create"); }
+
+    // Coming back here and picking a different path must not carry the half-finished wallet from
+    // the previous one. A hardware wallet left behind this way used to surface on the seed page as
+    // twelve blank words, because it has no seed to show.
+    if (m_w->mode != previous) {
+        delete m_w->wallet;
+        m_w->wallet = nullptr;
+    }
     QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
         .setValue(QStringLiteral("wizard/lastMode"), mode);
     return true;
@@ -280,8 +289,11 @@ bool FilePage::validatePage() {
 int FilePage::nextId() const {
     if (m_w->mode == WalletWizard::Restore)
         return WalletWizard::Page_RestoreSeed;
-    if (m_w->mode == WalletWizard::Watch)
-        return WalletWizard::Page_Password; // wallet already built on the Watch page; just save it
+    // Watch-only and hardware wallets were already built on their own page, and neither has a seed
+    // to show or back up - the keys are on the device, or there are none. They go straight to
+    // setting the file password.
+    if (m_w->mode == WalletWizard::Watch || m_w->mode == WalletWizard::Hardware)
+        return WalletWizard::Page_Password;
     return WalletWizard::Page_Seed;
 }
 
@@ -321,7 +333,7 @@ SeedPage::SeedPage(WalletWizard *w) : m_w(w), ui(new Ui::PageWalletSeed) {
 
     // Optional BIP39 passphrase ("extension word" / "25th word"). It is NOT part of the seed words
     // above; it mixes into key derivation so it must be remembered separately, and a typo silently
-    // produces a different wallet — hence a confirm field. Hidden behind a checkbox for normal users.
+    // produces a different wallet - hence a confirm field. Hidden behind a checkbox for normal users.
     m_usePass = new QCheckBox(tr("Add an optional passphrase (advanced)"), this);
     m_passphrase = new QLineEdit(this);
     m_passphrase->setEchoMode(QLineEdit::Password);
@@ -335,7 +347,7 @@ SeedPage::SeedPage(WalletWizard *w) : m_w(w), ui(new Ui::PageWalletSeed) {
     m_passError->hide();
     auto *passNote = new QLabel(
         tr("The passphrase is required together with your seed to recover this wallet. "
-           "It is not written in the words above — store it separately. If you lose it, "
+           "It is not written in the words above - store it separately. If you lose it, "
            "these funds are unrecoverable."),
         this);
     passNote->setWordWrap(true);
@@ -368,12 +380,12 @@ SeedPage::~SeedPage() { delete ui; }
 bool SeedPage::validatePage() {
     m_passError->hide();
     if (!m_w->wallet) {
-        // Seed generation failed earlier — don't dead-end silently on a blank grid.
+        // Seed generation failed earlier - don't dead-end silently on a blank grid.
         m_passError->setText(tr("Couldn't generate a seed phrase. Go back a step and try again."));
         m_passError->show();
         return false;
     }
-    // If the passphrase box is ticked it must actually be filled — otherwise we'd silently create a
+    // If the passphrase box is ticked it must actually be filled - otherwise we'd silently create a
     // NO-passphrase wallet, so the user's real addresses would differ from what they intended.
     const bool passChecked = m_usePass && m_usePass->isChecked();
     if (passChecked && m_passphrase->text().isEmpty()) {
@@ -432,9 +444,13 @@ bool SeedPage::validatePage() {
 }
 
 void SeedPage::initializePage() {
-    if (m_w->mode == WalletWizard::Create && !m_w->wallet)
+    // Regenerate whenever there is no seed to show, not merely when there is no wallet: a wallet
+    // carried over from another path (hardware, watch-only) has no seed, and showing its emptiness
+    // here would be both meaningless and alarming.
+    const bool haveSeed = m_w->wallet && !m_w->wallet->getSeed().trimmed().isEmpty();
+    if (m_w->mode == WalletWizard::Create && !haveSeed)
         regenerate();
-    else if (m_w->wallet)
+    else if (haveSeed)
         showSeedWords(m_w->wallet->getSeed());
 }
 
@@ -545,7 +561,7 @@ bool RestoreSeedPage::validatePage() {
     QString phrase = m_seed->toPlainText().replace('\n', ' ').replace('\r', "").simplified();
     const QStringList seedWords = phrase.split(' ', Qt::SkipEmptyParts);
 
-    // Accept every valid BIP39 length (12/15/18/21/24), not just 12 or 24 — an 18-word seed from
+    // Accept every valid BIP39 length (12/15/18/21/24), not just 12 or 24 - an 18-word seed from
     // another wallet is perfectly valid. The core still verifies the checksum in recoveryWallet().
     const int n = seedWords.size();
     if (n != 12 && n != 15 && n != 18 && n != 21 && n != 24) {
@@ -613,11 +629,11 @@ bool PasswordPage::validatePage() {
     QDir dir(QDir(m_w->walletDir).filePath(m_w->walletName));
     if (!dir.exists()) dir.mkpath(".");
     const QString path = dir.filePath(m_w->walletName + QStringLiteral(".keys"));
-    // Encrypting the wallet runs Argon2id (64 MiB / 3 passes) + a synced write — slow enough to
+    // Encrypting the wallet runs Argon2id (64 MiB / 3 passes) + a synced write - slow enough to
     // freeze the wizard. Run it off-thread behind a busy dialog so the UI stays responsive.
     Wallet *w = m_w->wallet;
     const QString pw = ui->widget_password->password();
-    // An empty password means the keys are effectively unprotected on disk — allow it (some users
+    // An empty password means the keys are effectively unprotected on disk - allow it (some users
     // want it) but make them confirm, so it's never a silent accident.
     if (pw.isEmpty()) {
         const auto r = QMessageBox::warning(
@@ -648,24 +664,28 @@ HardwarePage::HardwarePage(WalletWizard *w) : m_w(w) {
 
     auto *info = new InfoFrame(this);
     info->setInfo(QIcon(kInfoIcon),
-                  tr("Your keys stay on the device. Connect and unlock it: Ledger — open the "
-                     "Ethereum app; Trezor — unlock (on Windows, Trezor Suite must have installed "
-                     "its USB driver). The wallet only opens while the device is connected."));
+                  tr("Your keys stay on the device. Connect and unlock it - on a Ledger, open the "
+                     "Ethereum app as well. The wallet only opens while the device is connected."));
 
+    // Only shown when both a Ledger and a Trezor are plugged in, since that is the only time the
+    // device type cannot simply be detected.
     m_ledger = new QRadioButton(tr("Ledger"), this);
     m_trezor = new QRadioButton(tr("Trezor"), this);
     m_ledger->setChecked(true);
-    auto *devs = new QHBoxLayout();
+    m_choiceRow = new QWidget(this);
+    auto *devs = new QHBoxLayout(m_choiceRow);
+    devs->setContentsMargins(0, 0, 0, 0);
+    devs->addWidget(new QLabel(tr("Two devices are connected. Use:"), m_choiceRow));
     devs->addWidget(m_ledger);
     devs->addWidget(m_trezor);
     devs->addStretch();
+    m_choiceRow->setVisible(false);
 
     m_status = new QLabel(this);
     m_status->setStyleSheet(QStringLiteral("color: gray;"));
 
     auto *refresh = new QPushButton(tr("Detect device"), this);
     connect(refresh, &QPushButton::clicked, this, [this]() { refreshDevices(); });
-    connect(m_ledger, &QRadioButton::toggled, this, [this]() { refreshDevices(); });
 
     // Optional host-entered BIP39 passphrase (Trezor). Ledger enters its passphrase on-device.
     m_usePass = new QCheckBox(tr("Use a BIP39 passphrase"), this);
@@ -674,8 +694,8 @@ HardwarePage::HardwarePage(WalletWizard *w) : m_w(w) {
     m_passphrase->setPlaceholderText(tr("Passphrase"));
     m_passphrase->setVisible(false);
     auto *passNote = new QLabel(
-        tr("Trezor: entered here (Trezor Suite style). Ledger: enter it on the device — this field "
-           "is ignored."),
+        tr("On a Trezor the passphrase is entered here. On a Ledger it is entered on the device, "
+           "so this field is ignored."),
         this);
     passNote->setWordWrap(true);
     passNote->setStyleSheet(QStringLiteral("color: gray;"));
@@ -693,7 +713,7 @@ HardwarePage::HardwarePage(WalletWizard *w) : m_w(w) {
 
     auto *layout = new QVBoxLayout(this);
     layout->addWidget(info);
-    layout->addLayout(devs);
+    layout->addWidget(m_choiceRow);
     layout->addWidget(refresh);
     layout->addWidget(m_status);
     layout->addWidget(m_usePass);
@@ -708,30 +728,57 @@ void HardwarePage::initializePage() {
     refreshDevices();
 }
 
+QString HardwarePage::detectedKind() const {
+    if (m_found == QLatin1String("both"))
+        return m_ledger->isChecked() ? QStringLiteral("ledger") : QStringLiteral("trezor");
+    if (!m_found.isEmpty())
+        return m_found;
+    // Nothing was detected. Try Trezor anyway so the attempt produces a real device error rather
+    // than a flat refusal - detection is a convenience, not a gate.
+    return QStringLiteral("trezor");
+}
+
 void HardwarePage::refreshDevices() {
     if (!m_status) return;
-    const bool ledger = m_ledger->isChecked();
-    const QString kind = ledger ? QStringLiteral("ledger") : QStringLiteral("trezor");
-    const QString label = ledger ? QStringLiteral("Ledger") : QStringLiteral("Trezor");
-    m_status->setText(tr("Searching for %1…").arg(label));
-    // Enumerate off the UI thread so a slow/blocking USB probe can never freeze the wizard.
+    m_status->setText(tr("Looking for a device…"));
+    // Enumerate off the UI thread so a slow/blocking USB probe can never freeze the wizard. Both
+    // families are probed so the user does not have to tell us what they plugged in.
     QPointer<HardwarePage> self(this);
-    QtConcurrent::run([kind]() { return WalletManager::instance()->listHwDevices(kind); })
-        .then(this, [self, label](const QStringList &devices) {
-            if (!self || !self->m_status) return;
-            if (devices.isEmpty())
-                self->m_status->setText(
-                    QObject::tr("No %1 detected. Connect and unlock the device, then press Detect.")
-                        .arg(label));
-            else
-                self->m_status->setText(
-                    QObject::tr("Found: %1").arg(devices.join(QStringLiteral(", "))));
-        });
+    QtConcurrent::run([]() {
+        auto *wm = WalletManager::instance();
+        return QPair<QStringList, QStringList>(wm->listHwDevices(QStringLiteral("ledger")),
+                                               wm->listHwDevices(QStringLiteral("trezor")));
+    }).then(this, [self](const QPair<QStringList, QStringList> &found) {
+        if (!self || !self->m_status) return;
+        const QStringList &ledger = found.first;
+        const QStringList &trezor = found.second;
+
+        if (!ledger.isEmpty() && !trezor.isEmpty()) {
+            self->m_found = QStringLiteral("both");
+            self->m_choiceRow->setVisible(true);
+            self->m_status->setText(QObject::tr("Found a Ledger and a Trezor."));
+        } else if (!ledger.isEmpty()) {
+            self->m_found = QStringLiteral("ledger");
+            self->m_choiceRow->setVisible(false);
+            self->m_status->setText(
+                QObject::tr("Found: %1").arg(ledger.join(QStringLiteral(", "))));
+        } else if (!trezor.isEmpty()) {
+            self->m_found = QStringLiteral("trezor");
+            self->m_choiceRow->setVisible(false);
+            self->m_status->setText(
+                QObject::tr("Found: %1").arg(trezor.join(QStringLiteral(", "))));
+        } else {
+            self->m_found.clear();
+            self->m_choiceRow->setVisible(false);
+            self->m_status->setText(QObject::tr(
+                "No device detected. Connect and unlock it, then press Detect device."));
+        }
+    });
 }
 
 bool HardwarePage::validatePage() {
     m_error->hide();
-    const QString kind = m_ledger->isChecked() ? QStringLiteral("ledger") : QStringLiteral("trezor");
+    const QString kind = detectedKind();
     const QString passphrase =
         (m_usePass && m_usePass->isChecked() && kind == QLatin1String("trezor"))
             ? m_passphrase->text()
@@ -762,7 +809,7 @@ WatchPage::WatchPage(WalletWizard *w) : m_w(w) {
     auto *v = new QVBoxLayout(this);
     auto *info = new QLabel(
         tr("Enter one or more Ethereum addresses to watch (one per line). A watch-only wallet "
-           "tracks balances and history but cannot sign or send — it holds no private keys."),
+           "tracks balances and history but cannot sign or send - it holds no private keys."),
         this);
     info->setWordWrap(true);
     v->addWidget(info);
@@ -947,7 +994,7 @@ bool OpenPage::validatePage() {
     // -1 = can't decrypt (wrong password), 0 = software, 1 = hardware.
     QString password;
     int kind = -1;
-    // fileIsHardware() decrypts the file (Argon2id) — run it off the UI thread so it never freezes.
+    // fileIsHardware() decrypts the file (Argon2id) - run it off the UI thread so it never freezes.
     runBusy(this, tr("Opening wallet…"),
             [&]() { kind = wm->fileIsHardware(m_walletFile, password); return true; });
     if (kind == -1) {
@@ -985,7 +1032,7 @@ bool OpenPage::validatePage() {
             return false;
         }
     } else {
-        // Decrypting runs Argon2id (64 MiB / 3 passes) — run it off-thread behind a busy dialog so
+        // Decrypting runs Argon2id (64 MiB / 3 passes) - run it off-thread behind a busy dialog so
         // the wizard doesn't hang while the wallet opens.
         const QString file = m_walletFile, pw = password;
         Wallet *opened = nullptr;

@@ -61,6 +61,102 @@ pub extern "C" fn aero_version() -> *mut c_char {
     to_cstr(env!("CARGO_PKG_VERSION"))
 }
 
+// -------------------------------------------------------------------------------------------------
+// Trezor-Host Protocol (2025+ Trezor models)
+// -------------------------------------------------------------------------------------------------
+
+/// Asks the user for the 6-digit code the Trezor is displaying during pairing.
+///
+/// Unlike every other call here, this one runs the other way round: the core invokes it partway
+/// through a blocking operation, on whichever worker thread is driving the device. An
+/// implementation that touches the UI must therefore marshal to the UI thread itself.
+///
+/// Write the code as NUL-terminated ASCII into `out` (at most `out_len` bytes including the
+/// terminator) and return 0. Return non-zero if the user cancelled.
+pub type PairingCodeFn =
+    Option<extern "C" fn(ctx: *mut std::ffi::c_void, out: *mut c_char, out_len: c_int) -> c_int>;
+
+/// The registered callback plus its context pointer.
+///
+/// The pointer is owned by the C++ side, which must keep it alive until the process exits or the
+/// callback is replaced. `Send` is asserted because the callback is invoked from worker threads;
+/// the C++ implementation is responsible for being thread-safe, which is exactly what marshalling
+/// to the UI thread achieves.
+struct PairingCallback {
+    func: PairingCodeFn,
+    ctx: *mut std::ffi::c_void,
+}
+unsafe impl Send for PairingCallback {}
+
+impl PairingCallback {
+    /// Invoke the C callback and read back the code.
+    ///
+    /// Taking `&self` matters: it makes the closure below capture the whole struct rather than its
+    /// individual fields, which is what keeps the `Send` assertion above meaningful under Rust
+    /// 2021's disjoint capture rules.
+    fn ask(&self) -> std::result::Result<String, String> {
+        let func = self.func.ok_or("no pairing callback is registered")?;
+        let mut buf = [0u8; 32];
+        let rc = func(self.ctx, buf.as_mut_ptr() as *mut c_char, buf.len() as c_int);
+        if rc != 0 {
+            return Err("pairing was cancelled".into());
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8(buf[..end].to_vec())
+            .map_err(|_| "the pairing code was not valid text".to_string())
+    }
+}
+
+/// Configure Trezor-Host Protocol support: where to keep the pairing credential, and how to ask
+/// the user for the pairing code.
+///
+/// `credential_path` should be an app-level location so a device is paired once for all wallets.
+/// Passing a NULL callback disables pairing: already-paired devices keep working, but a device
+/// that needs pairing reports an error rather than hanging.
+///
+/// # Safety
+/// `credential_path` must be a valid NUL-terminated string. `ctx` must remain valid for as long as
+/// the callback is registered.
+#[no_mangle]
+pub unsafe extern "C" fn aero_thp_configure(
+    credential_path: *const c_char,
+    callback: PairingCodeFn,
+    ctx: *mut std::ffi::c_void,
+) {
+    clear_error();
+    let path = std::path::PathBuf::from(from_cstr(credential_path).unwrap_or_default());
+    let prompt: Option<crate::thp_conn::CodePrompt> = callback.map(|_| {
+        let cb = PairingCallback { func: callback, ctx };
+        Box::new(move || cb.ask()) as crate::thp_conn::CodePrompt
+    });
+    crate::thp_conn::configure(path, prompt);
+}
+
+/// Whether a Trezor has already been paired, i.e. whether connecting will be silent. 1 = yes.
+#[no_mangle]
+pub extern "C" fn aero_thp_is_paired() -> c_int {
+    c_int::from(crate::thp_conn::is_paired())
+}
+
+/// Forget the stored pairing, so the next connection pairs afresh. Returns 0 on success.
+#[no_mangle]
+pub extern "C" fn aero_thp_forget_pairing() -> c_int {
+    clear_error();
+    match crate::thp_conn::forget_pairing() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_error(e);
+            -1
+        }
+    }
+}
+
+/// Drop any cached device connection. Call when a wallet is closed so the device is released.
+#[no_mangle]
+pub extern "C" fn aero_thp_disconnect() {
+    crate::thp_conn::disconnect();
+}
+
 /// Free a string returned by this library.
 #[no_mangle]
 pub extern "C" fn aero_string_free(s: *mut c_char) {
@@ -646,6 +742,24 @@ pub extern "C" fn aero_wallet_set_provider(
     }
 }
 
+/// Point history for `chain_id` at explorer APIs of the caller's choosing, ahead of the built-in
+/// ones. `csv` is a comma-separated list of bases; NULL or empty restores the built-ins.
+///
+/// Each entry is either a host, to which `/api` is appended, or a URL that already carries a query
+/// string, which is used as given - so `https://api.etherscan.io/v2/api?chainid=1&apikey=…` works,
+/// as does a private Blockscout. This exists so that an explorer going away or tightening its limits
+/// is a setting somebody changes rather than a release everybody has to install.
+#[no_mangle]
+pub extern "C" fn aero_set_history_apis(chain_id: u64, csv: *const c_char) {
+    let list = from_cstr(csv)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    crate::explorers::set_custom(chain_id, list);
+}
+
 /// ETH balance for `index` as JSON `BalanceInfo`. Caller frees the string.
 #[no_mangle]
 pub extern "C" fn aero_wallet_eth_balance(w: *mut Wallet, index: u32) -> *mut c_char {
@@ -1008,7 +1122,7 @@ pub extern "C" fn aero_wallet_build_unsigned(
 }
 
 /// Sign an unsigned-tx JSON (from `aero_wallet_build_unsigned`) with the local key; returns the 0x
-/// raw RLP hex (no network needed — runs offline). Null on error. Caller frees the string.
+/// raw RLP hex (no network needed - runs offline). Null on error. Caller frees the string.
 #[no_mangle]
 pub extern "C" fn aero_wallet_sign_unsigned(w: *mut Wallet, json: *const c_char) -> *mut c_char {
     clear_error();
@@ -1336,6 +1450,140 @@ pub extern "C" fn aero_wallet_router_swap(
         return ptr::null_mut();
     };
     block_json(w, |w| RUNTIME.block_on(w.router_swap(from_index, &to, &value, &data)))
+}
+
+/// What Across can bridge out of the connected chain right now, as JSON
+/// `{origin_chain, assets:[{symbol, display, decimals, native, destinations:[chain_id]}]}`.
+/// Fetched from Across itself, so retired assets stop being offered. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_across_assets(w: *mut Wallet) -> *mut c_char {
+    block_json(w, |w| RUNTIME.block_on(w.across_assets()))
+}
+
+// --- Hyperliquid (XMR1) ---------------------------------------------------------------------------
+
+/// Everything the XMR1 trading screen shows, as JSON: the order book, the account's XMR1 and USDC
+/// balances, its resting orders and its recent fills. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_hl_overview(w: *mut Wallet, index: u32) -> *mut c_char {
+    block_json(w, |w| RUNTIME.block_on(w.hl_overview(index)))
+}
+
+/// Whether this account has already authorised Aero's trading key. Returns JSON `{"ready":bool}`.
+/// Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_hl_agent_ready(w: *mut Wallet, index: u32) -> *mut c_char {
+    block_json(w, |w| {
+        RUNTIME
+            .block_on(w.hl_agent_ready(index))
+            .map(|ready| serde_json::json!({ "ready": ready }))
+    })
+}
+
+/// Authorise Aero's trading key for this account - a one-time signature with the account key, after
+/// which orders are signed by a key that cannot withdraw. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_hl_approve_agent(w: *mut Wallet, index: u32) -> *mut c_char {
+    block_json(w, |w| RUNTIME.block_on(w.hl_approve_agent(index)))
+}
+
+/// Place an XMR1 order. `market_order` fills immediately at up to `price` and cancels any remainder;
+/// otherwise the order rests at `price`. Returns JSON `{state, size, price, oid}` where `state` is
+/// `filled`, `resting` or `none`. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_hl_place_order(
+    w: *mut Wallet,
+    index: u32,
+    is_buy: bool,
+    price: f64,
+    size: f64,
+    market_order: bool,
+) -> *mut c_char {
+    block_json(w, |w| {
+        RUNTIME.block_on(w.hl_place_order(index, is_buy, price, size, market_order))
+    })
+}
+
+/// Cancel a resting XMR1 order by its exchange order id. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_hl_cancel_order(w: *mut Wallet, index: u32, oid: u64) -> *mut c_char {
+    block_json(w, |w| RUNTIME.block_on(w.hl_cancel_order(index, oid)))
+}
+
+/// Move USDC from Arbitrum One onto the exchange by transferring it to Hyperliquid's bridge.
+/// Requires the wallet to be connected to Arbitrum. Returns JSON `SendResult`. Caller frees.
+#[no_mangle]
+pub extern "C" fn aero_wallet_hl_deposit(
+    w: *mut Wallet,
+    index: u32,
+    amount_usdc: *const c_char,
+) -> *mut c_char {
+    let Some(amount) = from_cstr(amount_usdc) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| RUNTIME.block_on(w.hl_deposit(index, &amount)))
+}
+
+/// Withdraw USDC from the exchange back to this account's address on Arbitrum, minus the exchange's
+/// flat fee. Signed by the account key, which an agent cannot do. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_hl_withdraw(
+    w: *mut Wallet,
+    index: u32,
+    amount_usdc: *const c_char,
+) -> *mut c_char {
+    let Some(amount) = from_cstr(amount_usdc) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| RUNTIME.block_on(w.hl_withdraw(index, &amount)))
+}
+
+/// What redeeming `amount_xmr1` of XMR1 for real Monero would cost: fee, minimum, and net payout.
+/// Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_xmr_redeem_quote(
+    w: *mut Wallet,
+    index: u32,
+    amount_xmr1: *const c_char,
+) -> *mut c_char {
+    let Some(amount) = from_cstr(amount_xmr1) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| RUNTIME.block_on(w.xmr_redeem_quote(index, &amount)))
+}
+
+/// Redeem XMR1 for Monero paid to `monero_address`. Opens a Wagyu order and sends the XMR1 to the
+/// address that order names. Returns the order id and session id needed to track it.
+/// Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_xmr_redeem(
+    w: *mut Wallet,
+    index: u32,
+    monero_address: *const c_char,
+    amount_xmr1: *const c_char,
+) -> *mut c_char {
+    let (Some(address), Some(amount)) = (from_cstr(monero_address), from_cstr(amount_xmr1)) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| RUNTIME.block_on(w.xmr_redeem(index, &address, &amount)))
+}
+
+/// Progress of a redemption. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_xmr_redeem_status(
+    w: *mut Wallet,
+    order_id: *const c_char,
+    session_id: *const c_char,
+) -> *mut c_char {
+    let (Some(order), Some(session)) = (from_cstr(order_id), from_cstr(session_id)) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| RUNTIME.block_on(w.xmr_redeem_status(&order, &session)))
 }
 
 /// Across bridge fee quote for sending `amount_wei` of `symbol` from the connected chain to

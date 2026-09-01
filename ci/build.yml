@@ -5,7 +5,7 @@
 name: build
 
 # Builds the Rust core + Qt GUI on Windows, Linux and macOS. On a version tag (v*) the built
-# binaries are attached to the GitHub Release. Runs on GitHub-hosted runners — this is how the
+# binaries are attached to the GitHub Release. Runs on GitHub-hosted runners - this is how the
 # non-Windows binaries are produced (they can't be cross-built from a Windows dev box).
 #
 # NOTE: bundling Tor per-OS and full Qt deployment (windeployqt / macdeployqt / linuxdeploy) are

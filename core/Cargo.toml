@@ -67,9 +67,6 @@ zeroize = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 hmac = "0.12"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-# Elligator2 map on Curve25519, needed for the CodeEntry (CPace) pairing method. Only an alpha is
-# published (Tor project's obfs4 map); pinned explicitly and used only for the pairing step.
-curve25519-elligator2 = "=0.1.0-alpha.2"
 # Raw USB transport for THP (independent of trezor-client's Codec-v1 transport).
 rusb = "0.9"
 
@@ -88,11 +85,17 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# --- msgpack, for Hyperliquid action hashing (see hyperliquid.rs) ---
+# The exchange hashes the msgpack encoding of an action and signs that, so the wallet has to
+# reproduce the encoding byte for byte.
+rmp-serde = "1"
+
 # --- misc ---
 thiserror = "2"
 once_cell = "1"
 hex = "0.4"
 tracing = "0.1"
+crypto-bigint = "0.5"
 
 # --- optional trustless light client (see the `helios` feature note above) ---
 # helios = { git = "https://github.com/a16z/helios", package = "helios" }

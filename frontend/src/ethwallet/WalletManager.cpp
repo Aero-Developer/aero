@@ -24,8 +24,8 @@ static QString takeError() {
 
 // Create a Wallet and anchor it to the GUI (main) thread. The wizard opens/creates wallets on a
 // worker thread (runBusy → QtConcurrent), so a Wallet born there would have its thread affinity set
-// to that worker thread. Its queued signals — notably providerConnected(), emitted from the network
-// pool via QMetaObject::invokeMethod(this, …, QueuedConnection) — are delivered on the object's
+// to that worker thread. Its queued signals - notably providerConnected(), emitted from the network
+// pool via QMetaObject::invokeMethod(this, …, QueuedConnection) - are delivered on the object's
 // thread's event loop, which for a finished worker thread doesn't exist. The result was the UI never
 // leaving "Connecting to Tor…" even though the connect succeeded. Moving it to the main thread (which
 // has the running event loop) makes those signals reach the UI slots.

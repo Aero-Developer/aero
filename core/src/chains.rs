@@ -13,8 +13,14 @@ pub struct ChainInfo {
     pub native_symbol: &'static str,
     /// CoinGecko coin id for pricing the native coin in USD.
     pub coingecko_id: &'static str,
-    /// Keyless Blockscout API base (history + NFTs). `None` => no keyless explorer for this chain.
-    pub blockscout_base: Option<&'static str>,
+    /// Keyless Etherscan-compatible API bases for history and NFTs, tried in order. Empty means no
+    /// keyless explorer for this chain, so history is unavailable unless the user configures one.
+    ///
+    /// More than one because a single hardcoded explorer is a single point of failure that can only
+    /// be repaired by shipping a new build: base.blockscout.com started answering 500 to every
+    /// request, and every Aero pointed at it lost its Base history with no way back. The fetcher
+    /// parks a base that stops answering and moves to the next.
+    pub explorers: &'static [&'static str],
     /// DexScreener chain slug (token liquidity lookups). `None` => skip liquidity checks.
     pub dexscreener_slug: Option<&'static str>,
     /// Build legacy (type-0, `gasPrice`) transactions instead of EIP-1559 (e.g. BNB Smart Chain).
@@ -34,7 +40,11 @@ const CHAINS: &[ChainInfo] = &[
         name: "Ethereum",
         native_symbol: "ETH",
         coingecko_id: "ethereum",
-        blockscout_base: Some("https://eth.blockscout.com"),
+        explorers: &[
+            "https://eth.blockscout.com",
+            "https://blockscout.com/eth/mainnet",
+            "https://api.routescan.io/v2/network/mainnet/evm/1/etherscan",
+        ],
         dexscreener_slug: Some("ethereum"),
         legacy_gas: false,
         cow_network: Some("mainnet"),
@@ -46,7 +56,7 @@ const CHAINS: &[ChainInfo] = &[
         name: "Arbitrum One",
         native_symbol: "ETH",
         coingecko_id: "ethereum",
-        blockscout_base: Some("https://arbitrum.blockscout.com"),
+        explorers: &["https://arbitrum.blockscout.com"],
         dexscreener_slug: Some("arbitrum"),
         legacy_gas: false,
         cow_network: Some("arbitrum_one"),
@@ -58,7 +68,7 @@ const CHAINS: &[ChainInfo] = &[
         name: "Base",
         native_symbol: "ETH",
         coingecko_id: "ethereum",
-        blockscout_base: Some("https://base.blockscout.com"),
+        explorers: &["https://base.blockscout.com"],
         dexscreener_slug: Some("base"),
         legacy_gas: false,
         cow_network: Some("base"),
@@ -70,7 +80,7 @@ const CHAINS: &[ChainInfo] = &[
         name: "Optimism",
         native_symbol: "ETH",
         coingecko_id: "ethereum",
-        blockscout_base: Some("https://optimism.blockscout.com"),
+        explorers: &["https://optimism.blockscout.com", "https://explorer.optimism.io"],
         dexscreener_slug: Some("optimism"),
         legacy_gas: false,
         cow_network: None, // CoW not deployed on Optimism
@@ -82,7 +92,7 @@ const CHAINS: &[ChainInfo] = &[
         name: "Polygon",
         native_symbol: "POL",
         coingecko_id: "matic-network",
-        blockscout_base: Some("https://polygon.blockscout.com"),
+        explorers: &["https://polygon.blockscout.com"],
         dexscreener_slug: Some("polygon"),
         legacy_gas: false,
         cow_network: Some("polygon"),
@@ -94,7 +104,9 @@ const CHAINS: &[ChainInfo] = &[
         name: "BNB Smart Chain",
         native_symbol: "BNB",
         coingecko_id: "binancecoin",
-        blockscout_base: None, // no keyless Blockscout instance; history unavailable
+        // No keyless explorer publishes BNB Smart Chain history. Set one under Settings > Node - an
+        // Etherscan V2 key covers this chain and every other one.
+        explorers: &[],
         dexscreener_slug: Some("bsc"),
         legacy_gas: true, // BSC uses legacy gasPrice transactions
         cow_network: None, // CoW not deployed on BNB Smart Chain
@@ -106,7 +118,7 @@ const CHAINS: &[ChainInfo] = &[
         name: "Gnosis",
         native_symbol: "XDAI",
         coingecko_id: "xdai",
-        blockscout_base: Some("https://gnosis.blockscout.com"),
+        explorers: &["https://gnosis.blockscout.com", "https://blockscout.com/xdai/mainnet"],
         dexscreener_slug: Some("gnosischain"),
         legacy_gas: false,
         cow_network: Some("xdai"),
@@ -120,7 +132,7 @@ const CHAINS: &[ChainInfo] = &[
         coingecko_id: "avalanche-2",
         // Routescan exposes a keyless Etherscan-compatible API for the Avalanche C-Chain (no
         // official keyless Blockscout). History works; NFT collections (Blockscout v2 only) don't.
-        blockscout_base: Some("https://api.routescan.io/v2/network/mainnet/evm/43114/etherscan"),
+        explorers: &["https://api.routescan.io/v2/network/mainnet/evm/43114/etherscan"],
         dexscreener_slug: Some("avalanche"),
         legacy_gas: false,
         cow_network: Some("avalanche"),
@@ -134,7 +146,7 @@ const CHAINS: &[ChainInfo] = &[
         name: "Sepolia (testnet)",
         native_symbol: "SepoliaETH",
         coingecko_id: "",
-        blockscout_base: Some("https://eth-sepolia.blockscout.com"),
+        explorers: &["https://eth-sepolia.blockscout.com"],
         dexscreener_slug: None,
         legacy_gas: false,
         cow_network: None,
@@ -146,7 +158,7 @@ const CHAINS: &[ChainInfo] = &[
         name: "Holesky (testnet)",
         native_symbol: "HoleskyETH",
         coingecko_id: "",
-        blockscout_base: Some("https://eth-holesky.blockscout.com"),
+        explorers: &["https://eth-holesky.blockscout.com"],
         dexscreener_slug: None,
         legacy_gas: false,
         cow_network: None,
@@ -155,9 +167,15 @@ const CHAINS: &[ChainInfo] = &[
     },
 ];
 
-/// True for chains that are test networks (worthless coins) — the UI marks them and can hide them.
+/// True for chains that are test networks (worthless coins) - the UI marks them and can hide them.
 pub fn is_testnet(chain_id: u64) -> bool {
     matches!(chain_id, 11155111 | 17000)
+}
+
+/// Whether this chain is in the table above, i.e. the wallet knows its coin, explorer and gas model.
+/// Used to refuse bridging to a chain the wallet could not afterwards display the funds on.
+pub fn is_known(chain_id: u64) -> bool {
+    CHAINS.iter().any(|c| c.chain_id == chain_id)
 }
 
 // ---- Keyless swap-router support (multi-router aggregator) --------------------------------
@@ -213,7 +231,7 @@ pub fn chain_info(chain_id: u64) -> ChainInfo {
             name: "Unknown",
             native_symbol: "ETH",
             coingecko_id: "ethereum",
-            blockscout_base: None,
+            explorers: &[],
             dexscreener_slug: None,
             legacy_gas: false,
             cow_network: None,

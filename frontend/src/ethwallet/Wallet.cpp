@@ -24,7 +24,7 @@ QString takeString(char *s) {
 
 // Like takeString, but for SECRET material (mnemonic / private key): the core buffer is zeroized on
 // free so the plaintext doesn't linger in freed heap. (The returned QString is still un-scrubbed Qt
-// heap — the reveal dialogs clear it + auto-clear the clipboard — but this closes the Rust-side leak.)
+// heap - the reveal dialogs clear it + auto-clear the clipboard - but this closes the Rust-side leak.)
 QString takeSecretString(char *s) {
     if (!s) return QString();
     QString out = QString::fromUtf8(s);
@@ -47,12 +47,15 @@ Wallet::Wallet(AeroWallet *core, QObject *parent)
     : QObject(parent), m_core(core) {
     // Bound how many Tor requests run at once. Enough for all the essential refreshes (balances,
     // history, native price, market prices, fees, fiat, NFTs) to run together, while queuing the
-    // non-essential burst (per-token liquidity checks, NFT/logo image fetches) right behind them —
+    // non-essential burst (per-token liquidity checks, NFT/logo image fetches) right behind them -
     // so one SOCKS proxy isn't flooded with dozens of simultaneous circuits.
     m_netPool.setMaxThreadCount(8);
     // History gets its own small lane so its per-account fan-out can't monopolise the essentials'
     // threads (balances/prices/fees/block).
     m_historyPool.setMaxThreadCount(3);
+    // Exchange actions get their own lane so a button press is never queued behind a refresh. Two
+    // threads is enough for the one action at a time the UI allows, plus room for a cancel alongside.
+    m_tradePool.setMaxThreadCount(2);
 }
 
 Wallet::~Wallet() {
@@ -63,6 +66,8 @@ Wallet::~Wallet() {
     m_netPool.waitForDone();
     m_historyPool.clear();
     m_historyPool.waitForDone();
+    m_tradePool.clear();
+    m_tradePool.waitForDone();
     if (m_core) {
         QWriteLocker lock(&m_coreLock);
         aero_wallet_free(m_core);
@@ -88,7 +93,7 @@ QString Wallet::address(quint32 index) const {
             return it.value();
     }
     // Cache miss. NEVER block the (usually UI) caller on the core lock: a scan holds it exclusively
-    // for minutes, and address() is called all over the UI — labels, the Receive QR, and especially
+    // for minutes, and address() is called all over the UI - labels, the Receive QR, and especially
     // applyReceiveSearch() which derives EVERY visible row on each keystroke. A blocking read here
     // froze the whole window whenever any of those ran during a scan. Try to read without waiting; if
     // a writer holds the lock, return empty. Addresses are warmed off-thread (warmAddresses, which
@@ -127,7 +132,7 @@ void Wallet::invalidateMetaCache() {
     m_numAccountsCache = -1;
     // NOTE: the TOKENS cache is intentionally NOT cleared here. Adding an HD account, importing a key,
     // and a funded scan all change the account COUNT but NOT the tracked-token list. Clearing the
-    // tokens cache on those operations forced the next tokens() call to re-read under the core lock —
+    // tokens cache on those operations forced the next tokens() call to re-read under the core lock -
     // which BLOCKS the UI thread whenever a scan holds the write lock (a balance-update signal ->
     // showCachedBalance() -> tokens() froze the whole app for the entire multi-minute scan). Only
     // addToken()/removeToken() actually change tokens; they clear this cache explicitly.
@@ -159,7 +164,7 @@ quint32 Wallet::numAccounts() const {
     m_coreLock.unlock();
     QMutexLocker c(&m_metaCacheMutex);
     m_numAccountsLast = static_cast<int>(n);
-    if (m_metaGen == gen) // no mutation raced us — safe to cache
+    if (m_metaGen == gen) // no mutation raced us - safe to cache
         m_numAccountsCache = static_cast<int>(n);
     return n;
 }
@@ -177,7 +182,7 @@ quint32 Wallet::addAccount() {
 
 void Wallet::addAccountAsync() {
     // Run on the GLOBAL pool, not m_netPool: deriving the next account is a quick local op and must
-    // not queue behind the network tasks (e.g. a large history fan-out) sitting in m_netPool — that
+    // not queue behind the network tasks (e.g. a large history fan-out) sitting in m_netPool - that
     // would delay the new address. Any core-lock wait happens on this worker thread, never the UI.
     QtConcurrent::run([this]() {
         quint32 idx;
@@ -188,7 +193,7 @@ void Wallet::addAccountAsync() {
         // NOTE: do NOT clear the whole address cache here. Appending an HD account does not change
         // any existing index's address (derivation is deterministic per index), and clearing it made
         // the subsequent rebuildAccountCombos() re-derive ALL accounts synchronously on the UI thread
-        // — a multi-second freeze once a wallet has hundreds of funded accounts. The new index simply
+        // - a multi-second freeze once a wallet has hundreds of funded accounts. The new index simply
         // isn't cached yet and gets derived once on first access. Only the count cache must refresh.
         invalidateMetaCache();
         QMetaObject::invokeMethod(this, [this, idx]() { emit accountAdded(idx); },
@@ -229,7 +234,7 @@ QString Wallet::resolveEns(const QString &name) {
 }
 
 QString Wallet::verifyMessage(const QString &message, const QString &signature) {
-    // Pure recovery — doesn't touch the core wallet, so no lock needed.
+    // Pure recovery - doesn't touch the core wallet, so no lock needed.
     char *j = aero_wallet_verify_message(message.toUtf8().constData(),
                                          signature.toUtf8().constData());
     if (!j) {
@@ -400,6 +405,10 @@ void Wallet::saveAsync() {
     });
 }
 
+void Wallet::setHistoryApis(quint64 chainId, const QString &csv) {
+    aero_set_history_apis(chainId, csv.toUtf8().constData());
+}
+
 bool Wallet::setProvider(quint64 chainId, const QStringList &endpoints, const QString &socksProxy) {
     m_chainId = chainId;
     QJsonArray arr;
@@ -429,8 +438,8 @@ void Wallet::connectProvider(quint64 chainId, const QStringList &endpoints, cons
         // A direct connection must explicitly allow clearnet (the core refuses otherwise).
         //
         // set_provider is swapped under a brief EXCLUSIVE write lock (a single fast FFI call), but the
-        // connectivity probe — which can block up to the RPC timeout when Tor is still bootstrapping /
-        // unreachable — runs under a SHARED read lock. Reads on the UI thread (address(), tokens(),
+        // connectivity probe - which can block up to the RPC timeout when Tor is still bootstrapping /
+        // unreachable - runs under a SHARED read lock. Reads on the UI thread (address(), tokens(),
         // balances) are also shared reads, so they no longer block behind a stuck connect: this was
         // the "Aero not responding" freeze whenever Tor was slow or down.
         auto tryMode = [&](const QString &proxy) -> bool {
@@ -438,7 +447,7 @@ void Wallet::connectProvider(quint64 chainId, const QStringList &endpoints, cons
                 QWriteLocker lock(&m_coreLock);
                 const QByteArray p = proxy.toUtf8();
                 // allow_clearnet is ALWAYS false: with no proxy the core permits ONLY local endpoints
-                // (127.0.0.1 / localhost — your own node) and refuses remote ones, so blanking the
+                // (127.0.0.1 / localhost - your own node) and refuses remote ones, so blanking the
                 // proxy while public RPCs are still configured can't silently leak the real IP.
                 const int rc = aero_wallet_set_provider(m_core, chainId, endpointsJson.constData(),
                                                         proxy.isEmpty() ? nullptr : p.constData(),
@@ -454,24 +463,24 @@ void Wallet::connectProvider(quint64 chainId, const QStringList &endpoints, cons
             return true;
         };
 
-        // Tor only — no clearnet fallback, so a failed Tor connection never silently leaks the IP.
+        // Tor only - no clearnet fallback, so a failed Tor connection never silently leaks the IP.
         int mode = 0;
         QString message;
         if (!socksProxy.isEmpty() && tryMode(socksProxy)) {
             mode = 2;
             message = tr("Connected via Tor");
         } else if (socksProxy.isEmpty() && tryMode(QString())) {
-            // The user explicitly disabled Tor (blank proxy) — typically to reach their own node
+            // The user explicitly disabled Tor (blank proxy) - typically to reach their own node
             // (e.g. http://127.0.0.1:8545). Connect directly. We only do this when the proxy was
             // deliberately left blank, never as a silent clearnet fallback for the default RPCs.
             mode = 1;
-            message = tr("Connected (direct — own node)");
+            message = tr("Connected (direct - own node)");
         } else {
             mode = 0;
             message = takeLastError();
             if (message.isEmpty())
-                message = socksProxy.isEmpty() ? tr("Offline — node unreachable")
-                                               : tr("Offline — no RPC reachable over Tor");
+                message = socksProxy.isEmpty() ? tr("Offline - node unreachable")
+                                               : tr("Offline - no RPC reachable over Tor");
         }
 
         m_chainId = chainId;
@@ -756,7 +765,7 @@ void Wallet::refreshHistoryAll(quint32 numAccounts, quint32 priorityIndex) {
 
 void Wallet::refreshAccountHistory(quint32 accountIndex) {
     // One account's full history, on the dedicated history pool (Background-gated in the core so it
-    // yields the Tor circuit to interactive work). Appended by the caller — no model clear — so this
+    // yields the Tor circuit to interactive work). Appended by the caller - no model clear - so this
     // is the primitive for lazy/on-demand and status-gated refresh (Electrum's per-address model).
     QtConcurrent::run(&m_historyPool, [this, accountIndex]() {
         QVector<HistoryItem> part;
@@ -990,7 +999,7 @@ QVector<TokenInfo> Wallet::tokens() const {
     // Cache miss. NEVER block the UI thread on the core lock (a scan holds it exclusively for minutes:
     // a balance-update signal -> showCachedBalance() -> tokens() would otherwise freeze the whole app).
     // Try to read without waiting; if a writer holds the lock, return the last-known tokens (stale is
-    // fine — the tracked list rarely changes; the next call after the writer refreshes it).
+    // fine - the tracked list rarely changes; the next call after the writer refreshes it).
     if (!m_coreLock.tryLockForRead()) {
         QMutexLocker c(&m_metaCacheMutex);
         return m_tokensCache;
@@ -1011,7 +1020,7 @@ QVector<TokenInfo> Wallet::tokens() const {
     m_coreLock.unlock();
     {
         QMutexLocker c(&m_metaCacheMutex);
-        if (m_metaGen == gen) { // no mutation raced us — safe to cache
+        if (m_metaGen == gen) { // no mutation raced us - safe to cache
             m_tokensCache = out;
             m_tokensCacheValid = true;
         }
@@ -1282,7 +1291,7 @@ QString Wallet::parseUnits(const QString &amount, quint8 decimals) {
 
 // ---------------------------------------------------------------------------------------------
 // CoW Protocol swaps. All run on the bounded net pool. The Rust methods borrow the wallet as
-// `&self` (they sign with a borrowed key; no struct mutation), so a shared read lock is correct —
+// `&self` (they sign with a borrowed key; no struct mutation), so a shared read lock is correct -
 // same as commitTransaction.
 
 void Wallet::swapQuote(quint32 fromIndex, const QString &sellToken, const QString &buyToken,
@@ -1415,7 +1424,7 @@ void Wallet::defillamaPrices(const QString &coinsCsv) {
 
 // ---------------------------------------------------------------------------------------------
 // Multi-router swap aggregator. All borrow the wallet as &self (sign with a borrowed key), so a
-// shared read lock is correct — same as commitTransaction.
+// shared read lock is correct - same as commitTransaction.
 
 void Wallet::swapQuotes(quint32 fromIndex, const QString &sell, const QString &buy,
                         const QString &sellAmountWei, bool sellIsNative, quint8 sellDecimals,
@@ -1510,6 +1519,173 @@ void Wallet::routerSwap(quint32 fromIndex, const QString &to, const QString &val
 }
 
 // --- Across cross-chain bridge -------------------------------------------------------------------
+
+void Wallet::acrossAssets() {
+    QtConcurrent::run(&m_netPool, [this]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_across_assets(m_core);
+        QString json, err;
+        if (res)
+            json = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, json, err]() { emit acrossAssetsReady(json, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+// --- Hyperliquid (XMR1) --------------------------------------------------------------------------
+
+void Wallet::hlOverview(quint32 index) {
+    QtConcurrent::run(&m_netPool, [this, index]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_hl_overview(m_core, index);
+        QString json, err;
+        if (res)
+            json = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this,
+                                  [this, index, json, err]() {
+                                      emit hlOverviewReady(index, json, err);
+                                  },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::hlAgentReady(quint32 index) {
+    QtConcurrent::run(&m_netPool, [this, index]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_hl_agent_ready(m_core, index);
+        bool ready = false;
+        QString err;
+        if (res)
+            ready = QJsonDocument::fromJson(takeString(res).toUtf8()).object()
+                        .value("ready").toBool();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, ready, err]() { emit hlAgentReadyResult(ready, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::hlApproveAgent(quint32 index) {
+    QtConcurrent::run(&m_tradePool, [this, index]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_hl_approve_agent(m_core, index);
+        QString err;
+        if (res)
+            takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, err]() { emit hlAgentApproved(err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::hlPlaceOrder(quint32 index, bool isBuy, double price, double size, bool marketOrder) {
+    QtConcurrent::run(&m_tradePool, [this, index, isBuy, price, size, marketOrder]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_hl_place_order(m_core, index, isBuy, price, size, marketOrder);
+        QString json, err;
+        if (res)
+            json = takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, json, err]() { emit hlOrderPlaced(json, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::hlCancelOrder(quint32 index, quint64 oid) {
+    QtConcurrent::run(&m_tradePool, [this, index, oid]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_hl_cancel_order(m_core, index, oid);
+        QString err;
+        if (res)
+            takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, err]() { emit hlOrderCancelled(err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::hlDeposit(quint32 index, const QString &amountUsdc) {
+    QtConcurrent::run(&m_tradePool, [this, index, amountUsdc]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_hl_deposit(m_core, index, amountUsdc.toUtf8().constData());
+        QString txHash, err;
+        if (res)
+            txHash = QJsonDocument::fromJson(takeString(res).toUtf8()).object()
+                         .value("tx_hash").toString();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, txHash, err]() { emit hlDeposited(txHash, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::hlWithdraw(quint32 index, const QString &amountUsdc) {
+    QtConcurrent::run(&m_tradePool, [this, index, amountUsdc]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_hl_withdraw(m_core, index, amountUsdc.toUtf8().constData());
+        QString err;
+        if (res)
+            takeString(res);
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, err]() { emit hlWithdrawn(err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::xmrRedeemQuote(quint32 index, const QString &amountXmr1) {
+    QtConcurrent::run(&m_netPool, [this, index, amountXmr1]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_xmr_redeem_quote(m_core, index, amountXmr1.toUtf8().constData());
+        QJsonObject quote;
+        QString err;
+        if (res)
+            quote = QJsonDocument::fromJson(takeString(res).toUtf8()).object();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, quote, err]() { emit xmrRedeemQuoted(quote, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::xmrRedeem(quint32 index, const QString &moneroAddress, const QString &amountXmr1) {
+    QtConcurrent::run(&m_tradePool, [this, index, moneroAddress, amountXmr1]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_xmr_redeem(m_core, index, moneroAddress.toUtf8().constData(),
+                                           amountXmr1.toUtf8().constData());
+        QJsonObject order;
+        QString err;
+        if (res)
+            order = QJsonDocument::fromJson(takeString(res).toUtf8()).object();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, order, err]() { emit xmrRedeemed(order, err); },
+                                  Qt::QueuedConnection);
+    });
+}
+
+void Wallet::xmrRedeemStatus(const QString &orderId, const QString &sessionId) {
+    QtConcurrent::run(&m_netPool, [this, orderId, sessionId]() {
+        QReadLocker lock(&m_coreLock);
+        char *res = aero_wallet_xmr_redeem_status(m_core, orderId.toUtf8().constData(),
+                                                  sessionId.toUtf8().constData());
+        QJsonObject status;
+        QString err;
+        if (res)
+            status = QJsonDocument::fromJson(takeString(res).toUtf8()).object();
+        else
+            err = takeLastError();
+        QMetaObject::invokeMethod(this, [this, status, err]() { emit xmrRedeemStatusReady(status, err); },
+                                  Qt::QueuedConnection);
+    });
+}
 
 void Wallet::acrossQuote(quint32 fromIndex, const QString &symbol, quint64 destChainId,
                          const QString &amountWei) {

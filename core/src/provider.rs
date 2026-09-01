@@ -11,7 +11,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -47,7 +47,7 @@ fn current_priority() -> Priority {
 }
 
 /// Set once when the app is closing. Long-running background loops (the funded scan, the per-account
-/// history fetch) poll this and bail out promptly so they release the core lock — otherwise the
+/// history fetch) poll this and bail out promptly so they release the core lock - otherwise the
 /// blocking flush/save in the GUI's closeEvent would wait on an in-flight multi-minute scan/history
 /// (made longer by rate-limit backoff), freezing the window so the X button appears to hang.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -82,7 +82,7 @@ pub async fn interruptible_sleep(d: Duration) {
 /// image HTTP) takes a permit here first.
 static TOTAL: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(20));
 /// Sub-cap on `Background` requests. Background work must first take a slot here, THEN a TOTAL slot,
-/// so at most this many bulk requests ever compete for TOTAL at once — leaving `TOTAL - BG` slots
+/// so at most this many bulk requests ever compete for TOTAL at once - leaving `TOTAL - BG` slots
 /// that only Interactive work contends for. That's what stops a burst of dozens of scan/history
 /// requests from queuing ahead of the fee/balance refresh the user is actually waiting on.
 static BG: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(ISO_CIRCUITS));
@@ -256,13 +256,107 @@ pub struct RpcProvider {
     /// Pool of clients on ISOLATED Tor circuits (distinct SOCKS auth => distinct exit IP). Bulk,
     /// per-address HTTP GETs (block-explorer history, price APIs) round-robin across these so that
     /// many concurrent fetches leave through DIFFERENT exits and don't all trip one exit's per-IP
-    /// rate limit — turning a slow, rate-limited, one-at-a-time history load into a parallel one.
+    /// rate limit - turning a slow, rate-limited, one-at-a-time history load into a parallel one.
     /// Empty when running without Tor (clearnet), in which case the main `http` client is used.
     iso_http: Vec<reqwest::Client>,
     iso_cursor: AtomicUsize,
-    endpoints: Vec<String>,
+    endpoints: Vec<Endpoint>,
     cursor: AtomicUsize,
     chain_id: u64,
+}
+
+/// One JSON-RPC endpoint and what is known about its willingness to answer.
+///
+/// Public endpoints do not fail cleanly. They stay up and start refusing: a rate limit, a daily
+/// quota, a sudden demand for an API key. Remembering that means the next request goes somewhere
+/// else instead of walking back into the same wall, which is the difference between a wallet that
+/// stops working when one provider changes its policy and one that quietly carries on.
+struct Endpoint {
+    url: String,
+    /// Unix milliseconds until which this endpoint is passed over. Zero when healthy.
+    parked_until: AtomicU64,
+    /// Consecutive refusals, so a persistently unhappy endpoint is parked for longer each time.
+    strikes: AtomicUsize,
+}
+
+/// How long an endpoint is passed over after refusing, doubling per consecutive refusal.
+const PARK_BASE: u64 = 30_000;
+const PARK_MAX: u64 = 600_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// What an endpoint said, once it is clear whose fault it was.
+enum Outcome {
+    Ok(Value),
+    /// The endpoint answered about the request itself - a revert, a bad parameter, a transaction the
+    /// chain will not take. Every other endpoint would say the same thing, so asking them is a waste
+    /// of round trips and shows the query to more servers than necessary.
+    Rejected(CoreError),
+    /// The endpoint declined to serve this caller at all: a rate limit, a quota, a demand for an API
+    /// key, a gateway error, a dead host. Says nothing about the request, so somewhere else is worth
+    /// asking.
+    Unavailable(CoreError),
+}
+
+/// Whether an HTTP status is the server declining to serve this caller rather than answering them.
+///
+/// 429 is the plain rate limit; 403 is the same thing dressed as a permission problem, which is how
+/// Cloudflare turns Tor exits away; 408 and 5xx are the server or the hop in front of it failing.
+/// Everything else, including a 400 or a 404, is an answer about the request and belongs to the
+/// caller to interpret.
+fn is_refusal_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || matches!(status.as_u16(), 403 | 408 | 429)
+}
+
+/// Whether an error came from a host declining to serve us, and so is worth another go elsewhere.
+fn is_refusal(e: &CoreError) -> bool {
+    let m = e.to_string();
+    m.contains("refused: ") || m.contains("http get failed") || m.contains("http post failed")
+}
+
+/// Whether a JSON-RPC error describes the request rather than the server's willingness to answer it.
+///
+/// Deliberately a list of things known to be about the request, with everything else treated as the
+/// endpoint's problem. The alternative - listing the ways a server can say "no" - has to be extended
+/// every time a provider invents new wording, and being wrong that way is what leaves a wallet
+/// showing "rate limit reached" with three working endpoints it never tried.
+fn is_about_the_request(message: &str) -> bool {
+    const REQUEST_FAULTS: &[&str] = &[
+        "execution reverted",
+        "revert",
+        "insufficient funds",
+        "insufficient balance",
+        "nonce too low",
+        "nonce too high",
+        "invalid nonce",
+        "already known",
+        "already imported",
+        "transaction underpriced",
+        "replacement transaction",
+        "fee cap",
+        "max fee per gas",
+        "tip higher than fee cap",
+        "intrinsic gas",
+        "exceeds block gas limit",
+        "gas required exceeds",
+        "out of gas",
+        "invalid params",
+        "invalid argument",
+        "invalid sender",
+        "invalid signature",
+        "invalid opcode",
+        "transaction type not supported",
+        "oversized data",
+        "future transaction",
+        "known transaction",
+    ];
+    let m = message.to_lowercase();
+    REQUEST_FAULTS.iter().any(|f| m.contains(f))
 }
 
 /// How many isolated Tor circuits to spread bulk GETs over.
@@ -340,7 +434,15 @@ impl RpcProvider {
             http,
             iso_http,
             iso_cursor: AtomicUsize::new(0),
-            endpoints: cfg.endpoints.clone(),
+            endpoints: cfg
+                .endpoints
+                .iter()
+                .map(|url| Endpoint {
+                    url: url.clone(),
+                    parked_until: AtomicU64::new(0),
+                    strikes: AtomicUsize::new(0),
+                })
+                .collect(),
             cursor: AtomicUsize::new(0),
             chain_id: cfg.chain_id,
         })
@@ -360,21 +462,54 @@ impl RpcProvider {
         self.chain_id
     }
 
-    // Sticky endpoint: keep using the SAME endpoint across calls (like Feather/Electrum use one node
-    // per session) so the Tor stream + TLS connection are reused via keep-alive, instead of opening a
-    // fresh circuit-hop to a different host on every request. We only move off it on failure
-    // (advance_endpoint), so a flaky endpoint is abandoned but a healthy one is stuck to.
-    fn current_endpoint(&self) -> &str {
-        let i = self.cursor.load(Ordering::Relaxed) % self.endpoints.len();
-        &self.endpoints[i]
+    /// The order to try endpoints in for one request: the sticky one first, then the rest, with
+    /// anything currently parked pushed to the back rather than dropped. Parked endpoints are still
+    /// tried as a last resort, because a stale park must never be the reason a wallet has no network
+    /// at all.
+    ///
+    /// The order starts at the same endpoint across calls (as Feather and Electrum use one node per
+    /// session) so the Tor stream and TLS connection are reused via keep-alive, rather than opening a
+    /// fresh circuit-hop to a different host every time. The pointer only moves off an endpoint that
+    /// failed, so a flaky one is abandoned and a healthy one is stuck to.
+    fn attempt_order(&self) -> Vec<usize> {
+        let n = self.endpoints.len();
+        let start = self.cursor.load(Ordering::Relaxed) % n;
+        let now = now_ms();
+        let mut ready = Vec::with_capacity(n);
+        let mut parked = Vec::new();
+        for k in 0..n {
+            let i = (start + k) % n;
+            if self.endpoints[i].parked_until.load(Ordering::Relaxed) > now {
+                parked.push(i);
+            } else {
+                ready.push(i);
+            }
+        }
+        ready.extend(parked);
+        ready
     }
 
-    fn advance_endpoint(&self) {
-        self.cursor.fetch_add(1, Ordering::Relaxed);
+    /// Remember that this endpoint answered, and stick to it.
+    fn mark_healthy(&self, i: usize) {
+        self.endpoints[i].strikes.store(0, Ordering::Relaxed);
+        self.endpoints[i].parked_until.store(0, Ordering::Relaxed);
+        self.cursor.store(i, Ordering::Relaxed);
+    }
+
+    /// Remember that this endpoint would not serve us, and for how long to leave it alone.
+    fn park(&self, i: usize) {
+        let strikes = self.endpoints[i].strikes.fetch_add(1, Ordering::Relaxed) + 1;
+        let backoff = PARK_BASE
+            .saturating_mul(1u64 << strikes.min(5) as u64)
+            .min(PARK_MAX);
+        self.endpoints[i].parked_until.store(now_ms() + backoff, Ordering::Relaxed);
+        // Move the sticky pointer along so the next request starts somewhere else even if this one
+        // ends up succeeding on a later endpoint.
+        self.cursor.store((i + 1) % self.endpoints.len(), Ordering::Relaxed);
     }
 
     /// GET a URL and parse it as JSON, reusing the same (Tor-proxied) HTTP client. Used for the
-    /// market price API — routed through Tor so the price lookup can't be tied to the user's IP.
+    /// market price API - routed through Tor so the price lookup can't be tied to the user's IP.
     /// GET raw bytes (e.g. an NFT thumbnail) over the same Tor-proxied client, so fetching remote
     /// images can't be tied to the user's IP.
     pub async fn http_get_bytes(&self, url: &str) -> Result<Vec<u8>> {
@@ -388,6 +523,11 @@ impl RpcProvider {
             .await
             .map_err(|e| CoreError::rpc(format!("image get failed: {e}")))?;
         let status = resp.status();
+        // Without this, a rate limit's HTML apology is handed back as though it were a picture, and
+        // whatever the decoder makes of that gets cached as the token's artwork.
+        if !status.is_success() {
+            return Err(CoreError::rpc(format!("image get failed: {status}")));
+        }
         let bytes = resp
             .bytes()
             .await
@@ -396,22 +536,59 @@ impl RpcProvider {
     }
 
     /// GET+parse JSON over the STABLE (sticky) Tor circuit. Used for APIs that are Tor-hostile and/or
-    /// stateful — DEX router quotes (CoW/Kyber/Odos/ParaSwap/OpenOcean), the CoW order book, and price
+    /// stateful - DEX router quotes (CoW/Kyber/Odos/ParaSwap/OpenOcean), the CoW order book, and price
     /// feeds. Those often block or rate-limit random Tor exits behind Cloudflare, so rotating circuits
     /// (see http_get_json_isolated) made them fail intermittently; a single consistent circuit is far
     /// more reliable, and these are only a handful of requests (not the per-address history fan-out).
     pub async fn http_get_json(&self, url: &str) -> Result<Value> {
+        // These are single-host APIs - a price feed, a router, an exchange - with nowhere to fail
+        // over to, so a refusal gets a second and third chance instead. The retry goes over an
+        // isolated circuit, which means a different Tor exit and usually a different rate-limit
+        // bucket: the reason these get refused at all is that thousands of people share the handful
+        // of exits in front of them.
+        let mut last = CoreError::rpc("no attempt made");
+        for attempt in 0..3u32 {
+            let client = if attempt == 0 { &self.http } else { self.iso_client() };
+            match self.get_json_with(client, url, &[]).await {
+                Ok(v) => return Ok(v),
+                Err(e) if !is_refusal(&e) => return Err(e),
+                Err(e) => last = e,
+            }
+            if shutting_down() {
+                break;
+            }
+            interruptible_sleep(Duration::from_millis(400 << attempt)).await;
+        }
+        Err(last)
+    }
+
+    /// GET and parse JSON with `client`, treating a refusal as a failure rather than as data.
+    ///
+    /// The distinction matters more than it looks. A rate limit usually arrives as a perfectly valid
+    /// JSON body with an HTTP 429 on it, and callers up the stack read a missing field as "nothing
+    /// here" - so a refused balance lookup became a balance of zero, and a refused price became a
+    /// price of nothing. Failing here means those read as errors, which is what they are.
+    async fn get_json_with(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Value> {
         let w0 = Instant::now();
         let _gate = gate().await; // priority-aware Tor concurrency gate
         let _probe = ReqProbe::begin(format!("GET  {}", host_of(url)), w0.elapsed());
-        let resp = self
-            .http
-            .get(url)
-            .header("accept", "application/json")
+        let mut req = client.get(url).header("accept", "application/json");
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| CoreError::rpc(format!("http get failed: {e}")))?;
         let status = resp.status();
+        if is_refusal_status(status) {
+            return Err(CoreError::rpc(format!("{} refused: {status}", host_of(url))));
+        }
         resp.json()
             .await
             .map_err(|e| CoreError::rpc(format!("bad json ({status}): {e}")))
@@ -421,31 +598,45 @@ impl RpcProvider {
     /// bulk, per-address block-explorer history fan-out, where hundreds of requests to one endpoint
     /// would otherwise share and rate-limit against a single exit IP. Do NOT use for router/price APIs.
     pub async fn http_get_json_isolated(&self, url: &str) -> Result<Value> {
-        let w0 = Instant::now();
-        let _gate = gate().await;
-        let _probe = ReqProbe::begin(format!("GET  {}", host_of(url)), w0.elapsed());
-        let resp = self
-            .iso_client()
-            .get(url)
-            .header("accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| CoreError::rpc(format!("http get failed: {e}")))?;
-        let status = resp.status();
-        resp.json()
-            .await
-            .map_err(|e| CoreError::rpc(format!("bad json ({status}): {e}")))
+        // No retry here: the caller (the explorer paging loop) already backs off and, now, moves to
+        // a different explorer entirely, which is a better answer than asking the same one again.
+        self.get_json_with(self.iso_client(), url, &[]).await
     }
 
-    /// POST a JSON body (over the same Tor client) and return the parsed JSON response. The body is
-    /// returned even for non-2xx statuses so callers (e.g. the CoW order-book API) can read the
-    /// structured error object.
+    /// POST a JSON body (over the same Tor client) and return the parsed JSON response.
+    ///
+    /// A 4xx body is still returned, because for these APIs it carries the answer: CoW explains a
+    /// rejected order in the body of a 400, and Hyperliquid explains a rejected order in the body of
+    /// a 422. A refusal is different - there is no answer in it, only "not you, not now" - so it
+    /// fails, and is retried on a fresh circuit rather than handed upwards as though the exchange had
+    /// said something.
     pub async fn http_post_json(&self, url: &str, body: &Value) -> Result<Value> {
+        let mut last = CoreError::rpc("no attempt made");
+        for attempt in 0..3u32 {
+            let client = if attempt == 0 { &self.http } else { self.iso_client() };
+            match self.post_json_with(client, url, body).await {
+                Ok(v) => return Ok(v),
+                Err(e) if !is_refusal(&e) => return Err(e),
+                Err(e) => last = e,
+            }
+            if shutting_down() {
+                break;
+            }
+            interruptible_sleep(Duration::from_millis(400 << attempt)).await;
+        }
+        Err(last)
+    }
+
+    async fn post_json_with(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        body: &Value,
+    ) -> Result<Value> {
         let w0 = Instant::now();
         let _gate = gate().await; // priority-aware Tor concurrency gate
         let _probe = ReqProbe::begin(format!("POST {}", host_of(url)), w0.elapsed());
-        let resp = self
-            .http
+        let resp = client
             .post(url)
             .header("content-type", "application/json")
             .header("accept", "application/json")
@@ -454,12 +645,44 @@ impl RpcProvider {
             .await
             .map_err(|e| CoreError::rpc(format!("http post failed: {e}")))?;
         let status = resp.status();
+        if is_refusal_status(status) {
+            return Err(CoreError::rpc(format!("{} refused: {status}", host_of(url))));
+        }
         let text = resp
             .text()
             .await
             .map_err(|e| CoreError::rpc(format!("http post read failed ({status}): {e}")))?;
         serde_json::from_str(&text)
             .map_err(|e| CoreError::rpc(format!("bad json ({status}): {e}")))
+    }
+
+    /// GET+parse JSON with extra request headers, over the stable Tor circuit.
+    ///
+    /// Exists for APIs that carry a per-request credential in a header rather than the URL - Wagyu's
+    /// bridge puts an order's session token in `x-session-id` precisely so it never lands in a query
+    /// string, where it would end up in logs and history.
+    pub async fn http_get_json_with_headers(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Value> {
+        // Retried like the other single-host GETs. This one tracks the progress of a redemption
+        // whose funds are already on their way, so "the server was busy" must not be allowed to look
+        // like "your order is gone".
+        let mut last = CoreError::rpc("no attempt made");
+        for attempt in 0..3u32 {
+            let client = if attempt == 0 { &self.http } else { self.iso_client() };
+            match self.get_json_with(client, url, headers).await {
+                Ok(v) => return Ok(v),
+                Err(e) if !is_refusal(&e) => return Err(e),
+                Err(e) => last = e,
+            }
+            if shutting_down() {
+                break;
+            }
+            interruptible_sleep(Duration::from_millis(400 << attempt)).await;
+        }
+        Err(last)
     }
 
     /// Perform a single JSON-RPC call. Tries each endpoint once on transport failure.
@@ -471,49 +694,77 @@ impl RpcProvider {
             "params": params,
         });
 
+        let mut refusals = 0usize;
         let mut last_err = CoreError::rpc("no endpoints");
-        for attempt in 0..self.endpoints.len() {
-            if attempt > 0 {
-                self.advance_endpoint(); // previous endpoint failed — try the next one
-            }
-            let url = self.current_endpoint().to_string();
+        for i in self.attempt_order() {
+            let url = self.endpoints[i].url.clone();
             match self.try_call(&url, &body).await {
-                Ok(Ok(v)) => return Ok(v),
-                // A valid JSON-RPC error (revert, bad params, etc.) is a definitive answer, NOT a
-                // transport failure — return it immediately instead of replaying the query to every
-                // other endpoint (fewer requests, fewer servers see the query).
-                Ok(Err(app_err)) => return Err(app_err),
-                Err(transport) => last_err = transport, // try the next endpoint
+                Outcome::Ok(v) => {
+                    self.mark_healthy(i);
+                    return Ok(v);
+                }
+                // The endpoint answered about the request, not about us. Every other endpoint would
+                // say the same, so return it rather than replaying the query across the internet.
+                Outcome::Rejected(e) => return Err(e),
+                // The endpoint would not serve us. Park it and ask the next one - this is the whole
+                // point of configuring several, and returning here is what used to leave the wallet
+                // reporting a rate limit while three working endpoints sat unused.
+                Outcome::Unavailable(e) => {
+                    self.park(i);
+                    refusals += 1;
+                    last_err = e;
+                }
             }
         }
-        Err(last_err)
+        Err(if refusals > 1 {
+            CoreError::rpc(format!(
+                "every network endpoint refused or failed to answer ({refusals} tried). \
+                 They may be rate-limiting this connection; it usually clears on its own, or set \
+                 your own node under Settings > Node. Last reply: {last_err}"
+            ))
+        } else {
+            last_err
+        })
     }
 
-    // Ok(Ok(result)) = success; Ok(Err(e)) = valid JSON-RPC error response (don't retry);
-    // Err(e) = transport/parse failure (retry the next endpoint).
-    async fn try_call(&self, url: &str, body: &Value) -> Result<std::result::Result<Value, CoreError>> {
+    async fn try_call(&self, url: &str, body: &Value) -> Outcome {
         let w0 = Instant::now();
         let _gate = gate().await; // priority-aware Tor concurrency gate
         let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("rpc");
         let _probe = ReqProbe::begin(format!("RPC  {method} @{}", host_of(url)), w0.elapsed());
-        let resp = self
-            .http
-            .post(url)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| CoreError::rpc(format!("request failed: {e}")))?;
+        let resp = match self.http.post(url).json(body).send().await {
+            Ok(r) => r,
+            Err(e) => return Outcome::Unavailable(CoreError::rpc(format!("request failed: {e}"))),
+        };
         let status = resp.status();
-        let val: Value = resp
-            .json()
-            .await
-            .map_err(|e| CoreError::rpc(format!("bad response ({status}): {e}")))?;
+        // A refusal is often an HTTP status rather than a JSON-RPC error - 429 for a rate limit, 403
+        // for a key demand, 5xx for a gateway having a bad day - and the body is then frequently HTML
+        // that would only produce a parse error.
+        if status.is_server_error() || status.as_u16() == 429 || status.as_u16() == 403 {
+            return Outcome::Unavailable(CoreError::rpc(format!("endpoint returned {status}")));
+        }
+        let val: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Outcome::Unavailable(CoreError::rpc(format!("bad response ({status}): {e}")))
+            }
+        };
         if let Some(err) = val.get("error") {
-            return Ok(Err(CoreError::rpc(format!("rpc error: {err}"))));
+            let message = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            let text = CoreError::rpc(format!("rpc error: {err}"));
+            return if is_about_the_request(&message) {
+                Outcome::Rejected(text)
+            } else {
+                Outcome::Unavailable(text)
+            };
         }
         match val.get("result").cloned() {
-            Some(v) => Ok(Ok(v)),
-            None => Err(CoreError::rpc("response missing result")), // treat as transport-ish, retry
+            Some(v) => Outcome::Ok(v),
+            None => Outcome::Unavailable(CoreError::rpc("response missing result")),
         }
     }
 
@@ -535,14 +786,17 @@ impl RpcProvider {
         );
 
         let mut last_err = CoreError::rpc("no endpoints");
-        for attempt in 0..self.endpoints.len() {
-            if attempt > 0 {
-                self.advance_endpoint(); // previous endpoint failed — try the next one
-            }
-            let url = self.current_endpoint().to_string();
+        for i in self.attempt_order() {
+            let url = self.endpoints[i].url.clone();
             match self.try_call_batch(&url, &body, calls.len()).await {
-                Ok(v) => return Ok(v),
-                Err(e) => last_err = e,
+                Ok(v) => {
+                    self.mark_healthy(i);
+                    return Ok(v);
+                }
+                Err(e) => {
+                    self.park(i);
+                    last_err = e;
+                }
             }
         }
         Err(last_err)
@@ -560,6 +814,9 @@ impl RpcProvider {
             .await
             .map_err(|e| CoreError::rpc(format!("batch request failed: {e}")))?;
         let status = resp.status();
+        if status.is_server_error() || status.as_u16() == 429 || status.as_u16() == 403 {
+            return Err(CoreError::rpc(format!("endpoint returned {status}")));
+        }
         let val: Value = resp
             .json()
             .await
@@ -569,13 +826,27 @@ impl RpcProvider {
             .ok_or_else(|| CoreError::rpc("batch response was not an array"))?;
         // Responses may arrive out of order; place each by its `id` (the request index).
         let mut out = vec![Value::Null; n];
+        let mut errors = 0usize;
+        let mut first_error = String::new();
         for item in arr {
+            if item.get("error").is_some() {
+                errors += 1;
+                if first_error.is_empty() {
+                    first_error = item["error"].to_string();
+                }
+            }
             if let Some(id) = item.get("id").and_then(|v| v.as_u64()) {
                 let idx = id as usize;
                 if idx < n {
                     out[idx] = item.get("result").cloned().unwrap_or(Value::Null);
                 }
             }
+        }
+        // A batch where every call came back an error is the endpoint refusing the batch, not N
+        // separate answers. Returning it as N nulls is how a rate-limited balance refresh used to
+        // read as "this account holds nothing" instead of as a failure worth retrying elsewhere.
+        if errors > 0 && errors == arr.len() {
+            return Err(CoreError::rpc(format!("batch refused: {first_error}")));
         }
         Ok(out)
     }
@@ -587,8 +858,8 @@ impl RpcProvider {
     }
 
     pub async fn get_transaction_count(&self, address: &str) -> Result<Value> {
-        // "pending" (not "latest") so back-to-back sends — an approve immediately followed by a swap,
-        // send-to-many, or speed-up — each get the NEXT nonce and don't collide on the same one.
+        // "pending" (not "latest") so back-to-back sends - an approve immediately followed by a swap,
+        // send-to-many, or speed-up - each get the NEXT nonce and don't collide on the same one.
         self.call("eth_getTransactionCount", json!([address, "pending"]))
             .await
     }
@@ -663,7 +934,246 @@ fn is_local(endpoint: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_local;
+    use super::*;
+
+    #[test]
+    fn a_refusal_is_told_apart_from_a_rejected_request() {
+        // Real wordings from public endpoints. Every one of these must send the wallet to the next
+        // endpoint rather than out to the user as an error: this is what "rate limit reached" with
+        // three untouched endpoints behind it looked like.
+        for refusal in [
+            "rate limit exceeded",
+            "Max rate limit reached",
+            "daily request count exceeded, upgrade your account",
+            "Too Many Requests",
+            "Unauthorized: You must authenticate your request with an API key",
+            "Cannot fulfill request",
+            "capacity exceeded",
+            "your app has exceeded its compute units per second capacity",
+            "the method eth_feeHistory does not exist/is not available",
+            "internal error",
+            "service temporarily unavailable, please try again later",
+            "project ID does not have access to archive state",
+        ] {
+            assert!(!is_about_the_request(refusal), "should have failed over: {refusal}");
+        }
+
+        // These describe the call, and every endpoint would say the same. Replaying them just shows
+        // the query to more servers and slows down the answer the user is waiting for.
+        for rejection in [
+            "execution reverted: ERC20: transfer amount exceeds balance",
+            "insufficient funds for gas * price + value",
+            "nonce too low",
+            "already known",
+            "replacement transaction underpriced",
+            "intrinsic gas too low",
+            "invalid params: invalid argument 0",
+            "gas required exceeds allowance",
+        ] {
+            assert!(is_about_the_request(rejection), "should not have failed over: {rejection}");
+        }
+    }
+
+    #[test]
+    fn a_parked_endpoint_goes_to_the_back_of_the_queue() {
+        let p = RpcProvider::new(&ProviderConfig {
+            chain_id: 1,
+            endpoints: vec![
+                "http://127.0.0.1:1".into(),
+                "http://127.0.0.1:2".into(),
+                "http://127.0.0.1:3".into(),
+            ],
+            socks_proxy: None,
+            allow_clearnet: true,
+            timeout_secs: 5,
+        })
+        .expect("provider");
+
+        assert_eq!(p.attempt_order(), vec![0, 1, 2]);
+
+        // The first endpoint refuses: it drops to last, and the next request starts on the second.
+        p.park(0);
+        assert_eq!(p.attempt_order(), vec![1, 2, 0]);
+
+        // It is still tried as a last resort - a stale park must never mean "no network at all".
+        p.park(1);
+        p.park(2);
+        assert_eq!(p.attempt_order().len(), 3);
+
+        // Answering clears the record and makes it sticky again.
+        p.mark_healthy(2);
+        assert_eq!(p.attempt_order()[0], 2);
+        assert_eq!(p.endpoints[2].strikes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn parking_backs_off_but_stays_bounded() {
+        let p = RpcProvider::new(&ProviderConfig {
+            chain_id: 1,
+            endpoints: vec!["http://127.0.0.1:1".into()],
+            socks_proxy: None,
+            allow_clearnet: true,
+            timeout_secs: 5,
+        })
+        .expect("provider");
+
+        let mut previous = 0u64;
+        for _ in 0..10 {
+            p.park(0);
+            let wait = p.endpoints[0].parked_until.load(Ordering::Relaxed) - now_ms();
+            assert!(wait <= PARK_MAX + 1000, "park must stay bounded, got {wait}ms");
+            previous = wait;
+        }
+        assert!(previous > PARK_BASE, "repeated refusals should back off");
+    }
+
+    /// A one-shot HTTP server on loopback that answers every request with `body`, so the failover
+    /// can be exercised against a rate limit without depending on a real provider being in a bad
+    /// mood.
+    fn serve(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(8) {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn a_rate_limited_endpoint_is_stepped_over_not_reported() {
+        // What the user saw: the first endpoint answers with a limit, and the wallet gave up there
+        // and put that message on screen while the other endpoints sat untouched.
+        let limited = serve(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32029,"message":"rate limit exceeded"}}"#);
+        let working = serve(r#"{"jsonrpc":"2.0","id":1,"result":"0x1234"}"#);
+
+        let p = RpcProvider::new(&ProviderConfig {
+            chain_id: 1,
+            endpoints: vec![limited.clone(), working.clone()],
+            socks_proxy: None,
+            allow_clearnet: true,
+            timeout_secs: 10,
+        })
+        .expect("provider");
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let got = rt.block_on(p.call("eth_blockNumber", json!([]))).expect("should have failed over");
+        assert_eq!(got, json!("0x1234"));
+
+        // And the endpoint that refused is now parked, so the next call starts on the good one
+        // instead of paying for the same refusal again.
+        assert_eq!(p.attempt_order()[0], 1);
+
+        // A revert is the request's own fault and must come straight back, not be replayed around
+        // the internet in the hope that some other node likes it better.
+        let reverting =
+            serve(r#"{"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted"}}"#);
+        let p2 = RpcProvider::new(&ProviderConfig {
+            chain_id: 1,
+            endpoints: vec![reverting, working],
+            socks_proxy: None,
+            allow_clearnet: true,
+            timeout_secs: 10,
+        })
+        .expect("provider");
+        let err = rt
+            .block_on(p2.call("eth_call", json!([])))
+            .expect_err("a revert is an answer");
+        assert!(err.to_string().contains("execution reverted"), "{err}");
+    }
+
+    /// As `serve`, but with a status line of the caller's choosing.
+    fn serve_status(status: &'static str, body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(8) {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn a_refused_http_get_is_an_error_not_an_empty_answer() {
+        let p = RpcProvider::new(&ProviderConfig {
+            chain_id: 1,
+            endpoints: vec!["http://127.0.0.1:1".into()],
+            socks_proxy: None,
+            allow_clearnet: true,
+            timeout_secs: 5,
+        })
+        .expect("provider");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        // A rate limit arrives as a perfectly valid JSON body with a 429 on it. Handed upwards, its
+        // missing fields read as "no balances", "no orders", "no price" - the failure mode that
+        // makes a wallet lie quietly rather than complain loudly.
+        let limited = serve_status("429 Too Many Requests", r#"{"message":"rate limited"}"#);
+        let err = rt
+            .block_on(p.http_get_json(&format!("{limited}/anything")))
+            .expect_err("a refusal is not data");
+        assert!(err.to_string().contains("429"), "{err}");
+
+        // A 400 still comes back, because for these APIs the body of a 400 is the answer: it is how
+        // CoW explains a rejected order and how Hyperliquid explains a rejected size.
+        let rejected = serve_status("400 Bad Request", r#"{"errorType":"InsufficientBalance"}"#);
+        let v = rt
+            .block_on(p.http_get_json(&format!("{rejected}/anything")))
+            .expect("a 400 carries the explanation");
+        assert_eq!(v["errorType"], "InsufficientBalance");
+
+        // And an error page is never mistaken for a picture.
+        let broken = serve_status("503 Service Unavailable", "<html>go away</html>");
+        assert!(rt.block_on(p.http_get_bytes(&format!("{broken}/img.png"))).is_err());
+    }
+
+    #[test]
+    fn a_batch_refused_outright_is_a_failure_not_a_row_of_empty_balances() {
+        // Every sub-call rejected is the endpoint turning the batch away. Read as N nulls, that is a
+        // wallet quietly showing zero balances for a whole page of accounts.
+        let refusing = serve(
+            r#"[{"jsonrpc":"2.0","id":0,"error":{"code":-32005,"message":"limit exceeded"}},
+                {"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"limit exceeded"}}]"#,
+        );
+        let working = serve(r#"[{"jsonrpc":"2.0","id":0,"result":"0x1"},{"jsonrpc":"2.0","id":1,"result":"0x2"}]"#);
+        let p = RpcProvider::new(&ProviderConfig {
+            chain_id: 1,
+            endpoints: vec![refusing, working],
+            socks_proxy: None,
+            allow_clearnet: true,
+            timeout_secs: 10,
+        })
+        .expect("provider");
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let calls = vec![
+            ("eth_getBalance".to_string(), json!([])),
+            ("eth_getBalance".to_string(), json!([])),
+        ];
+        let got = rt.block_on(p.call_batch(&calls)).expect("should have failed over");
+        assert_eq!(got, vec![json!("0x1"), json!("0x2")]);
+    }
 
     #[test]
     fn is_local_only_matches_real_loopback() {

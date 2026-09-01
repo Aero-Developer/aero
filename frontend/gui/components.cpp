@@ -15,7 +15,7 @@ bool aeroIsPortable() {
     //   * launched with --portable (and never with --no-portable), or
     //   * a `portable`/`portable.dat` marker file sits next to the executable, or
     //   * a `wallets` or `config` folder already lives next to the executable (i.e. we've been
-    //     running portably from here before — keeps it sticky even if a marker gets deleted).
+    //     running portably from here before - keeps it sticky even if a marker gets deleted).
     static const bool portable = []() {
         const QStringList args = QCoreApplication::arguments();
         if (args.contains(QStringLiteral("--no-portable")))

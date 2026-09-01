@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Please report security issues **privately** — open a GitHub Security Advisory
+Please report security issues **privately** - open a GitHub Security Advisory
 (`Security → Report a vulnerability`) on this repository rather than a public issue. Include steps
 to reproduce and the affected version/commit. Do not disclose publicly until a fix is available.
 
@@ -17,18 +17,18 @@ Only the latest release receives security fixes. This is pre-1.0 software.
   alone is useless without the password.
 - **Network-level surveillance / IP correlation.** All traffic (RPC, explorer, price, liquidity,
   images) goes through the bundled Tor with `socks5h` (DNS resolved through Tor). There is **no
-  clearnet fallback** — if Tor is unreachable the wallet stays offline rather than leaking your IP.
+  clearnet fallback** - if Tor is unreachable the wallet stays offline rather than leaking your IP.
 - **Telemetry / phone-home.** There is none. No analytics, no update pings, no third-party services
   beyond the keyless public data sources listed below.
 - **Address-poisoning / spam.** History hides zero-value/poisoning transfers, homoglyph-symbol
   tokens, and untrusted ERC-20s below a configurable dust threshold; the send dialog highlights the
   address head/tail so a poisoned look-alike is visible.
-- **Silent data loss.** Wallet saves are atomic (temp + fsync + rename) and imported keys — the only
-  funds not recoverable from the seed — fail loudly if they can't be persisted.
+- **Silent data loss.** Wallet saves are atomic (temp + fsync + rename) and imported keys - the only
+  funds not recoverable from the seed - fail loudly if they can't be persisted.
 
 **What Aero does NOT (and cannot) protect against**
 - A compromised operating system (keyloggers, memory scrapers, malicious clipboard readers).
-- A weak wallet password — the KDF raises the cost but can't save a trivial password.
+- A weak wallet password - the KDF raises the cost but can't save a trivial password.
 - **Data-correctness trust in the RPC/explorer.** A light wallet trusts its RPC endpoint for
   balances/nonces/gas and the block explorer for history. Aero rotates across multiple keyless
   endpoints so no single one sees all requests, and it can point at your **own node** (Settings →

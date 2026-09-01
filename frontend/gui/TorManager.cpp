@@ -22,7 +22,7 @@ TorManager::~TorManager() {
 }
 
 bool TorManager::socksPortOpen() const {
-    // Don't just check that SOMETHING is listening — verify it speaks SOCKS5 before we route all
+    // Don't just check that SOMETHING is listening - verify it speaks SOCKS5 before we route all
     // wallet traffic through it. A bare TCP connect would happily "adopt" a malicious/unrelated local
     // service squatting on our dedicated port; a SOCKS5 greeting/response rejects any non-SOCKS
     // squatter. (Full Tor-identity proof would need the control port; this closes the common case.)
@@ -99,14 +99,14 @@ void TorManager::launchBundled() {
     QDir().mkpath(dataDir);
 
     // We only get here when no Aero Tor is already listening on our port, so any leftover lock file
-    // belongs to a previous Tor that crashed or was killed. Tor refuses to start (exits code 1 —
+    // belongs to a previous Tor that crashed or was killed. Tor refuses to start (exits code 1 -
     // "Another process has locked the data directory") if a stale lock remains, so clear it.
     QFile::remove(QDir(dataDir).filePath(QStringLiteral("lock")));
 
     QStringList args;
     // IsolateSOCKSAuth (Tor default, made explicit): each distinct SOCKS username gets its OWN circuit
     // and exit. Aero uses this to spread bulk per-address fetches (block-explorer history) over many
-    // circuits so they don't all share — and rate-limit against — one exit IP.
+    // circuits so they don't all share - and rate-limit against - one exit IP.
     args << QStringLiteral("--SocksPort")
          << QStringLiteral("%1 IsolateSOCKSAuth").arg(m_socksPort)
          << QStringLiteral("--DataDirectory") << dataDir
@@ -144,7 +144,7 @@ void TorManager::launchBundled() {
                                     ? tr("Tor exited unexpectedly (code %1)").arg(code)
                                     : tr("Tor failed: %1").arg(m_lastError));
                 else {
-                    m_ready = false; // Tor died after being up — let the app recover (auto-reconnect)
+                    m_ready = false; // Tor died after being up - let the app recover (auto-reconnect)
                     emit ended();
                 }
             });

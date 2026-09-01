@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>A free, lightweight, Tor-routed desktop wallet for Ethereum &amp; ERC-20 tokens.</b><br>
-  The look and feel of <a href="https://featherwallet.org">Feather</a> — for Ethereum.
+  The look and feel of <a href="https://featherwallet.org">Feather</a> - for Ethereum.
 </p>
 
 <p align="center">
@@ -31,22 +31,22 @@ it with a small **Rust core** for keys, signing and networking. Everything route
 
 ## Features
 
-- **Lightweight & private** — no bloat, no background sync services, no analytics. All RPC, price,
+- **Lightweight & private** - no bloat, no background sync services, no analytics. All RPC, price,
   history and image traffic goes over **Tor** (bundled `tor.exe`, no clearnet fallback).
-- **Your keys, your coins** — BIP39 seed (12/24 words) with an optional **BIP39 passphrase**
+- **Your keys, your coins** - BIP39 seed (12/24 words) with an optional **BIP39 passphrase**
   (Trezor-Suite-style). Wallet files are encrypted with **Argon2id + AES-256-GCM**.
-- **Hardware wallets** — connect a **Ledger** or **Trezor**; the private keys never leave the
+- **Hardware wallets** - connect a **Ledger** or **Trezor**; the private keys never leave the
   device. The wallet won't open while the device is unplugged.
-- **Multichain** — Ethereum, Arbitrum, Base, Optimism, Polygon, BNB Smart Chain, Gnosis and
+- **Multichain** - Ethereum, Arbitrum, Base, Optimism, Polygon, BNB Smart Chain, Gnosis and
   Avalanche, switchable from the status bar. Same address on every chain.
-- **Full recovery** — restoring a seed scans **every common derivation scheme** (MetaMask/BIP44,
+- **Full recovery** - restoring a seed scans **every common derivation scheme** (MetaMask/BIP44,
   Ledger Live, MEW/legacy, …) with a gap limit, so funds are found regardless of the wallet that
   created them (Electrum-style).
-- **ERC-20 & NFTs** — token balances with logos, a searchable send picker, spam/address-poisoning
+- **ERC-20 & NFTs** - token balances with logos, a searchable send picker, spam/address-poisoning
   filtering with a configurable dust threshold, and an optional NFT tab.
-- **Send / receive** — EIP-1559 fees with Fast/Normal/Slow/Custom tiers (legacy gas on BSC), QR
+- **Send / receive** - EIP-1559 fees with Fast/Normal/Slow/Custom tiers (legacy gas on BSC), QR
   codes, a Feather-style transaction dialog, and desktop notifications for incoming/outgoing txs.
-- **Home dashboard** — XMR/ETH tickers and a combined fiat balance, with selectable display
+- **Home dashboard** - XMR/ETH tickers and a combined fiat balance, with selectable display
   currency and preferred block explorer.
 
 ## Supported networks
@@ -65,6 +65,13 @@ it with a small **Rust core** for keys, signing and networking. Everything route
 Balances, sends and prices work on every chain; transaction history is shown where a keyless
 Blockscout-style explorer exists.
 
+Every one of these services is free and public, which means any of them can rate-limit, break or
+disappear. Aero keeps several RPC endpoints and several explorers per network, parks whichever one
+stops answering and carries on with the next, so a provider having a bad day is not a wallet having
+a bad day. If they all do, **Settings > Node** takes your own RPC endpoint and your own history API -
+anything Etherscan-compatible, including an `api.etherscan.io/v2` URL with your own key, which covers
+every network here and needs no new build.
+
 ## Privacy & trust model
 
 - **Keys** never leave the machine (software wallets) or the device (hardware wallets). The
@@ -80,7 +87,7 @@ Blockscout-style explorer exists.
 ## Download & run (Windows)
 
 Grab a release, unzip, and run `aero_gui.exe` from the portable folder. It bundles Qt, the Rust
-core (`aero_core.dll`) and Tor (`tor/tor.exe`) — nothing to install.
+core (`aero_core.dll`) and Tor (`tor/tor.exe`) - nothing to install.
 
 ```
 dist/aero-portable/
@@ -155,7 +162,7 @@ flowchart TD
     tor --> data["Blockscout / CoinGecko / DexScreener"]
 ```
 
-The frontend never touches the network directly — the Rust core owns all I/O and enforces the
+The frontend never touches the network directly - the Rust core owns all I/O and enforces the
 Tor-only policy.
 
 ## Roadmap / status
@@ -170,8 +177,8 @@ Tor-only policy.
 - [x] Speed-up / cancel pending transactions, pay-to-many, EIP-681 URIs, image QR scan
 - [x] Light/dark theme, historical fiat value in history
 - [ ] Third-party security audit (see `SECURITY.md`)
-- [ ] macOS / Linux release builds (CI in `ci/build.yml` — move to `.github/workflows/` to enable)
-- [ ] **Multisig (planned milestone)** — via Gnosis **Safe** smart accounts: connect/deploy a Safe,
+- [ ] macOS / Linux release builds (CI in `ci/build.yml` - move to `.github/workflows/` to enable)
+- [ ] **Multisig (planned milestone)** - via Gnosis **Safe** smart accounts: connect/deploy a Safe,
   propose/confirm transactions, and collect co-signer signatures off-chain. This is a large,
   standalone feature (Safe contracts + off-chain signature aggregation) and is intentionally out of
   scope for the current single-sig releases.

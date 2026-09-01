@@ -1,4 +1,4 @@
-//! aero_core — the Ethereum wallet backend for the Aero desktop wallet.
+//! aero_core - the Ethereum wallet backend for the Aero desktop wallet.
 //!
 //! This crate replaces Feather's Monero `libwalletqt`/`monero` backend. It provides:
 //!   * BIP39/BIP44 HD key derivation for Ethereum ([`keys`]),
@@ -16,12 +16,16 @@ pub mod across;
 pub mod chains;
 pub mod erc20;
 pub mod error;
+pub mod explorers;
 pub mod ffi;
 pub mod hardware;
+pub mod hyperliquid;
 pub mod keys;
 pub mod keystore;
 pub mod provider;
 pub mod thp;
+pub mod thp_conn;
+pub mod wagyu;
 pub mod wallet;
 
 #[cfg(feature = "helios")]

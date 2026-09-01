@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-// Aero — replaces Feather's Monero WalletManager. Constructs Wallet objects from the
+// Aero - replaces Feather's Monero WalletManager. Constructs Wallet objects from the
 // aero_core C ABI (create new / restore from mnemonic / open encrypted file).
 
 #ifndef AERO_WALLETMANAGER_H

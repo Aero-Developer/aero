@@ -26,7 +26,7 @@ void AddressModel::rebuildVisible() {
                 m_visible.append(i);
         if (!m_visible.isEmpty())
             return;
-        // Fallback: nothing funded yet — show all so there's always an address to receive to.
+        // Fallback: nothing funded yet - show all so there's always an address to receive to.
     }
     for (quint32 i = 0; i < n; ++i)
         m_visible.append(i);
@@ -34,7 +34,7 @@ void AddressModel::rebuildVisible() {
 
 quint32 AddressModel::accountAt(int row) const {
     // Out-of-range rows (e.g. an empty/filtered model) return an INVALID sentinel rather than the raw
-    // row index — otherwise callers would silently act on "account 0"/garbage. static_cast<int> of the
+    // row index - otherwise callers would silently act on "account 0"/garbage. static_cast<int> of the
     // sentinel is -1, so the int-based guards in callers reject it.
     return (row >= 0 && row < m_visible.size()) ? m_visible.at(row) : 0xFFFFFFFFu;
 }

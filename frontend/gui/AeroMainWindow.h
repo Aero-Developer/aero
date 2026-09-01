@@ -9,6 +9,7 @@
 #include <QPixmap>
 #include <QHash>
 #include <QJsonObject>
+#include <QPointer>
 #include <QSet>
 #include <QList>
 
@@ -25,6 +26,7 @@
 #include "TorManager.h"
 
 class QComboBox;
+class QDialog;
 class QGroupBox;
 class QMessageBox;
 class QButtonGroup;
@@ -42,6 +44,7 @@ class QListWidget;
 class QTableWidget;
 class QTreeWidget;
 class QScrollArea;
+class XmrTradeTab;
 
 class AeroMainWindow : public QMainWindow
 {
@@ -141,7 +144,7 @@ private:
     void saveHistoryCache();          // persist the current chain's fetched history (debounced)
     void foldHistoryCacheIntoMeta();  // build history snapshot into m_meta without saving (close path)
     void loadHistoryCache();          // restore the current chain's history instantly (0 requests)
-    void loadHistoricalPrices();      // restore cached per-date prices (immutable) — no re-fetch ever
+    void loadHistoricalPrices();      // restore cached per-date prices (immutable) - no re-fetch ever
     void scheduleHistorySave();       // debounce persisting history after targeted batches arrive
     void primeZeroBalances();         // show 0 immediately for accounts with no known balance yet
     // Run a blocking wallet op (Argon2 save/store, or a core-locked read that may wait behind a
@@ -186,6 +189,22 @@ private:
     void updateSwapPayUsd();               // Swap: refresh the "≈ $X" USD value under "You pay"
     void showRevokeApprovals();            // Tools -> Revoke Token Approvals dialog
     void showBridgeDialog();               // Tools -> Across cross-chain bridge dialog
+    void updateXmrTabEnabled();            // show/hide the Buy XMR tab per wallet kind
+    void showXmrTradeTab();                // Tools -> jump to the Buy XMR tab
+    // A bridge deposit is broadcast asynchronously, so the bookkeeping (history row, receipt watch,
+    // optimistic balance drop) is owned by the window rather than the dialog - closing the dialog
+    // mid-flight must never lose a transaction that is already on the wire.
+    struct PendingBridge {
+        bool active = false;   // a deposit is broadcasting
+        bool approving = false; // an approval is broadcasting
+        quint32 account = 0;   // the account it is sent FROM (frozen when the dialog opened)
+        quint64 dest = 0;      // destination chain id
+        QString symbol, amountHuman, tokenAddr, to;
+    };
+    PendingBridge m_pendingBridge;
+    QPointer<QDialog> m_bridgeDialog;      // only one bridge dialog at a time
+    void onBridgeBroadcast(const QString &txHash, const QString &err);
+    void onBridgeApproveBroadcast(const QString &txHash, const QString &err);
     // MetaMask-style detailed confirmation for a swap. Returns true if the user confirms.
     // `cowVerified` reflects CoW's own `verified` quote flag (surfaced as a security badge).
     // For on-chain routers, `routerId`/`routerLabel`/`routerTo`/`routerSpender` describe the router
@@ -261,6 +280,9 @@ private:
     // (registry RPCs over the running Tor proxy) are used. socksFor("") == direct/own-node.
     QStringList endpointsFor(quint64 chainId) const;
     QString socksFor(quint64 chainId) const;
+    // Push the user's chosen history API (Settings -> Node) into the core for `chainId`, so an
+    // explorer that has gone away can be replaced without a new build.
+    void applyHistoryApis(quint64 chainId) const;
     // If the user opted to share an external Tor (Feather / Tor Browser / system Tor) instead of the
     // bundled one, returns its SOCKS URL (socks5h://host:port); empty when using the bundled Tor.
     QString externalSocks() const;
@@ -333,7 +355,7 @@ private:
     QHash<quint32, double> m_ethRawByAccount;  // raw ETH balance per account (for combined total)
     QHash<QString, double> m_tokenRawByKey;    // "account|tokenAddr" -> raw token balance
     // Details of the tx being committed, captured at confirm time so the post-send UI (optimistic
-    // balance drop, history row, notification) uses the ACTUAL token amount — not the raw Amount
+    // balance drop, history row, notification) uses the ACTUAL token amount - not the raw Amount
     // field, which may be entered in USD. m_committedIsReplacement suppresses the optimistic drop +
     // duplicate history row for a speed-up/cancel (a replacement of an already-shown tx).
     QString m_committedAmount;                 // human token amount (asset units)
@@ -343,7 +365,7 @@ private:
     quint32 m_committedFrom = 0xFFFFFFFFu;      // account the tx was actually sent FROM (not the live combo)
     bool m_committedIsReplacement = false;
     quint32 m_lastSendFrom = 0xFFFFFFFFu;      // account we last sent from (for the optimistic drop)
-    qint64 m_lastSendMs = 0;                   // when we last sent — suppress false "received" while
+    qint64 m_lastSendMs = 0;                   // when we last sent - suppress false "received" while
                                                // a pre-mine refresh reads the still-higher balance
 
     // Optimistic swap-sell state: when a swap is submitted, the sold asset is dropped from the
@@ -360,7 +382,7 @@ private:
     QTimer *m_blockTimer = nullptr;            // polls the chain head for new blocks
     QTimer *m_receiptTimer = nullptr;          // fast-polls a just-sent tx's receipt to confirm it
     QString m_pendingReceiptHash;              // the tx we're watching for confirmation ("" = none)
-    bool m_sendInFlight = false;               // a commit/broadcast is in progress — block re-sends
+    bool m_sendInFlight = false;               // a commit/broadcast is in progress - block re-sends
     QProgressDialog *m_sendProgress = nullptr; // modal "Broadcasting…" shown while a send is in flight
     void beginSendProgress(const QString &text); // show the broadcast spinner + set the in-flight guard
     void endSendProgress();                    // clear the guard + dismiss the spinner
@@ -392,6 +414,7 @@ private:
     AddressModel *m_addressModel = nullptr;    // Receive: the address list
     QWidget *m_nftTab = nullptr;               // NFTs tab
     QListWidget *m_nftList = nullptr;          // NFT collection grid
+    XmrTradeTab *m_xmrTab = nullptr;           // Buy XMR tab (XMR1 on Hyperliquid)
 
     // ##### Swap (multi-router) tab #####
     QWidget *m_swapTab = nullptr;              // scrollable content (widgets parented here)

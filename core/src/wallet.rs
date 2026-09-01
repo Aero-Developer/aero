@@ -20,6 +20,7 @@ use crate::chains::chain_info;
 use crate::erc20;
 use crate::error::{CoreError, Result};
 use crate::hardware::{self, HwKind};
+use crate::hyperliquid;
 use crate::keys::{SeedPhrase, WordCount};
 use crate::keystore::{self, AccountEntry, HwDescriptor, TokenRef, WalletSecrets};
 use crate::provider::{ProviderConfig, RpcProvider};
@@ -48,7 +49,7 @@ const EVM_NATIVE_SENTINEL: &str = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";
 /// Odos represents the native coin with the zero address.
 const ODOS_NATIVE: &str = "0x0000000000000000000000000000000000000000";
 
-/// Multicall3 — deployed at the same canonical address on every major EVM chain (incl. testnets).
+/// Multicall3 - deployed at the same canonical address on every major EVM chain (incl. testnets).
 /// We use `aggregate3Value` to send native coin to many recipients atomically in ONE transaction.
 const MULTICALL3: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
@@ -183,7 +184,7 @@ pub struct FeeSuggestion {
 #[derive(Serialize)]
 pub struct SendResult {
     pub tx_hash: String,
-    /// Nonce the transaction was broadcast at — needed to later speed-up or cancel it (a replacement
+    /// Nonce the transaction was broadcast at - needed to later speed-up or cancel it (a replacement
     /// reuses the same nonce with higher gas).
     pub nonce: u64,
 }
@@ -248,7 +249,7 @@ struct HwContext {
 
 /// Short-TTL caches for pure, read-only network lookups that several UI triggers hit repeatedly
 /// (connect, tab switches, per-block refresh). Serving a recent value avoids re-opening a Tor
-/// stream for data that barely changes over a few seconds — fewer requests = a healthier circuit.
+/// stream for data that barely changes over a few seconds - fewer requests = a healthier circuit.
 /// Keyed by chain id so a network switch never returns another chain's value. Locks are only ever
 /// held to copy the cached value in/out, NEVER across a network await.
 #[derive(Default)]
@@ -356,7 +357,7 @@ impl Wallet {
             // Require the device now and verify it derives the same first address.
             let derived = crate::ffi::block_on(hardware::get_address(kind, passphrase, 0))?;
             // An empty stored address list must NOT skip verification (that would open the wallet
-            // against any connected device/passphrase) — treat it as a mismatch.
+            // against any connected device/passphrase) - treat it as a mismatch.
             let expected = hw.addresses.first().cloned().unwrap_or_default();
             if expected.is_empty() || !derived.eq_ignore_ascii_case(&expected) {
                 return Err(CoreError::rpc(
@@ -481,7 +482,7 @@ impl Wallet {
     /// Append a new HD account and return its (stable) unified index.
     pub fn add_account(&mut self) -> u32 {
         if matches!(self.keys, KeySource::WatchOnly) {
-            return self.account_count().saturating_sub(1); // no keys to derive from — no-op
+            return self.account_count().saturating_sub(1); // no keys to derive from - no-op
         }
         let hd_index = self.secrets.account_count;
         self.secrets.account_count += 1;
@@ -575,7 +576,7 @@ impl Wallet {
         // on-device works; message signing needs a software account for now.
         if matches!(&self.keys, KeySource::Hardware(_)) {
             return Err(CoreError::Signing(
-                "message signing on a hardware wallet isn't supported yet — use a software account"
+                "message signing on a hardware wallet isn't supported yet - use a software account"
                     .into(),
             ));
         }
@@ -588,7 +589,7 @@ impl Wallet {
 
     /// Recover the address that produced an EIP-191 (`personal_sign`) signature over `message`.
     /// Returns the recovered, checksummed address so the caller can compare it to who they expected.
-    /// This is a pure function (no keys involved) — hence `&self` isn't required.
+    /// This is a pure function (no keys involved) - hence `&self` isn't required.
     pub fn verify_message(message: &str, signature: &str) -> Result<String> {
         let hexs = signature.trim().trim_start_matches("0x").trim_start_matches("0X");
         let bytes = hex::decode(hexs)
@@ -723,13 +724,13 @@ impl Wallet {
 
     /// Fetch native + tracked-token balances for accounts `0..num_accounts` in ONE batched
     /// JSON-RPC request (chunked to stay under public-RPC batch caps). This replaces the old
-    /// per-account × per-token fan-out (which opened dozens of independent Tor circuits and made
+    /// per-account x per-token fan-out (which opened dozens of independent Tor circuits and made
     /// balances trickle in), so everything lands together in a couple of round-trips.
     ///
     /// Returns `{ "native_symbol": "...", "accounts": [ { index, native_raw, native_formatted,
     /// native_symbol, tokens: [ { address, symbol, decimals, raw, formatted } ] } ] }`.
     /// `extra_tokens_json` (may be empty) is a JSON array `[{address,symbol,decimals}]` of additional
-    /// tokens to include in the balance read — e.g. the current chain's curated tokens — so the
+    /// tokens to include in the balance read - e.g. the current chain's curated tokens - so the
     /// Send/Swap pickers show balances immediately without the user having to permanently track each
     /// token. Extras are fetched, never persisted.
     pub async fn all_balances(&self, num_accounts: u32, extra_tokens_json: &str) -> Result<serde_json::Value> {
@@ -737,9 +738,9 @@ impl Wallet {
         let native_symbol = chain_info(provider.chain_id()).native_symbol.to_string();
         let n = num_accounts.max(1);
 
-        // Resolve every account address once (works for both software and hardware — the latter
+        // Resolve every account address once (works for both software and hardware - the latter
         // reads its cached device addresses, no device round-trip here).
-        // A single unresolvable account must not blank every balance — skip it rather than error.
+        // A single unresolvable account must not blank every balance - skip it rather than error.
         let mut addrs: Vec<(u32, Address)> = Vec::with_capacity(n as usize);
         for i in 0..n {
             if let Ok(a) = self.address(i).and_then(|s| parse_address(&s)) {
@@ -779,11 +780,11 @@ impl Wallet {
         let per_addr = 1 + tokens.len();
 
         // TURBO PATH: fetch every balance through Multicall3 in ONE eth_call per big group, instead
-        // of one JSON-RPC call per (account, asset). For N accounts × per_addr assets, the old path
-        // issued N×per_addr calls across many rate-limited batches (which is why accounts past the
-        // first chunk silently failed to load); this issues ~ceil(N×per_addr / MC_CALLS) eth_calls
-        // total — typically 1–2 round-trips for a whole wallet. Sub-calls are flattened in account
-        // order [acct0_native, acct0_tok0, …, acct1_native, …] so the per_addr indexing below still
+        // of one JSON-RPC call per (account, asset). For N accounts x per_addr assets, the old path
+        // issued Nxper_addr calls across many rate-limited batches (which is why accounts past the
+        // first chunk silently failed to load); this issues ~ceil(Nxper_addr / MC_CALLS) eth_calls
+        // total - typically 1-2 round-trips for a whole wallet. Sub-calls are flattened in account
+        // order [acct0_native, acct0_tok0, ..., acct1_native, ...] so the per_addr indexing below still
         // maps results straight back to each account.
         use alloy::primitives::Bytes;
         let mc_addr = parse_address(MULTICALL3)?;
@@ -804,7 +805,7 @@ impl Wallet {
         }
 
         // Each entry becomes Some(balance) on success, None if that sub-call failed/was unreachable.
-        const MC_CALLS: usize = 400; // sub-calls per eth_call — bounds response size / eth_call gas
+        const MC_CALLS: usize = 400; // sub-calls per eth_call - bounds response size / eth_call gas
         let mut balances: Vec<Option<U256>> = vec![None; subcalls.len()];
         let mut off = 0usize;
         for group in subcalls.chunks(MC_CALLS) {
@@ -889,8 +890,8 @@ impl Wallet {
             return Ok(Vec::new());
         }
 
-        // Ethereum seeds are used by different wallets under different derivation schemes, so — like
-        // Electrum's Bitcoin recovery — we scan every common scheme (not just the standard BIP44
+        // Ethereum seeds are used by different wallets under different derivation schemes, so - like
+        // Electrum's Bitcoin recovery - we scan every common scheme (not just the standard BIP44
         // path) so funds created by any of them are found. `{i}` is the per-scheme index.
         // Scheme 0 is the standard path (stored as `Hd(index)`); the rest as `HdPath(path)`.
         const SCHEMES: [&str; 4] = [
@@ -909,7 +910,7 @@ impl Wallet {
         let per_addr = 1 + tokens.len(); // 1 eth_getBalance + one balanceOf per token
         // Size the address chunk so each JSON-RPC batch (per_addr calls per address) stays under the
         // ~40-call public-RPC cap. A flat 20 addresses overflowed the batch once tokens were tracked
-        // (20 * (1+tokens) calls), and the over-cap calls came back null — which used to be counted
+        // (20 * (1+tokens) calls), and the over-cap calls came back null - which used to be counted
         // as empty addresses and tripped the gap limit early (the "stopped at ~18" bug).
         let chunk: u32 = (40 / per_addr).max(1) as u32;
         let hard_cap: u32 = 100_000; // safety bound
@@ -933,14 +934,14 @@ impl Wallet {
             let is_mainnet = provider.chain_id() == 1;
             // Tracks whether anything at all was found on THIS chain. On non-mainnet chains, if the
             // standard BIP44 scheme (scheme 0) turns up nothing we skip the rare alternate-derivation
-            // schemes (Ledger Live / legacy) for that chain — they're seldom used on L2s, and any that
+            // schemes (Ledger Live / legacy) for that chain - they're seldom used on L2s, and any that
             // are would already be registered from the mainnet scan. This cuts a fresh/empty wallet's
             // cross-chain scan from thousands of probes to a few hundred.
             let mut chain_found_any = false;
 
             for (scheme_idx, template) in SCHEMES.iter().enumerate() {
                 if scheme_idx > 0 && !is_mainnet && !chain_found_any {
-                    break; // this non-mainnet chain looks empty on the standard path — stop early
+                    break; // this non-mainnet chain looks empty on the standard path - stop early
                 }
                 let mut consecutive_empty = 0u32;
                 let mut index: u32 = 0;
@@ -996,9 +997,9 @@ impl Wallet {
                         let mut has_balance = native.map(|wei| wei > U256::ZERO).unwrap_or(false);
                         // Token balances. A missing entry or an explicit JSON `null` means the CALL
                         // failed (transient/batch issue) -> unknown, must not advance the gap. But a
-                        // concrete return — including an empty `0x` from a revert or from there being
+                        // concrete return - including an empty `0x` from a revert or from there being
                         // no such token contract on THIS chain (the tracked list is mainnet tokens, so
-                        // their addresses aren't contracts on L2s) — is a definitive read worth zero.
+                        // their addresses aren't contracts on L2s) - is a definitive read worth zero.
                         // Treating that `0x` as "failed" was why non-mainnet scans never advanced the
                         // gap and ran toward the hard cap.
                         let mut tokens_ok = true;
@@ -1032,8 +1033,8 @@ impl Wallet {
                             consecutive_empty += 1;
                             // Depth floor for the standard BIP44 scheme (scheme 0, e.g. MetaMask):
                             // always scan at least SCAN_FLOOR indices before the gap can stop us, so a
-                            // wallet with many accounts and internal empty runs (> gap) — e.g. ~230
-                            // MetaMask accounts where some middle ones are unfunded — is fully found
+                            // wallet with many accounts and internal empty runs (> gap) - e.g. ~230
+                            // MetaMask accounts where some middle ones are unfunded - is fully found
                             // rather than truncated. Other schemes rarely go deep, so they keep the
                             // plain gap limit.
                             if consecutive_empty >= gap
@@ -1072,7 +1073,7 @@ impl Wallet {
         }
 
         // Make the standard-scheme accounts contiguous (0..=max) and in order, so the Receive tab
-        // lists every account — funded ones AND the unfunded gaps between them — as one continuous
+        // lists every account - funded ones AND the unfunded gaps between them - as one continuous
         // 0,1,2,... run instead of only the funded indices. Done only when the wallet is purely HD
         // (no imported keys / alternate-scheme accounts, whose unified positions and user labels we
         // must not move); pre-existing Hd(0..n) keep their positions, so labels stay aligned. This
@@ -1114,7 +1115,7 @@ impl Wallet {
     }
 
     /// Scan ONE chain (via the given provider) for funded derivation paths, WITHOUT mutating the
-    /// wallet — so several chains can be scanned concurrently (see `scan_funded_all_chains`). Returns
+    /// wallet - so several chains can be scanned concurrently (see `scan_funded_all_chains`). Returns
     /// the funded `(scheme_idx, per-scheme index, path)` tuples; the caller registers them. Chunks
     /// within each scheme are fetched with a small concurrent look-ahead window (`buffered`) instead
     /// of one-at-a-time, and the global RPC semaphore keeps total Tor concurrency bounded.
@@ -1162,7 +1163,7 @@ impl Wallet {
 
         for (scheme_idx, template) in SCHEMES.iter().enumerate() {
             if crate::provider::shutting_down() {
-                break; // app closing — stop scanning and return what we have
+                break; // app closing - stop scanning and return what we have
             }
             // On non-mainnet chains, if the standard path found nothing, skip the rare alt schemes.
             if scheme_idx > 0 && !is_mainnet && !chain_found_any {
@@ -1204,7 +1205,7 @@ impl Wallet {
                         // scan completeness: the balance reads go over one shared Tor exit and the
                         // RPC endpoint rate-limits, so a batch mid-scan can transiently fail. The old
                         // code retried once immediately (both attempts hit the same rate window) and,
-                        // on failure, `break 'scheme` ABANDONED the rest of the scheme — silently
+                        // on failure, `break 'scheme` ABANDONED the rest of the scheme - silently
                         // skipping every higher-index funded account (the "found 167 one run, 43 the
                         // next" bug). Backing off and retrying lets the rate window recover so the
                         // scan reaches the true end instead of stopping at the first hiccup.
@@ -1300,7 +1301,7 @@ impl Wallet {
             futures::future::join_all(providers.iter().map(|p| self.scan_chain_paths(p, gap_limit)))
                 .await;
 
-        // Merge funded paths across chains, deduped by (scheme, path) — the same address is funded on
+        // Merge funded paths across chains, deduped by (scheme, path) - the same address is funded on
         // multiple chains, but should register as one account.
         let mut found: Vec<(usize, u32, String)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -1319,13 +1320,13 @@ impl Wallet {
     }
 
     /// ETH/USD price read on-chain from the Chainlink mainnet aggregator via `eth_call`
-    /// (over the same Tor RPC) — no third-party price API. Returns USD per 1 ETH.
+    /// (over the same Tor RPC) - no third-party price API. Returns USD per 1 ETH.
     /// USD price of the connected chain's native coin. On Ethereum mainnet this uses the trustless
     /// on-chain Chainlink feed; on other chains (where that feed's RPC isn't reachable) it falls
     /// back to CoinGecko over Tor, keyed by the chain's native coin id.
     pub async fn native_usd_price(&self) -> Result<f64> {
         let chain = self.provider()?.chain_id();
-        // Serve a recent price (≤20s) instead of re-fetching on every connect / tab switch / block.
+        // Serve a recent price (<=20s) instead of re-fetching on every connect / tab switch / block.
         if let Some((t, cid, p)) = *self.caches.native_price.lock().unwrap() {
             if cid == chain && t.elapsed() < Duration::from_secs(20) {
                 return Ok(p);
@@ -1349,7 +1350,7 @@ impl Wallet {
             // else fall through to the market sources (feed RPC hiccup shouldn't blank the price)
         }
 
-        // Gnosis' native coin (xDAI) is a DAI-pegged stablecoin with no spot market — it's ~$1.
+        // Gnosis' native coin (xDAI) is a DAI-pegged stablecoin with no spot market - it's ~$1.
         if info.native_symbol.eq_ignore_ascii_case("XDAI")
             || info.native_symbol.eq_ignore_ascii_case("DAI")
         {
@@ -1365,7 +1366,7 @@ impl Wallet {
         }
     }
 
-    /// Historical USD spot price of `symbol` on `date` (YYYY-MM-DD, UTC) via Coinbase — used to show
+    /// Historical USD spot price of `symbol` on `date` (YYYY-MM-DD, UTC) via Coinbase - used to show
     /// each transaction's fiat value at the time it happened. Returns 0.0 if unavailable.
     pub async fn price_on_date(&self, symbol: &str, date: &str) -> Result<f64> {
         let provider = self.provider()?;
@@ -1413,7 +1414,7 @@ impl Wallet {
             }
         }
 
-        // 3) CoinGecko — last resort (often empty over Tor, but free when it works).
+        // 3) CoinGecko - last resort (often empty over Tor, but free when it works).
         let cg = format!(
             "https://api.coingecko.com/api/v3/simple/price?ids={coingecko_id}&vs_currencies=usd"
         );
@@ -1763,7 +1764,7 @@ impl Wallet {
     }
 
     /// Atomic native-coin multi-send: pay many recipients in ONE transaction via Multicall3's
-    /// `aggregate3Value` (all-or-nothing — if any transfer would fail, the whole tx reverts, so no
+    /// `aggregate3Value` (all-or-nothing - if any transfer would fail, the whole tx reverts, so no
     /// partial sends / stranded nonces). `recipients` are (address, decimal-wei). Native only.
     pub async fn send_many_native(
         &self,
@@ -1791,14 +1792,14 @@ impl Wallet {
         }
         let data = aggregate3ValueCall { calls }.abi_encode();
         // msg.value MUST equal the sum (Multicall3 forwards each call's value; any surplus would be
-        // stuck in the contract) — we send exactly `total`.
+        // stuck in the contract) - we send exactly `total`.
         self.build_sign_send(from_index, parse_address(MULTICALL3)?, total, Bytes::from(data), None,
                              fee, None)
             .await
     }
 
     /// Broadcast an already-signed raw transaction (0x-prefixed RLP). Works for any wallet type
-    /// (no keys needed) — this is the "transaction pusher" used to relay an offline-signed tx over
+    /// (no keys needed) - this is the "transaction pusher" used to relay an offline-signed tx over
     /// Tor. Returns the resulting tx hash.
     pub async fn broadcast_raw(&self, raw_hex: &str) -> Result<SendResult> {
         let provider = self.provider()?;
@@ -1885,7 +1886,7 @@ impl Wallet {
     }
 
     /// Sign an unsigned-tx JSON (from [`build_unsigned`]) with the local key and return the 0x raw
-    /// RLP. Pure signing — no network needed, so it runs on an offline machine.
+    /// RLP. Pure signing - no network needed, so it runs on an offline machine.
     pub async fn sign_unsigned(&self, json_str: &str) -> Result<String> {
         let v: serde_json::Value = serde_json::from_str(json_str)
             .map_err(|e| CoreError::Amount(format!("bad unsigned tx json: {e}")))?;
@@ -1985,7 +1986,7 @@ impl Wallet {
             return Err(CoreError::rpc("transaction not found (may have already confirmed/dropped)"));
         }
         if v.get("blockNumber").map(|b| !b.is_null()).unwrap_or(false) {
-            return Err(CoreError::rpc("transaction already confirmed — nothing to replace"));
+            return Err(CoreError::rpc("transaction already confirmed - nothing to replace"));
         }
         let self_addr = parse_address(&self.address(from_index)?)?;
         // Only the sender can replace their own tx (same from + nonce).
@@ -2136,7 +2137,7 @@ impl Wallet {
     }
 
     /// Send an arbitrary-calldata transaction (used to execute an aggregator router's swap). `data`
-    /// is 0x-prefixed calldata from the router's build/assemble step — used verbatim.
+    /// is 0x-prefixed calldata from the router's build/assemble step - used verbatim.
     pub async fn router_swap(
         &self,
         from_index: u32,
@@ -2385,7 +2386,7 @@ impl Wallet {
         let quoted_sell = U256::from_str(&s("sellAmount")).unwrap_or(U256::ZERO);
         let quoted_fee = U256::from_str(&s("feeAmount")).unwrap_or(U256::ZERO);
         let sell_amount = quoted_sell.saturating_add(quoted_fee);
-        // Apply slippage to the minimum buy — this is what makes the order fillable.
+        // Apply slippage to the minimum buy - this is what makes the order fillable.
         let quoted_buy = U256::from_str(&s("buyAmount")).unwrap_or(U256::ZERO);
         let bps = U256::from(10_000u64.saturating_sub(slippage_bps.min(5_000) as u64));
         let buy_amount = quoted_buy * bps / U256::from(10_000u64);
@@ -2575,6 +2576,403 @@ impl Wallet {
 
     // ---------- Across Protocol cross-chain bridge ----------
 
+    /// What can be bridged out of the currently connected chain, as
+    /// `{origin_chain, assets: [{symbol, display, decimals, native, destinations: [chain_id]}]}`.
+    ///
+    /// The caller builds its menus from this rather than from a list of its own, so an asset Across
+    /// has retired stops being offered the moment Across says so instead of failing at the quote.
+    pub async fn across_assets(&self) -> Result<serde_json::Value> {
+        let provider = self.provider()?;
+        let origin = provider.chain_id();
+        let table = crate::across::routes(provider).await;
+
+        let mut assets = Vec::new();
+        for symbol in crate::across::symbols_from(&table, origin) {
+            let destinations = crate::across::destinations(&table, origin, &symbol);
+            if destinations.is_empty() {
+                continue;
+            }
+            let Some(route) = crate::across::resolve(&table, origin, destinations[0], &symbol) else {
+                continue;
+            };
+            assets.push(serde_json::json!({
+                "symbol": symbol,
+                "display": crate::across::display_symbol(&symbol),
+                "decimals": self.bridge_decimals(route).await,
+                "native": route.is_native,
+                "destinations": destinations,
+            }));
+        }
+        Ok(serde_json::json!({ "origin_chain": origin, "assets": assets }))
+    }
+
+    /// Decimals of the asset being deposited, read from the token itself.
+    ///
+    /// Worth a round-trip: the same ticker is not the same token everywhere - USDC is six-decimal on
+    /// Ethereum and eighteen-decimal on BNB Smart Chain - and a wrong figure here does not fail, it
+    /// quietly bridges a thousand times too much or too little.
+    async fn bridge_decimals(&self, route: &crate::across::Route) -> u8 {
+        if route.is_native {
+            return 18;
+        }
+        match self.erc20_metadata(&route.origin_token).await {
+            Ok((_, decimals)) => decimals,
+            Err(_) => crate::across::fallback_decimals(&route.symbol, route.origin_chain),
+        }
+    }
+
+    // ---------- Hyperliquid (XMR1) ----------
+
+    /// The key that signs orders: an *agent*, derived from the account key rather than being the
+    /// account key.
+    ///
+    /// Hyperliquid lets an account authorise another key to trade on its behalf, and that key can
+    /// only trade - it cannot withdraw or transfer. Deriving it means there is no second secret to
+    /// store or back up, and it still holds the property that matters: the key handling every order
+    /// is one that cannot move money, so a bug or a leak in the trading path cannot drain anything.
+    ///
+    /// `rotation` exists so a suspect agent can be replaced by approving a new one.
+    fn hl_agent_signer(&self, index: u32, rotation: u32) -> Result<PrivateKeySigner> {
+        let account = self.local_signer(index)?;
+        let mut material = Vec::with_capacity(64);
+        material.extend_from_slice(b"aero:hyperliquid:agent:v1");
+        material.extend_from_slice(account.to_bytes().as_slice());
+        material.extend_from_slice(&rotation.to_be_bytes());
+        let derived = alloy::primitives::keccak256(&material);
+        let signer = PrivateKeySigner::from_slice(derived.as_slice())
+            .map_err(|e| CoreError::Signing(format!("could not derive a trading key: {e}")))?;
+        Ok(signer)
+    }
+
+    /// Sign a Hyperliquid action and post it.
+    fn hl_sign(
+        &self,
+        signer: &PrivateKeySigner,
+        unsigned: &hyperliquid::Unsigned,
+    ) -> Result<serde_json::Value> {
+        let sig = signer
+            .sign_hash_sync(&unsigned.digest)
+            .map_err(|e| CoreError::Signing(e.to_string()))?;
+        Ok(hyperliquid::envelope(unsigned, &sig))
+    }
+
+    /// Everything the trading screen shows, in one round trip: the book, what the account holds,
+    /// its resting orders, and its recent fills.
+    ///
+    /// Bundled deliberately - these are read together and shown together, and fetching them
+    /// separately would let the book move between the panels of a single view.
+    pub async fn hl_overview(&self, index: u32) -> Result<serde_json::Value> {
+        let provider = self.provider()?;
+        let market = hyperliquid::find_market(provider, hyperliquid::XMR1).await?;
+        let user = self.address(index)?;
+
+        let (book, balances, orders, fills) = futures::join!(
+            hyperliquid::book(provider, &market.coin),
+            hyperliquid::balances(provider, &user),
+            hyperliquid::open_orders(provider, &user),
+            hyperliquid::fills(provider, &user),
+        );
+        // Every part of this is reported as fact on a screen someone trades from, so a part that
+        // failed has to fail the whole refresh rather than be drawn as a zero. Swallowing these was
+        // how a rate-limited poll could quietly show no balance, no orders and no fills - a wallet
+        // apparently emptied, and an order apparently cancelled, at the exact moment the exchange was
+        // too busy to say otherwise.
+        let book = book?;
+        let balances = balances?;
+
+        // Only this market's orders and fills: the account may have traded other things.
+        let orders: Vec<_> = orders?.into_iter().filter(|o| o.coin == market.coin).collect();
+        let fills: Vec<_> = fills?
+            .into_iter()
+            .filter(|f| f.coin == market.coin)
+            .rev()
+            .take(50)
+            .collect();
+
+        let held = |coin: &str| -> serde_json::Value {
+            match balances.iter().find(|b| b.coin == coin) {
+                Some(b) => serde_json::json!({ "total": b.total, "hold": b.hold }),
+                None => serde_json::json!({ "total": "0", "hold": "0" }),
+            }
+        };
+
+        Ok(serde_json::json!({
+            "market": market.coin,
+            "sz_decimals": market.sz_decimals,
+            "px_decimals": market.px_decimals,
+            "address": user,
+            "bids": book.bids,
+            "asks": book.asks,
+            "mid": book.mid(),
+            "xmr1": held(hyperliquid::XMR1),
+            "usdc": held("USDC"),
+            "open_orders": orders,
+            "fills": fills,
+        }))
+    }
+
+    /// Whether this account has authorised Aero's trading key yet.
+    ///
+    /// Checked against the exchange rather than remembered locally, because the authorisation lives
+    /// there: an agent approved on another machine already works here, and one revoked elsewhere
+    /// must stop working here.
+    pub async fn hl_agent_ready(&self, index: u32) -> Result<bool> {
+        let provider = self.provider()?;
+        let agent = self.hl_agent_signer(index, 0)?.address();
+        let v = provider
+            .http_post_json(
+                &format!("{}/info", hyperliquid::API),
+                &serde_json::json!({
+                    "type": "extraAgents",
+                    "user": self.address(index)?.to_lowercase(),
+                }),
+            )
+            .await?;
+        let wanted = format!("{agent:#x}").to_lowercase();
+        // An authorisation expires. Treating one that lapses shortly as already gone means the user
+        // re-approves at a moment of their choosing instead of having an order rejected mid-trade.
+        let soon = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+            + 24 * 60 * 60 * 1000;
+        // A reply that isn't a list tells us nothing about the agent. Read as "no agent", it asks the
+        // user to sign an approval they may already have given.
+        let Some(list) = v.as_array() else {
+            return Err(CoreError::rpc(format!("hyperliquid agents: unexpected reply {v}")));
+        };
+        Ok(list.iter().any(|a| {
+            let matches = a
+                .get("address")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_lowercase()
+                == wanted;
+            let valid = a
+                .get("validUntil")
+                .and_then(|x| x.as_u64())
+                .map(|until| until > soon)
+                .unwrap_or(true);
+            matches && valid
+        }))
+    }
+
+    /// Authorise Aero's trading key, so later orders never need the account key.
+    ///
+    /// Signed by the account itself - the one and only time trading setup touches it.
+    pub async fn hl_approve_agent(&self, index: u32) -> Result<serde_json::Value> {
+        let agent = self.hl_agent_signer(index, 0)?.address();
+        let unsigned = hyperliquid::approve_agent_action(agent, "Aero");
+        let account = self.local_signer(index)?;
+        let body = self.hl_sign(&account, &unsigned)?;
+        hyperliquid::submit(self.provider()?, &body).await
+    }
+
+    /// Place an order.
+    ///
+    /// `price` is the limit for a resting order; for a market order it is the worst price accepted,
+    /// and the order takes what it can at or better and cancels the rest. There is no unbounded
+    /// market order here on purpose: this book is thin enough that one could fill far from the mid.
+    pub async fn hl_place_order(
+        &self,
+        index: u32,
+        is_buy: bool,
+        price: f64,
+        size: f64,
+        market_order: bool,
+    ) -> Result<serde_json::Value> {
+        let provider = self.provider()?;
+        let market = hyperliquid::find_market(provider, hyperliquid::XMR1).await?;
+        let tif = if market_order { hyperliquid::Tif::Ioc } else { hyperliquid::Tif::Gtc };
+        let unsigned = hyperliquid::order_action(&market, is_buy, price, size, tif)?;
+        let agent = self.hl_agent_signer(index, 0)?;
+        let body = self.hl_sign(&agent, &unsigned)?;
+        let reply = hyperliquid::submit(provider, &body).await?;
+        Ok(hl_order_result(&reply))
+    }
+
+    /// Cancel a resting order.
+    pub async fn hl_cancel_order(&self, index: u32, oid: u64) -> Result<serde_json::Value> {
+        let provider = self.provider()?;
+        let market = hyperliquid::find_market(provider, hyperliquid::XMR1).await?;
+        let unsigned = hyperliquid::cancel_action(&market, oid)?;
+        let agent = self.hl_agent_signer(index, 0)?;
+        let body = self.hl_sign(&agent, &unsigned)?;
+        hyperliquid::submit(provider, &body).await
+    }
+
+    /// Move USDC from Arbitrum onto the exchange.
+    ///
+    /// This is an ordinary token transfer to Hyperliquid's bridge, which is why it is a normal
+    /// signed transaction and works on a hardware wallet like any other send. The checks around it
+    /// matter more than the transfer: the bridge accepts only native USDC on Arbitrum and ignores
+    /// anything under the minimum, and either mistake loses the money with no way back.
+    pub async fn hl_deposit(&self, index: u32, amount_usdc: &str) -> Result<SendResult> {
+        let provider = self.provider()?;
+        if provider.chain_id() != hyperliquid::ARBITRUM_CHAIN_ID {
+            return Err(CoreError::rpc(
+                "deposits go through Arbitrum One - switch the wallet to that network first"
+                    .to_string(),
+            ));
+        }
+        let amount = amount_usdc.trim().parse::<f64>().unwrap_or(0.0);
+        if amount < hyperliquid::MIN_DEPOSIT_USDC {
+            return Err(CoreError::Amount(format!(
+                "the bridge ignores deposits under {} USDC, and they cannot be recovered",
+                hyperliquid::MIN_DEPOSIT_USDC
+            )));
+        }
+        // USDC is six-decimal on Arbitrum; read it rather than assume, since sending the wrong
+        // scale here is unrecoverable.
+        let (_, decimals) = self.erc20_metadata(hyperliquid::USDC_ARBITRUM).await?;
+        let units = parse_units(amount_usdc.trim(), decimals)?.to_string();
+        self.send_erc20(
+            index,
+            hyperliquid::USDC_ARBITRUM,
+            hyperliquid::BRIDGE2_ARBITRUM,
+            &units,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Withdraw USDC from the exchange back to Arbitrum.
+    ///
+    /// Signed by the account key, not the agent - an agent deliberately cannot do this. The funds
+    /// arrive at the same address on Arbitrum, minus the exchange's flat fee.
+    pub async fn hl_withdraw(&self, index: u32, amount_usdc: &str) -> Result<serde_json::Value> {
+        let amount = amount_usdc.trim().parse::<f64>().unwrap_or(0.0);
+        if amount <= hyperliquid::WITHDRAW_FEE_USDC {
+            return Err(CoreError::Amount(format!(
+                "the exchange takes a {} USDC fee, so a withdrawal has to be larger than that",
+                hyperliquid::WITHDRAW_FEE_USDC
+            )));
+        }
+        let destination = parse_address(&self.address(index)?)?;
+        let unsigned = hyperliquid::withdraw_action(destination, amount_usdc.trim());
+        let account = self.local_signer(index)?;
+        let body = self.hl_sign(&account, &unsigned)?;
+        hyperliquid::submit(self.provider()?, &body).await
+    }
+
+    /// What redeeming XMR1 for real Monero would cost right now.
+    ///
+    /// Asked fresh each time rather than assumed: Wagyu's fee is runtime configuration on its side,
+    /// and it can differ per sender, so a figure shown from memory can understate what a user is
+    /// about to give up.
+    pub async fn xmr_redeem_quote(&self, index: u32, amount_xmr1: &str) -> Result<serde_json::Value> {
+        let provider = self.provider()?;
+        let terms = crate::wagyu::terms(provider).await?;
+        let gross = parse_xmr_amount(amount_xmr1)?;
+        let minimum = terms.minimum_atomic as f64 / crate::wagyu::ATOMIC_PER_XMR as f64;
+
+        let held = self.hl_spot_balance(index, hyperliquid::XMR1).await.unwrap_or(0.0);
+        Ok(serde_json::json!({
+            "fee_percent": terms.withdrawal_fee_rate * 100.0,
+            "minimum": minimum,
+            "gross": gross,
+            "net": terms.net_atomic(to_atomic(gross)) as f64 / crate::wagyu::ATOMIC_PER_XMR as f64,
+            "below_minimum": to_atomic(gross) < terms.minimum_atomic,
+            "available": held,
+        }))
+    }
+
+    /// Redeem XMR1 for Monero paid to `monero_address`.
+    ///
+    /// Two steps that must happen in this order and cannot be pulled apart. Wagyu is asked to open an
+    /// order, which names a Hyperliquid address generated **for that order alone**; the XMR1 is then
+    /// sent there. The address is never reused and never cached - sending to a previous order's
+    /// address is sending into an order that is no longer waiting for it.
+    ///
+    /// The transfer is signed by the account key, since it moves money and the trading agent is not
+    /// permitted to. If the transfer fails, the order is simply left to expire and nothing is lost.
+    pub async fn xmr_redeem(
+        &self,
+        index: u32,
+        monero_address: &str,
+        amount_xmr1: &str,
+    ) -> Result<serde_json::Value> {
+        let provider = self.provider()?;
+        let gross = parse_xmr_amount(amount_xmr1)?;
+
+        // Everything that can be checked without committing is checked before the order exists, so a
+        // rejection leaves no dangling order behind.
+        let terms = crate::wagyu::terms(provider).await?;
+        if to_atomic(gross) < terms.minimum_atomic {
+            return Err(CoreError::Amount(format!(
+                "Wagyu will not redeem less than {} XMR",
+                terms.minimum_atomic as f64 / crate::wagyu::ATOMIC_PER_XMR as f64
+            )));
+        }
+        let held = self.hl_spot_balance(index, hyperliquid::XMR1).await?;
+        if gross > held {
+            return Err(CoreError::Amount(format!(
+                "that is more XMR1 than this account holds ({held})"
+            )));
+        }
+
+        let market = hyperliquid::find_market(provider, hyperliquid::XMR1).await?;
+        // A transfer may move a balance finer than the book trades in, so it is the balance
+        // precision that bounds the amount, not the order-size precision. Truncated rather than
+        // rounded: redeeming the whole balance must not round up into more than is held.
+        let amount = hyperliquid::format_size(gross, market.wei_decimals);
+
+        // Quoted from the amount actually sent rather than what was typed: Wagyu pays out on what
+        // arrives, and the two differ once the amount is truncated to what a balance can hold.
+        let expected = terms.net_atomic(to_atomic(amount.parse::<f64>().unwrap_or(gross))) as f64
+            / crate::wagyu::ATOMIC_PER_XMR as f64;
+
+        let order = crate::wagyu::create_withdrawal(provider, monero_address).await?;
+        let destination = parse_address(&order.deposit_address)?;
+
+        let unsigned = hyperliquid::spot_send_action(destination, &market.send_token, &amount);
+        let account = self.local_signer(index)?;
+        let body = self.hl_sign(&account, &unsigned)?;
+        let result = hyperliquid::submit(provider, &body).await.map_err(|e| {
+            CoreError::rpc(format!(
+                "the redemption order was created but the XMR1 could not be sent, so nothing left \
+                 the account and the order will expire on its own - {e}"
+            ))
+        })?;
+
+        Ok(serde_json::json!({
+            "order_id": order.order_id,
+            "session_id": order.session_id,
+            "deposit_address": order.deposit_address,
+            "expires_at": order.expires_at,
+            "destination": order.destination,
+            "sent": amount,
+            "expected": expected,
+            "result": result,
+        }))
+    }
+
+    /// Where a redemption has got to, for the screen tracking it.
+    pub async fn xmr_redeem_status(
+        &self,
+        order_id: &str,
+        session_id: &str,
+    ) -> Result<serde_json::Value> {
+        crate::wagyu::order_status(self.provider()?, order_id, session_id).await
+    }
+
+    /// How much of a spot token this account holds on Hyperliquid, free of any amount on hold.
+    async fn hl_spot_balance(&self, index: u32, coin: &str) -> Result<f64> {
+        let user = self.address(index)?;
+        let balances = hyperliquid::balances(self.provider()?, &user).await?;
+        let held = balances
+            .iter()
+            .find(|b| b.coin == coin)
+            .map(|b| {
+                let total = b.total.parse::<f64>().unwrap_or(0.0);
+                let hold = b.hold.parse::<f64>().unwrap_or(0.0);
+                (total - hold).max(0.0)
+            })
+            .unwrap_or(0.0);
+        Ok(held)
+    }
+
     /// Fetch an Across bridge fee quote for sending `amount_wei` of `symbol` from the CURRENTLY
     /// CONNECTED chain to `dest_chain_id`, to the same address. Returns a normalized JSON object with
     /// the output amount, fees, SpokePool address, and the deposit parameters (timestamps, deadlines,
@@ -2588,16 +2986,20 @@ impl Wallet {
     ) -> Result<serde_json::Value> {
         let provider = self.provider()?;
         let origin = provider.chain_id();
-        if !crate::across::supported(origin) {
-            return Err(CoreError::rpc("bridging is not available from this chain".to_string()));
+        if dest_chain_id == origin {
+            return Err(CoreError::rpc("choose a different destination chain".to_string()));
         }
-        if !crate::across::supported(dest_chain_id) || dest_chain_id == origin {
-            return Err(CoreError::rpc("choose a different Across-supported destination chain".to_string()));
-        }
-        let input_token = crate::across::token_address(symbol, origin)
-            .ok_or_else(|| CoreError::rpc(format!("{symbol} is not bridgeable from this chain")))?;
-        let output_token = crate::across::token_address(symbol, dest_chain_id)
-            .ok_or_else(|| CoreError::rpc(format!("{symbol} is not bridgeable to that chain")))?;
+        // Which routes exist is Across's answer to give, not ours to remember; asking it is what
+        // stops the wallet offering a bridge that can only ever fail.
+        let table = crate::across::routes(provider).await;
+        let route = crate::across::resolve(&table, origin, dest_chain_id, symbol).ok_or_else(|| {
+            CoreError::rpc(format!(
+                "Across no longer bridges {} between these chains",
+                crate::across::display_symbol(symbol)
+            ))
+        })?;
+        let input_token = route.origin_token.as_str();
+        let output_token = route.dest_token.as_str();
         let me = self.address(from_index)?;
         let url = format!(
             "https://app.across.to/api/suggested-fees?inputToken={input_token}&outputToken={output_token}\
@@ -2607,9 +3009,12 @@ impl Wallet {
 
         let output_amount = r.get("outputAmount").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         if output_amount.is_empty() {
-            let msg = r
-                .get("message")
-                .and_then(|m| m.as_str())
+            // Non-2xx bodies come back parsed (http_get_json doesn't fail on status), so surface the
+            // API's own explanation - "route not enabled", "amount too low", etc. - instead of a
+            // generic failure. Across puts it in `message`, sometimes only in `error`/`code`.
+            let msg = ["message", "error", "code"]
+                .iter()
+                .find_map(|k| r.get(*k).and_then(|m| m.as_str()))
                 .unwrap_or("bridge quote unavailable for this pair/amount");
             return Err(CoreError::rpc(format!("Across: {msg}")));
         }
@@ -2627,14 +3032,33 @@ impl Wallet {
         let limits = r.get("limits");
         let lim = |k: &str| limits.and_then(|l| l.get(k)).map(str_or_num).unwrap_or_else(|| "0".into());
 
+        // Exclusivity: the SpokePool reverts with InvalidExclusiveRelayer on any deposit that pairs a
+        // non-zero exclusivity deadline with the ZERO relayer address (it refuses to lock funds for a
+        // relayer that doesn't exist). Drop the deadline whenever there is no relayer to be exclusive
+        // to, so such a quote can't produce a transaction that is certain to revert.
+        let exclusive_relayer = r
+            .get("exclusiveRelayer")
+            .and_then(|v| v.as_str())
+            .unwrap_or("0x0000000000000000000000000000000000000000")
+            .to_string();
+        let no_relayer = exclusive_relayer
+            .trim_start_matches("0x")
+            .chars()
+            .all(|c| c == '0');
+        let exclusivity_deadline = if no_relayer {
+            "0".to_string()
+        } else {
+            r.get("exclusivityDeadline").map(str_or_num).unwrap_or_else(|| "0".into())
+        };
+
         Ok(serde_json::json!({
             "symbol": symbol,
             "origin_chain": origin,
             "dest_chain": dest_chain_id,
             "input_token": input_token,
             "output_token": output_token,
-            "input_is_native": crate::across::is_native(symbol, origin),
-            "decimals": crate::across::decimals(symbol),
+            "input_is_native": route.is_native,
+            "decimals": self.bridge_decimals(route).await,
             "input_amount": amount_wei,
             "output_amount": output_amount,
             "total_relay_fee": total_relay_fee,
@@ -2642,9 +3066,8 @@ impl Wallet {
             "spoke_pool": r.get("spokePoolAddress").and_then(|v| v.as_str()).unwrap_or_default(),
             "timestamp": r.get("timestamp").map(str_or_num).unwrap_or_else(|| "0".into()),
             "fill_deadline": r.get("fillDeadline").map(str_or_num).unwrap_or_else(|| "0".into()),
-            "exclusive_relayer": r.get("exclusiveRelayer").and_then(|v| v.as_str())
-                .unwrap_or("0x0000000000000000000000000000000000000000"),
-            "exclusivity_deadline": r.get("exclusivityDeadline").map(str_or_num).unwrap_or_else(|| "0".into()),
+            "exclusive_relayer": exclusive_relayer,
+            "exclusivity_deadline": exclusivity_deadline,
             "est_fill_time_sec": r.get("estimatedFillTimeSec").and_then(|v| v.as_u64()).unwrap_or(0),
             "is_amount_too_low": r.get("isAmountTooLow").and_then(|v| v.as_bool()).unwrap_or(false),
             "min_deposit": lim("minDeposit"),
@@ -2666,24 +3089,61 @@ impl Wallet {
         let q = self.across_quote(from_index, symbol, dest_chain_id, amount_wei).await?;
         let gs = |k: &str| q.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
 
-        let spoke = gs("spoke_pool");
-        if spoke.is_empty() {
-            return Err(CoreError::rpc("Across quote missing the SpokePool address".to_string()));
+        // The quote is re-fetched here, so re-check the route limits against THIS quote - the caller's
+        // earlier check could have been against a stale one. Outside these bounds the deposit still
+        // succeeds on-chain but no relayer fills it, leaving the funds in limbo until the refund.
+        if q.get("is_amount_too_low").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(CoreError::rpc(
+                "amount is below the Across minimum for this route".to_string(),
+            ));
         }
+        let input_amount = U256::from_str(amount_wei)
+            .map_err(|_| CoreError::Amount("bad bridge amount".into()))?;
+        let max_deposit = U256::from_str(&gs("max_deposit")).unwrap_or(U256::ZERO);
+        if max_deposit > U256::ZERO && input_amount > max_deposit {
+            return Err(CoreError::rpc(
+                "amount exceeds the Across route capacity for this pair".to_string(),
+            ));
+        }
+
+        // A SpokePool address we can't parse would be sent to as-is and burn gas on a revert.
+        let spoke = parse_address(&gs("spoke_pool"))
+            .map_err(|_| CoreError::rpc("Across quote missing a usable SpokePool address".to_string()))?
+            .to_string();
         let me = parse_address(&self.address(from_index)?)?;
         let input_token = parse_address(&gs("input_token"))?;
         let output_token = parse_address(&gs("output_token"))?;
-        let input_amount = U256::from_str(amount_wei)
-            .map_err(|_| CoreError::Amount("bad bridge amount".into()))?;
         let output_amount = U256::from_str(&gs("output_amount")).unwrap_or(U256::ZERO);
+        if output_amount == U256::ZERO {
+            return Err(CoreError::rpc("Across quote returned no output amount".to_string()));
+        }
         let relayer_s = gs("exclusive_relayer");
         let exclusive_relayer = parse_address(if relayer_s.is_empty() {
             "0x0000000000000000000000000000000000000000"
         } else {
             &relayer_s
         })?;
-        let quote_timestamp: u32 = gs("timestamp").parse().unwrap_or(0);
-        let fill_deadline: u32 = gs("fill_deadline").parse().unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+        // Both timestamps are validated by the SpokePool (_depositV3): it reverts with
+        // InvalidQuoteTimestamp if the quote is in the future or older than depositQuoteTimeBuffer,
+        // and with InvalidFillDeadline past currentTime + fillDeadlineBuffer - a 0 for either is a
+        // guaranteed revert that burns the gas. Fall back to our own clock if the API omitted them:
+        // a minute in the past for the quote (ahead of chain time reverts outright), and two hours
+        // out for the fill, which is what Across's own quotes use.
+        let mut quote_timestamp: u32 = gs("timestamp").parse().unwrap_or(0);
+        if quote_timestamp == 0 {
+            quote_timestamp = now.saturating_sub(60);
+        }
+        let mut fill_deadline: u32 = gs("fill_deadline").parse().unwrap_or(0);
+        if fill_deadline == 0 {
+            fill_deadline = now.saturating_add(2 * 60 * 60);
+        }
+        if quote_timestamp == 0 || fill_deadline == 0 {
+            return Err(CoreError::rpc("Across quote is missing its deposit deadlines".to_string()));
+        }
         let exclusivity_deadline: u32 = gs("exclusivity_deadline").parse().unwrap_or(0);
         let native = q.get("input_is_native").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -2710,6 +3170,9 @@ impl Wallet {
             "value": if native { input_amount.to_string() } else { "0".to_string() },
             "native": native,
             "input_token": gs("input_token"),
+            "input_amount": amount_wei,
+            "decimals": q.get("decimals").and_then(|v| v.as_u64()).unwrap_or(18),
+            // From the FRESH quote - the caller should confirm against this, not the older estimate.
             "output_amount": gs("output_amount"),
             "is_amount_too_low": q.get("is_amount_too_low").and_then(|v| v.as_bool()).unwrap_or(false),
             "min_deposit": gs("min_deposit"),
@@ -2718,7 +3181,7 @@ impl Wallet {
     }
 
     /// DefiLlama current prices for a comma-separated list of coin keys
-    /// (e.g. `ethereum:0x…,coingecko:ethereum`). Used to cross-check CoW quote rates.
+    /// (e.g. `ethereum:0x...,coingecko:ethereum`). Used to cross-check CoW quote rates.
     pub async fn defillama_prices(&self, coins_csv: &str) -> Result<serde_json::Value> {
         let url = format!("https://coins.llama.fi/prices/current/{coins_csv}");
         self.provider()?.http_get_json(&url).await
@@ -2781,7 +3244,7 @@ impl Wallet {
         }
         // Selling the native coin via CoW needs eth-flow (only where a verified eth-flow contract is
         // configured, i.e. mainnet). On other CoW chains (e.g. Arbitrum) don't offer a CoW route for
-        // native sells — it would quote but fail to execute. Other routers handle native there.
+        // native sells - it would quote but fail to execute. Other routers handle native there.
         if sell_is_native && info.eth_flow.is_none() {
             return Err(CoreError::rpc("cow native-sell unavailable on this chain".to_string()));
         }
@@ -3015,24 +3478,23 @@ impl Wallet {
         let info = chain_info(provider.chain_id());
         let owner = self.address(index)?.to_lowercase();
 
-        let Some(bs) = info.blockscout_base else {
-            return Ok(Vec::new()); // no keyless explorer for this chain
-        };
-        let base = format!("{bs}/api?module=account");
-        let base = base.as_str();
+        let bases = crate::explorers::bases(provider.chain_id());
+        if bases.is_empty() {
+            return Ok(Vec::new()); // no explorer for this chain, and none configured
+        }
 
         let mut items: Vec<HistoryItem> = Vec::new();
 
         // Fetch the three explorer lists CONCURRENTLY (they're independent) instead of one after
-        // another — cuts an account's history latency to roughly that of a single list. Bounded by
+        // another - cuts an account's history latency to roughly that of a single list. Bounded by
         // the global RPC semaphore so the fan-out never floods Tor.
         let (txlist, tokentx, internal) = tokio::join!(
-            fetch_all_pages(provider, base, "txlist", &owner),
-            fetch_all_pages(provider, base, "tokentx", &owner),
-            fetch_all_pages(provider, base, "txlistinternal", &owner),
+            fetch_list(provider, &bases, "txlist", &owner),
+            fetch_list(provider, &bases, "tokentx", &owner),
+            fetch_list(provider, &bases, "txlistinternal", &owner),
         );
 
-        // Native ETH transactions — ALL pages, so an old wallet's early history (e.g. 2021) isn't
+        // Native ETH transactions - ALL pages, so an old wallet's early history (e.g. 2021) isn't
         // truncated to the most recent 100.
         for r in txlist {
             let s = |k: &str| r.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -3057,7 +3519,7 @@ impl Wallet {
             });
         }
 
-        // ERC20 token transfers — ALL pages.
+        // ERC20 token transfers - ALL pages.
         for r in tokentx {
             let s = |k: &str| r.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
             let to = s("to").to_lowercase();
@@ -3081,7 +3543,7 @@ impl Wallet {
             });
         }
 
-        // Internal (contract-initiated) native transfers TO the owner — ALL pages. These are the
+        // Internal (contract-initiated) native transfers TO the owner - ALL pages. These are the
         // native leg an EOA receives via a contract: the output of a token->native swap, a WETH
         // unwrap, a refund, etc. Without them a token->native swap looks like a one-sided "Sent"
         // (the native the user got back arrives by an internal tx, not the external tx list). Only
@@ -3118,7 +3580,7 @@ impl Wallet {
         items.retain(|h| {
             // Include the log index so two LEGITIMATE identical transfers of the same token+amount in
             // one tx (e.g. a batch/airdrop emitting two equal Transfer events) aren't collapsed into
-            // one — while true duplicate rows (same log index) from overlapping pages still dedup.
+            // one - while true duplicate rows (same log index) from overlapping pages still dedup.
             seen.insert(format!(
                 "{}|{}|{}|{}|{}",
                 h.tx_hash, h.token, h.direction, h.amount, h.log_index
@@ -3126,7 +3588,7 @@ impl Wallet {
         });
 
         // Collapse on-chain swaps into a single "Swap A -> B" row: any tx where the owner both sent
-        // asset A and received asset B (a router swap). CoW settlements are skipped here — they are
+        // asset A and received asset B (a router swap). CoW settlements are skipped here - they are
         // surfaced (with richer status) via `cow_orders`.
         let items = group_swaps(items);
 
@@ -3154,7 +3616,12 @@ impl Wallet {
         let owner = self.address(index)?;
         let url = format!("https://api.cow.fi/{cow}/api/v1/account/{owner}/orders?limit=200");
         let v = provider.http_get_json(&url).await?;
-        let arr = v.as_array().cloned().unwrap_or_default();
+        // CoW answers with a list, or with an object describing what went wrong. Reading the second
+        // as the first drops every pending swap out of History, which looks exactly like a swap that
+        // failed and left the money nowhere.
+        let Some(arr) = v.as_array().cloned() else {
+            return Err(CoreError::rpc(format!("cow orders: unexpected reply {v}")));
+        };
         let mut out = Vec::with_capacity(arr.len());
         for o in arr {
             let g = |k: &str| o.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
@@ -3208,17 +3675,28 @@ impl Wallet {
     /// Includes each collection's `reputation` so the UI can hide spam. Mainnet only.
     pub async fn account_nfts(&self, index: u32) -> Result<Vec<NftCollection>> {
         let provider = self.provider()?;
-        let Some(bs) = chain_info(provider.chain_id()).blockscout_base else {
-            return Ok(Vec::new()); // no keyless explorer for this chain
-        };
         let owner = self.address(index)?;
-        let url = format!("{bs}/api/v2/addresses/{owner}/nft/collections?type=ERC-721,ERC-1155");
-        // Not every keyless explorer implements the Blockscout v2 NFT endpoint (e.g. the Routescan
-        // Etherscan-compatible API used for Avalanche). Treat any failure/absence as "no NFTs" rather
-        // than surfacing an error.
-        let Ok(v) = provider.http_get_json(&url).await else {
+        // Not every explorer implements the Blockscout v2 NFT endpoint (the Routescan
+        // Etherscan-compatible API used for Avalanche does not, nor does an Etherscan V2 URL a user
+        // may have configured), and the one that does may be having a bad day. Try each in turn and
+        // treat "none of them answered" as "no NFTs" rather than as an error.
+        let mut v = serde_json::Value::Null;
+        for base in crate::explorers::bases(provider.chain_id()) {
+            if base.contains('?') {
+                continue; // a keyed Etherscan-style URL, which has no such endpoint
+            }
+            let url =
+                format!("{base}/api/v2/addresses/{owner}/nft/collections?type=ERC-721,ERC-1155");
+            if let Ok(body) = provider.http_get_json(&url).await {
+                if body.get("items").is_some() {
+                    v = body;
+                    break;
+                }
+            }
+        }
+        if v.is_null() {
             return Ok(Vec::new());
-        };
+        }
         let mut out = Vec::new();
         if let Some(items) = v.get("items").and_then(|i| i.as_array()) {
             for it in items {
@@ -3337,7 +3815,7 @@ impl Wallet {
     ) -> Result<SendResult> {
         let provider = self.provider()?;
         // The sending address comes from the account's derivation (software) or the device's cached
-        // address (hardware) — no local key material is required to build the tx.
+        // address (hardware) - no local key material is required to build the tx.
         let from: Address = parse_address(&self.address(from_index)?)?;
 
         let nonce = match nonce_override {
@@ -3501,8 +3979,8 @@ fn atomic_write(path: &str, bytes: &[u8]) -> Result<()> {
 }
 
 /// Ensure `secrets.account_order` is populated. Older wallet files (and freshly-built secrets) have
-/// no order; reconstruct the historical layout — HD accounts `0..account_count` followed by the
-/// imported keys — which preserves every account's existing index while making future
+/// no order; reconstruct the historical layout - HD accounts `0..account_count` followed by the
+/// imported keys - which preserves every account's existing index while making future
 /// `add_account`/`import_private_key` calls append without shifting anything.
 fn normalize_account_order(secrets: &mut WalletSecrets) {
     if !secrets.account_order.is_empty() {
@@ -3527,28 +4005,71 @@ fn normalize_account_order(secrets: &mut WalletSecrets) {
 /// rate-limits by IP, and every account in the wallet shares ONE Tor exit. A burst of per-account
 /// history fetches therefore reliably trips the limit, and Blockscout answers with
 /// `{"message":"NOTOK","result":"Max rate limit reached"}` (or a transport error). The old code
-/// treated a non-array `result` as "no more transactions" and returned an EMPTY list — so a
+/// treated a non-array `result` as "no more transactions" and returned an EMPTY list - so a
 /// rate-limited account silently contributed ZERO history. Across ~160 accounts that turned a full
 /// history into a tiny, wrong subset (the "only 221 transactions" bug).
 ///
 /// So: retry the SAME page with exponential backoff on a rate-limit / transient failure, and only
 /// stop on a genuine terminal response (an array shorter than a full page, or an explicit
-/// "no transactions found"). Bounded by MAX_PAGES and MAX_RETRIES so a pathological account can't
+/// "no transactions found"). Bounded by MAX_PAGES and `max_retries` so a pathological account can't
 /// loop forever.
+///
+/// The bool is whether the list was read to its end. False means the explorer stopped answering, and
+/// the caller should ask a different one rather than believe the short answer.
+///
+/// Fetch one list, moving to another explorer if the first stops answering.
+///
+/// Backing off against a single base is the right response to a rate limit but the wrong one to an
+/// explorer that is simply broken: when base.blockscout.com began answering 500 to everything, every
+/// account in the wallet spent half a minute exhausting its retries before giving up empty. So a base
+/// that fails is parked for the rest of the run and the next one is asked immediately.
+async fn fetch_list(
+    provider: &RpcProvider,
+    bases: &[String],
+    action: &str,
+    owner: &str,
+) -> Vec<serde_json::Value> {
+    let mut best: Vec<serde_json::Value> = Vec::new();
+    for (i, base) in bases.iter().enumerate() {
+        if crate::provider::shutting_down() {
+            break;
+        }
+        // Patience depends on whether there is anywhere else to go. With another base waiting, give
+        // up quickly and ask it. On the last one - which is every request on the chains that have
+        // only one explorer - keep retrying, because giving up here means the account silently
+        // contributes no history at all, which is the bug that once turned a full wallet into a
+        // couple of hundred transactions.
+        let last = i + 1 == bases.len();
+        let retries = if last { 6 } else { 2 };
+        let query = crate::explorers::query_base(base);
+        let (rows, complete) = fetch_all_pages(provider, &query, action, owner, retries).await;
+        if complete {
+            crate::explorers::mark_healthy(base);
+            return rows;
+        }
+        crate::explorers::park(base);
+        // Keep whatever the fullest attempt managed, in case every base is having a bad day.
+        if rows.len() > best.len() {
+            best = rows;
+        }
+    }
+    best
+}
+
 async fn fetch_all_pages(
     provider: &RpcProvider,
     base: &str,
     action: &str,
     owner: &str,
-) -> Vec<serde_json::Value> {
+    max_retries: u32,
+) -> (Vec<serde_json::Value>, bool) {
     const PER_PAGE: usize = 1000;
-    const MAX_PAGES: u32 = 25; // up to 25k txs per list — plenty, and bounds Tor round-trips
-    const MAX_RETRIES: u32 = 6; // per page, on rate-limit / transient error
+    const MAX_PAGES: u32 = 25; // up to 25k txs per list - plenty, and bounds Tor round-trips
     let mut out = Vec::new();
     let mut page = 1u32;
     while page <= MAX_PAGES {
         if crate::provider::shutting_down() {
-            return out; // app closing — stop paging and release the core lock promptly
+            return (out, true); // app closing - stop paging; not a failure of this explorer
         }
         let url = format!(
             "{base}&action={action}&address={owner}&sort=desc&page={page}&offset={PER_PAGE}"
@@ -3564,15 +4085,15 @@ async fn fetch_all_pages(
                         let n = rows.len();
                         out.extend(rows.iter().cloned());
                         if n < PER_PAGE {
-                            return out; // last page reached
+                            return (out, true); // last page reached
                         }
-                        break; // full page — go fetch the next one
+                        break; // full page - go fetch the next one
                     }
                     // `result` is missing or not an array. Two very different cases:
-                    //   • a genuine "No transactions found" (message == "No transactions found",
-                    //     result is often an empty string) → this account/list is simply done.
-                    //   • a rate-limit / server hiccup ("Max rate limit reached", "NOTOK", etc.)
-                    //     → must NOT be treated as done; back off and retry the SAME page.
+                    //   - a genuine "No transactions found" (message == "No transactions found",
+                    //     result is often an empty string) -> this account/list is simply done.
+                    //   - a rate-limit / server hiccup ("Max rate limit reached", "NOTOK", etc.)
+                    //     -> must NOT be treated as done; back off and retry the SAME page.
                     let msg = format!(
                         "{} {}",
                         v.get("message").and_then(|m| m.as_str()).unwrap_or(""),
@@ -3584,29 +4105,30 @@ async fn fetch_all_pages(
                         || msg.contains("too many")
                         || msg.contains("notok")
                         || msg.contains("try again");
-                    if rate_limited && attempt < MAX_RETRIES && !crate::provider::shutting_down() {
+                    if rate_limited && attempt < max_retries && !crate::provider::shutting_down() {
                         attempt += 1;
                         crate::provider::interruptible_sleep(backoff_delay(attempt)).await;
                         continue; // retry same page
                     }
-                    // Terminal: genuine empty result, or we've exhausted retries.
-                    return out;
+                    // A genuine empty result is the end of the list; a refusal we ran out of
+                    // patience with is not, and saying so sends the caller to another explorer.
+                    return (out, !rate_limited);
                 }
                 Err(_) => {
                     // Transport/parse error (often a 429 body that isn't JSON). Retry with backoff
                     // rather than silently dropping the rest of this account's history.
-                    if attempt < MAX_RETRIES && !crate::provider::shutting_down() {
+                    if attempt < max_retries && !crate::provider::shutting_down() {
                         attempt += 1;
                         crate::provider::interruptible_sleep(backoff_delay(attempt)).await;
                         continue;
                     }
-                    return out;
+                    return (out, false);
                 }
             }
         }
         page += 1;
     }
-    out
+    (out, true)
 }
 
 /// Exponential backoff (capped) for retrying a rate-limited explorer page: 0.5s, 1s, 2s, 4s, 8s, 8s.
@@ -3624,10 +4146,10 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Short "0x1234…abcd" form of an address for unknown-token display.
+/// Short "0x1234...abcd" form of an address for unknown-token display.
 fn short_addr_str(a: &str) -> String {
     if a.len() >= 12 {
-        format!("{}…{}", &a[..6], &a[a.len() - 4..])
+        format!("{}...{}", &a[..6], &a[a.len() - 4..])
     } else {
         a.to_string()
     }
@@ -3661,7 +4183,7 @@ fn parse_iso8601(s: &str) -> u64 {
 }
 
 /// Collapse on-chain swap transactions (owner sent asset A and received asset B in the same tx)
-/// into a single `kind == "swap"` `HistoryItem`. CoW settlement/vault txs are left untouched here —
+/// into a single `kind == "swap"` `HistoryItem`. CoW settlement/vault txs are left untouched here -
 /// those are surfaced with richer status via `Wallet::cow_orders` (avoiding duplicate rows).
 fn group_swaps(items: Vec<HistoryItem>) -> Vec<HistoryItem> {
     use std::collections::HashMap;
@@ -3750,9 +4272,29 @@ fn group_swaps(items: Vec<HistoryItem>) -> Vec<HistoryItem> {
     result
 }
 
+/// Read a redemption amount, rejecting anything that is not a positive finite number.
+///
+/// `parse::<f64>()` happily accepts `inf` and `NaN`, and either one would sail through a later
+/// "is it more than the balance?" comparison and be formatted into a transfer amount.
+fn parse_xmr_amount(s: &str) -> Result<f64> {
+    let amount: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| CoreError::Amount(format!("'{}' is not an amount", s.trim())))?;
+    if !amount.is_finite() || amount <= 0.0 {
+        return Err(CoreError::Amount("enter an amount greater than zero".to_string()));
+    }
+    Ok(amount)
+}
+
+/// XMR to piconero.
+fn to_atomic(xmr: f64) -> u64 {
+    (xmr * crate::wagyu::ATOMIC_PER_XMR as f64).round() as u64
+}
+
 fn parse_address(s: &str) -> Result<Address> {
     let t = s.trim();
-    // If the input is MIXED-case it carries an EIP-55 checksum — enforce it so a mistyped/corrupted
+    // If the input is MIXED-case it carries an EIP-55 checksum - enforce it so a mistyped/corrupted
     // paste (a wrong checksum) is rejected rather than silently accepted (funds-loss defence). All-
     // lower / all-upper input has no checksum to verify, so parse it leniently.
     let hex = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
@@ -3994,6 +4536,38 @@ fn parse_openocean_quote(resp: &serde_json::Value) -> Result<RouterQuote> {
     })
 }
 
+/// Summarise what the exchange did with an order.
+///
+/// An order either rests on the book or fills immediately, and the caller needs to say which -
+/// "order placed" after a market order that already filled would read as though nothing happened.
+fn hl_order_result(reply: &serde_json::Value) -> serde_json::Value {
+    let status = reply
+        .get("response")
+        .and_then(|r| r.get("data"))
+        .and_then(|d| d.get("statuses"))
+        .and_then(|s| s.as_array())
+        .and_then(|s| s.first());
+
+    match status {
+        Some(s) if s.get("filled").is_some() => {
+            let f = &s["filled"];
+            serde_json::json!({
+                "state": "filled",
+                "size": f.get("totalSz").and_then(|x| x.as_str()).unwrap_or("0"),
+                "price": f.get("avgPx").and_then(|x| x.as_str()).unwrap_or("0"),
+                "oid": f.get("oid").and_then(|x| x.as_u64()).unwrap_or(0),
+            })
+        }
+        Some(s) if s.get("resting").is_some() => serde_json::json!({
+            "state": "resting",
+            "oid": s["resting"].get("oid").and_then(|x| x.as_u64()).unwrap_or(0),
+        }),
+        // An IOC order that crossed nothing is cancelled outright rather than rejected, which is
+        // not an error but is also not a trade.
+        _ => serde_json::json!({ "state": "none" }),
+    }
+}
+
 pub fn format_units(value: U256, decimals: u8) -> String {
     // A malicious token can report absurd decimals; 10^decimals overflows U256 past ~77. Clamp so a
     // crafted token can't panic the formatter (it just displays with fewer places).
@@ -4035,6 +4609,62 @@ pub fn parse_units(amount: &str, decimals: u8) -> Result<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A loopback explorer that answers every request with `body`, for exercising the failover
+    /// without waiting for a real one to break.
+    fn serve_explorer(body: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(16) {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn history_moves_to_another_explorer_when_one_stops_answering() {
+        // The wording Blockscout and Etherscan both use when they have had enough of a caller. Read
+        // as "this account has no transactions", it silently empties a wallet's history.
+        let limited = serve_explorer(r#"{"status":"0","message":"NOTOK","result":"Max rate limit reached"}"#);
+        let working = serve_explorer(
+            r#"{"status":"1","message":"OK","result":[{"hash":"0xabc","value":"1","blockNumber":"1"}]}"#,
+        );
+
+        let provider = RpcProvider::new(&crate::provider::ProviderConfig {
+            chain_id: 1,
+            endpoints: vec!["http://127.0.0.1:1".into()],
+            socks_proxy: None,
+            allow_clearnet: true,
+            timeout_secs: 10,
+        })
+        .expect("provider");
+
+        // A chain of its own, so this test can't be disturbed by another one running beside it.
+        const CHAIN: u64 = 424242;
+        crate::explorers::set_custom(CHAIN, vec![limited.clone(), working.clone()]);
+        assert_eq!(crate::explorers::bases(CHAIN), vec![limited.clone(), working.clone()]);
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let bases = crate::explorers::bases(CHAIN);
+        let rows = rt.block_on(fetch_list(&provider, &bases, "txlist", "0xdead"));
+        assert_eq!(rows.len(), 1, "should have read the list from the second explorer");
+
+        // And the one that refused is remembered, so the next of the wallet's accounts starts on the
+        // explorer that works instead of spending its retries discovering the same thing again.
+        assert_eq!(crate::explorers::bases(CHAIN), vec![working, limited]);
+        crate::explorers::set_custom(CHAIN, Vec::new());
+    }
 
     #[test]
     fn ens_namehash_matches_eip137_vectors() {
@@ -4198,7 +4828,7 @@ mod tests {
     #[test]
     fn change_password_reencrypts_over_existing_file() {
         // Simulates the "change password" flow: save, then save AGAIN over the same file with a new
-        // password. The overwrite must be atomic/clean — the old password must stop working and the
+        // password. The overwrite must be atomic/clean - the old password must stop working and the
         // new one must open the identical wallet (no corruption, no key loss).
         let phrase = "test test test test test test test test test test test junk";
         let w = Wallet::restore(phrase).unwrap();

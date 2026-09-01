@@ -56,7 +56,7 @@ This writes `dist/SHA256SUMS` in the standard `<hash>  <path>` format.
 Sign the checksum file (not each artifact) with the project key. Either tool is fine; publish the
 public key in the repo and the release notes.
 
-**minisign** (recommended — small, no keyring):
+**minisign** (recommended - small, no keyring):
 
 ```powershell
 minisign -Sm dist/SHA256SUMS          # produces dist/SHA256SUMS.minisig

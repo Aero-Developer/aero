@@ -31,7 +31,7 @@ static bool hasHomoglyphSymbol(const QString &symbol) {
 
 // True if this transfer is an ERC-20 the user doesn't track. Attackers emit fake `Transfer` events
 // (address-poisoning) that appear in history as though *you* sent funds, so we cannot trust the
-// direction OR the symbol — we trust only the official tracked contract-address allow-list. This
+// direction OR the symbol - we trust only the official tracked contract-address allow-list. This
 // covers both unsolicited incoming airdrops and spoofed "outgoing" transactions you never signed.
 bool HistoryModel::isSpamToken(const HistoryItem &h) const {
     if (h.token.isEmpty())
@@ -68,7 +68,7 @@ static QString capAmount(const QString &raw) {
 //   * spoofed zero-value ERC-20 Transfer events of REAL tokens (DAI/USDT/EURC/…) where YOUR address
 //     is spoofed as the sender, so they'd otherwise show as bogus "Sent 0 DAI" rows. You never
 //     legitimately send 0 of a token, so any zero-value token transfer (either direction) is spam.
-// A zero-value NATIVE transaction is kept — that's a genuine contract call (approve/swap/revoke).
+// A zero-value NATIVE transaction is kept - that's a genuine contract call (approve/swap/revoke).
 static bool isPoisoning(const HistoryItem &h) {
     const bool zero = h.amount.isEmpty() || h.amount == QLatin1String("0");
     if (!zero)
@@ -119,7 +119,7 @@ void HistoryModel::rebuildPoisonRefs() {
         if (h.kind == QLatin1String("swap"))
             continue;
         const bool nonzero = !(h.amount.isEmpty() || h.amount == QLatin1String("0"));
-        // Only trust a counterparty as "real" if it moved value and isn't itself a spam token — so a
+        // Only trust a counterparty as "real" if it moved value and isn't itself a spam token - so a
         // poisoning entry can never seed its own look-alike reference.
         if (nonzero && !isSpamToken(h))
             addRef(h.counterparty.toLower());
@@ -133,14 +133,14 @@ void HistoryModel::rebuildPoisonRefs() {
 bool HistoryModel::isVanityLookalike(const HistoryItem &h) const {
     const QString a = h.counterparty.toLower();
     if (!isEvmAddress(a) || m_poisonRefAddrs.contains(a))
-        return false; // not an address, or an exact legit address — not a look-alike
+        return false; // not an address, or an exact legit address - not a look-alike
     return m_poisonRefSigs.contains(addrSignature(a));
 }
 
 bool HistoryModel::isHiddenSpam(const HistoryItem &h) const {
     if (h.kind == QLatin1String("swap"))
         return false; // swaps are user-initiated, never spam
-    // Never hide the user's own just-broadcast (pending) send — it must appear in history instantly.
+    // Never hide the user's own just-broadcast (pending) send - it must appear in history instantly.
     if (h.status == QLatin1String("pending") && h.direction == QLatin1String("out"))
         return false;
     if (isPoisoning(h) || isSpamToken(h))
@@ -286,7 +286,7 @@ void HistoryModel::setSearchText(const QString &text) {
 }
 
 void HistoryModel::sort(int column, Qt::SortOrder order) {
-    // No-op when nothing changed — this also breaks the recursion the view would otherwise cause by
+    // No-op when nothing changed - this also breaks the recursion the view would otherwise cause by
     // re-issuing sort() after each model reset (we own the ordering, there is no proxy).
     if (column == m_sortColumn && order == m_sortOrder)
         return;
@@ -392,7 +392,7 @@ void HistoryModel::setOwnAddresses(const QSet<QString> &addrs) {
     for (const QString &a : addrs)
         lower.insert(a.toLower());
     if (lower == m_ownAddresses)
-        return; // unchanged — avoid a needless re-filter
+        return; // unchanged - avoid a needless re-filter
     m_ownAddresses = lower;
     rebuildVisible(); // look-alike detection references the wallet's own addresses
 }
@@ -404,7 +404,7 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
     const HistoryItem &h = m_items.at(index.row());
 
     // Show the asset's logo next to the amount. Only *native* ETH (empty token address) may use the
-    // ETH logo — an ERC-20 that calls itself "ETH" is a scam and must not borrow it. Unknown tokens
+    // ETH logo - an ERC-20 that calls itself "ETH" is a scam and must not borrow it. Unknown tokens
     // get no logo (QIcon(path) is never null even when the resource is missing, so check existence).
     if (role == Qt::DecorationRole && index.column() == Column_Amount) {
         const QString sym = h.token.isEmpty() ? QStringLiteral("ETH") : h.symbol.toUpper();
@@ -441,7 +441,7 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
         // Spam/poisoning rows are normally hidden; if visible (toggle off) label them clearly.
         if (isSpamToken(h))
             return tr("Unsolicited/spam token transfer. This is NOT native ETH and does not affect "
-                      "your balance — likely a scam token impersonating a real asset. Do not "
+                      "your balance - likely a scam token impersonating a real asset. Do not "
                       "interact with it.");
         if (isPoisoning(h))
             return tr("Possible address-poisoning: zero-value transfer. Do not trust this address.");
@@ -503,7 +503,7 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
         case Column_Value: {
             const double price = unitPriceFor(h);
             if (price <= 0.0)
-                return QStringLiteral("—"); // price not known (yet) for this asset
+                return QStringLiteral("-"); // price not known (yet) for this asset
             const double val = h.formatted.toDouble() * price * m_fiatRate;
             return QStringLiteral("%1%2").arg(m_fiatSymbol, grouped2(val, 2));
         }
@@ -586,7 +586,7 @@ void HistoryModel::beginFullRefresh() {
     m_fetched.clear();
     m_seen.clear();
     // Show any optimistic pending swaps on top until the fetched (settled) copy arrives, which
-    // appendBatch then reconciles. NOTE: we deliberately do NOT seed m_seen with local swap UIDs —
+    // appendBatch then reconciles. NOTE: we deliberately do NOT seed m_seen with local swap UIDs -
     // doing so made appendBatch skip the fetched settled order, so the pending row never flipped to
     // filled/failed (the "stuck on pending forever" bug).
     m_allItems = m_localSwaps;
@@ -608,7 +608,7 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
             // first; if that fails, fall back to a content match. The fallback is essential for CoW
             // eth-flow (native-ETH) swaps: we place the pending row under the on-chain tx hash, but
             // the settled order comes back from cow_orders keyed by the CoW order UID, so the ids
-            // never match — without this the successful swap would linger "pending" and then wrongly
+            // never match - without this the successful swap would linger "pending" and then wrongly
             // flip to "failed".
             QString removedLocalHash;
             for (int i = 0; i < m_localSwaps.size(); ++i)
@@ -649,7 +649,7 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
             continue;
         }
         // Reconcile an optimistic pending SEND against its real mined row (same txHash): drop the
-        // pending local copy so the confirmed row (with block/timestamp/fee) replaces it — no duplicate.
+        // pending local copy so the confirmed row (with block/timestamp/fee) replaces it - no duplicate.
         if (!h.txHash.isEmpty()) {
             const QString hx = h.txHash.toLower();
             bool wasLocal = false;
@@ -699,7 +699,7 @@ void HistoryModel::rebuildAll() {
         };
         dropReconciled(m_localSwaps);
         dropReconciled(m_localSends);
-        // Content-match fallback for swaps whose ids differ from the fetched copy (CoW eth-flow — see
+        // Content-match fallback for swaps whose ids differ from the fetched copy (CoW eth-flow - see
         // appendBatch), so a settled order also clears its optimistic pending row here.
         m_localSwaps.erase(
             std::remove_if(m_localSwaps.begin(), m_localSwaps.end(),

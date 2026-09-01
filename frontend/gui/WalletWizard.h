@@ -140,8 +140,11 @@ private:
     Ui::PageSetPassword *ui;
 };
 
-// Connect a Ledger/Trezor: pick the device type, detect it, optionally enter a passphrase
-// (Trezor Suite style), then derive a watch-only wallet whose keys stay on the device.
+// Connect a Ledger/Trezor: detect whatever is plugged in, optionally enter a passphrase, then
+// derive a watch-only wallet whose keys stay on the device.
+//
+// The device type is detected rather than chosen. The radio buttons only appear in the one case
+// where detection cannot decide for us: a Ledger and a Trezor connected at the same time.
 class HardwarePage : public QWizardPage
 {
     Q_OBJECT
@@ -153,13 +156,18 @@ public:
 
 private:
     void refreshDevices();
+    /// The device family to use: whichever was detected, or the picked one if both are present.
+    QString detectedKind() const;
+
     WalletWizard *m_w;
     QRadioButton *m_ledger = nullptr;
     QRadioButton *m_trezor = nullptr;
+    QWidget *m_choiceRow = nullptr;
     QLabel *m_status = nullptr;
     QCheckBox *m_usePass = nullptr;
     QLineEdit *m_passphrase = nullptr;
     QLabel *m_error = nullptr;
+    QString m_found; // "ledger", "trezor", "both", or empty
 };
 
 // Watch-only: enter one or more 0x addresses to track without keys (view balances/history, no

@@ -8,7 +8,11 @@
 //!   no host-passphrase API, so any BIP39 passphrase is entered on the device itself.
 //! * Trezor: driven through `trezor-client` directly (not `alloy-signer-trezor`) so we can inject a
 //!   host-entered passphrase (Trezor Suite style) via the `PassphraseRequest` -> `ack_passphrase`
-//!   flow. Requires the WinUSB driver on Windows (installed by Trezor Suite/Bridge).
+//!   flow. Talks to the device directly over USB - no vendor bridge or suite needs to be running.
+//! * Trezor, 2025+ models (Safe 5/7, T3W1): those speak only the Trezor-Host Protocol and reject
+//!   the client above with `Failure_InvalidProtocol`. They are handled by `thp_conn`, which this
+//!   module falls back to. Unlike the rest of this layer, a THP connection is held open and reused,
+//!   because establishing one costs a full Noise handshake.
 //!
 //! All accounts use the standard BIP44 path `m/44'/60'/0'/0/{index}` (matching Aero's software
 //! wallets and MetaMask).
@@ -41,6 +45,69 @@ impl HwKind {
             "trezor" => Ok(HwKind::Trezor),
             other => Err(CoreError::rpc(format!("unknown hardware kind: {other}"))),
         }
+    }
+}
+
+/// Which protocol the attached Trezor speaks.
+///
+/// Worth remembering rather than re-deciding: finding out costs a rejected handshake, and for a THP
+/// device the legacy client retries several times before giving up. Cleared whenever a device is
+/// unplugged or an operation fails outright, so swapping devices re-probes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrezorProtocol {
+    Legacy,
+    Thp,
+}
+
+static TREZOR_PROTOCOL: std::sync::Mutex<Option<TrezorProtocol>> = std::sync::Mutex::new(None);
+
+fn remembered_protocol() -> Option<TrezorProtocol> {
+    *TREZOR_PROTOCOL.lock().unwrap()
+}
+
+fn remember_protocol(p: Option<TrezorProtocol>) {
+    *TREZOR_PROTOCOL.lock().unwrap() = p;
+}
+
+/// Run a Trezor operation, over whichever protocol the device speaks.
+///
+/// On the first operation both are tried, legacy first so that existing devices behave exactly as
+/// before. If both fail, both errors are reported: the legacy error alone is misleading on a THP
+/// device, and the THP error alone is misleading on a legacy one.
+fn trezor_op<T>(
+    legacy: impl Fn() -> std::result::Result<T, String>,
+    thp: impl Fn() -> std::result::Result<T, String>,
+) -> Result<T> {
+    match remembered_protocol() {
+        Some(TrezorProtocol::Legacy) => legacy().map_err(|e| {
+            remember_protocol(None);
+            CoreError::rpc(e)
+        }),
+        Some(TrezorProtocol::Thp) => thp().map_err(|e| {
+            remember_protocol(None);
+            crate::thp_conn::disconnect();
+            CoreError::rpc(e)
+        }),
+        None => match legacy() {
+            Ok(v) => {
+                remember_protocol(Some(TrezorProtocol::Legacy));
+                Ok(v)
+            }
+            Err(legacy_err) => match thp() {
+                Ok(v) => {
+                    remember_protocol(Some(TrezorProtocol::Thp));
+                    Ok(v)
+                }
+                Err(thp_err) => {
+                    crate::thp_conn::disconnect();
+                    Err(CoreError::rpc(format!(
+                        "could not talk to the Trezor.\n\
+                         As an older device (Model One/T, Safe 3): {legacy_err}\n\
+                         As a 2025+ device (Safe 5/7): {thp_err}"
+                    )))
+                }
+            },
+        },
     }
 }
 
@@ -108,17 +175,24 @@ pub async fn get_addresses(
             Ok(out)
         }
         HwKind::Trezor => {
-            let mut client = connect_trezor()?;
-            let mut out = Vec::with_capacity(count as usize);
-            for i in start..start + count {
-                let s = trezor_get_address(&mut client, trezor_path(i), passphrase)
-                    .map_err(CoreError::rpc)?;
-                let addr = s
-                    .parse::<Address>()
-                    .map_err(|e| CoreError::rpc(format!("bad Trezor address {s}: {e}")))?;
-                out.push(addr.to_checksum(None));
-            }
-            Ok(out)
+            let raw = trezor_op(
+                || {
+                    let mut client = connect_trezor().map_err(|e| e.to_string())?;
+                    let mut out = Vec::with_capacity(count as usize);
+                    for i in start..start + count {
+                        out.push(trezor_get_address(&mut client, trezor_path(i), passphrase)?);
+                    }
+                    Ok(out)
+                },
+                || crate::thp_conn::get_addresses(passphrase, start, count),
+            )?;
+            raw.into_iter()
+                .map(|s| {
+                    s.parse::<Address>()
+                        .map(|a| a.to_checksum(None))
+                        .map_err(|e| CoreError::rpc(format!("bad Trezor address {s}: {e}")))
+                })
+                .collect()
         }
     }
 }
@@ -170,23 +244,46 @@ pub async fn trezor_sign_tx(
     data: &[u8],
     chain_id: u64,
 ) -> Result<Signature> {
-    let mut client = connect_trezor()?;
-    let path = trezor_path(index);
     let to_str = to.to_checksum(None);
-    let sig = if legacy {
-        trezor_sign_legacy(
-            &mut client, path, u_be(nonce as u128), u_be(gas_price), u_be(gas_limit as u128),
-            to_str, value.to_be_bytes_trimmed_vec(), data.to_vec(), chain_id, passphrase,
-        )
-    } else {
-        trezor_sign_eip1559(
-            &mut client, path, u_be(nonce as u128), u_be(gas_limit as u128), to_str,
-            value.to_be_bytes_trimmed_vec(), data.to_vec(), chain_id, u_be(max_fee),
-            u_be(max_priority), passphrase,
-        )
-    }
-    .map_err(CoreError::rpc)?;
-    Ok(sig)
+    // THP carries amounts as u128. Every real Ether amount fits (u128 wei is ~3.4e20 ETH), but
+    // check rather than truncate: a silently wrong amount is the worst possible failure here.
+    let value_u128: u128 = value
+        .try_into()
+        .map_err(|_| CoreError::rpc("transaction value is too large to sign on this device"))?;
+
+    trezor_op(
+        || {
+            let mut client = connect_trezor().map_err(|e| e.to_string())?;
+            let path = trezor_path(index);
+            if legacy {
+                trezor_sign_legacy(
+                    &mut client, path, u_be(nonce as u128), u_be(gas_price), u_be(gas_limit as u128),
+                    to_str.clone(), value.to_be_bytes_trimmed_vec(), data.to_vec(), chain_id,
+                    passphrase,
+                )
+            } else {
+                trezor_sign_eip1559(
+                    &mut client, path, u_be(nonce as u128), u_be(gas_limit as u128), to_str.clone(),
+                    value.to_be_bytes_trimmed_vec(), data.to_vec(), chain_id, u_be(max_fee),
+                    u_be(max_priority), passphrase,
+                )
+            }
+        },
+        || {
+            let (v, r, s) = if legacy {
+                crate::thp_conn::sign_legacy(
+                    passphrase, index, nonce, gas_limit, gas_price, &to_str, value_u128, data,
+                    chain_id,
+                )?
+            } else {
+                crate::thp_conn::sign_eip1559(
+                    passphrase, index, nonce, gas_limit, max_fee, max_priority, &to_str,
+                    value_u128, data, chain_id,
+                )?
+            };
+            parity_signature(v, &r, &s)
+        },
+    )
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -198,7 +295,7 @@ fn connect_trezor() -> Result<Trezor> {
     // unacknowledged USB packet buffered on the device; the next `Initialize` then trips over that
     // stale message and the device replies `Failure_InvalidProtocol` (or a malformed-chunk error).
     // Dropping the handle and reconnecting drains the stale message, so retry a few times with a
-    // fresh connection before giving up — this is what Trezor's own host tools do.
+    // fresh connection before giving up - this is what Trezor's own host tools do.
     let mut last = String::new();
     for attempt in 0..4 {
         match trezor_client::unique(false) {
@@ -214,11 +311,11 @@ fn connect_trezor() -> Result<Trezor> {
     }
     let low = last.to_ascii_lowercase();
     let hint = if low.contains("invalidprotocol") || low.contains("invalid protocol") {
-        // The device rejected Codec v1 outright — it speaks only the newer encrypted Trezor-Host
+        // The device rejected Codec v1 outright - it speaks only the newer encrypted Trezor-Host
         // Protocol (THP), used by 2025+ models (Safe 5/7, T3W1). Our Trezor library is Codec v1 only,
         // so it can't pair with a THP device yet.
         "  (this is a newer Trezor that uses the encrypted Trezor-Host Protocol, which Aero does not \
-         support yet — older Trezors: Model One/T, Safe 3 work. Use Trezor Suite/MetaMask with a THP \
+         support yet - older Trezors: Model One/T, Safe 3 work. Use Trezor Suite/MetaMask with a THP \
          device for now.)"
     } else if low.contains("protocol") || low.contains("chunk") {
         "  (unplug and reconnect the Trezor, close Trezor Suite/Bridge if it's open, then retry)"

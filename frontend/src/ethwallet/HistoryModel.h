@@ -68,7 +68,7 @@ public:
     int totalRows() const { return m_filtered.size(); }       // rows across ALL pages (post-filter)
 
     // Distinct ERC-20 contract addresses (lower-case) present in history that aren't currently
-    // trusted and aren't obvious homoglyph/ETH impersonators — candidates for a liquidity check.
+    // trusted and aren't obvious homoglyph/ETH impersonators - candidates for a liquidity check.
     QStringList untrackedTokenAddresses() const;
 
 public slots:
@@ -180,7 +180,7 @@ private:
     QVector<HistoryItem> m_filtered;   // full filtered + sorted result (all pages)
     QVector<HistoryItem> m_items;    // the CURRENT PAGE slice of m_filtered (what the view renders)
     QSet<QString> m_knownTokens;
-    QSet<QString> m_ownAddresses;   // wallet's own addresses (lower-case) — poisoning targets
+    QSet<QString> m_ownAddresses;   // wallet's own addresses (lower-case) - poisoning targets
     QSet<QString> m_poisonRefAddrs; // legit addresses (own + real counterparties), lower-case
     QSet<QString> m_poisonRefSigs;  // first4+last4 hex signatures of the above (look-alike index)
     bool m_hideSpam = true;

@@ -9,6 +9,29 @@
 use std::io::{self, Write};
 
 use aero_core::keys::WordCount;
+
+/// Where the THP pairing credential lives. Deliberately outside the working directory so that
+/// replacing the diagnostic folder does not discard the pairing and force the device to be paired
+/// again. An existing file next to the executable is migrated across on first use.
+fn thp_pairing_path() -> std::path::PathBuf {
+    const NAME: &str = "thp-pairing.txt";
+    let base = std::env::var("APPDATA")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".config")));
+    let Ok(base) = base else { return std::path::PathBuf::from(NAME) };
+
+    let dir = base.join("aero");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return std::path::PathBuf::from(NAME);
+    }
+    let path = dir.join(NAME);
+
+    let legacy = std::path::PathBuf::from(NAME);
+    if !path.exists() && legacy.exists() {
+        let _ = std::fs::copy(&legacy, &path);
+    }
+    path
+}
 use aero_core::provider::ProviderConfig;
 use aero_core::wallet::{parse_units, Wallet};
 
@@ -31,6 +54,57 @@ fn main() {
         match aero_core::thp::probe() {
             Ok(s) => println!("{s}"),
             Err(e) => println!("THP probe failed: {e}"),
+        }
+        return;
+    }
+
+    // Headless THP diagnostic: `aero thp-handshake` goes one step further than `thp-probe` and runs
+    // the Noise_XX handshake, which is also the first exercise of the ACK/synchronization layer.
+    if std::env::args().nth(1).as_deref() == Some("thp-handshake") {
+        match aero_core::thp::handshake_probe() {
+            Ok(s) => println!("{s}"),
+            Err(e) => println!("THP handshake failed: {e}"),
+        }
+        return;
+    }
+
+    // Headless THP diagnostic: `aero thp-pair` performs CodeEntry pairing and stores the issued
+    // credential next to the executable, so a second run exercises the skip-pairing path.
+    if std::env::args().nth(1).as_deref() == Some("thp-pair") {
+        let path = thp_pairing_path();
+        match aero_core::thp::pair_probe(&path) {
+            Ok(s) => println!("{s}"),
+            Err(e) => println!("THP pairing failed: {e}"),
+        }
+        return;
+    }
+
+    // Headless THP diagnostic: `aero thp-address` reconnects using the stored credential, opens
+    // sessions and derives Ethereum addresses from the seed.
+    if matches!(std::env::args().nth(1).as_deref(), Some("thp-address") | Some("thp-sign")) {
+        let signing = std::env::args().nth(1).as_deref() == Some("thp-sign");
+        let path = thp_pairing_path();
+        // Prompted rather than taken as an argument so it does not land in shell history.
+        // Deliberately not called a "BIP-39 passphrase": the passphrase (hidden wallet) feature is
+        // independent of whether the backup is BIP-39 or SLIP-39, and the wire field is just a
+        // string that the device applies according to its own backup type.
+        println!("Passphrase (any throwaway value works for this test; blank = standard wallet):");
+        let mut line = String::new();
+        let passphrase = match std::io::stdin().read_line(&mut line) {
+            Ok(_) => {
+                let p = line.trim_end_matches(['\r', '\n']).to_string();
+                if p.is_empty() { None } else { Some(p) }
+            }
+            Err(_) => None,
+        };
+        let result = if signing {
+            aero_core::thp::sign_probe(&path, passphrase.as_deref())
+        } else {
+            aero_core::thp::address_probe(&path, passphrase.as_deref())
+        };
+        match result {
+            Ok(s) => println!("{s}"),
+            Err(e) => println!("THP {} failed: {e}", if signing { "signing" } else { "address" }),
         }
         return;
     }
@@ -100,11 +174,16 @@ fn run_bench(rt: &tokio::runtime::Runtime) {
         .ok()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
         .unwrap_or_else(|| {
+            // Kept in step with the app's own list (kDefaultEndpoints in AeroMainWindow.cpp) so a
+            // bench measures what users actually talk to.
             vec![
                 "https://ethereum-rpc.publicnode.com".into(),
                 "https://eth.drpc.org".into(),
                 "https://eth.merkle.io".into(),
                 "https://1rpc.io/eth".into(),
+                "https://rpc.flashbots.net".into(),
+                "https://eth-mainnet.public.blastapi.io".into(),
+                "https://eth.rpc.blxrbdn.com".into(),
             ]
         });
 
@@ -165,7 +244,7 @@ fn run_bench(rt: &tokio::runtime::Runtime) {
             let _ = tokio::join!(w.all_balances(naccts, &extras), w.native_usd_price(), w.market_prices());
         };
         // Foreground probe: repeatedly time an interactive fee estimate while the storm runs. This is
-        // the number that matters — how long a thing the user is waiting on takes under background load.
+        // the number that matters - how long a thing the user is waiting on takes under background load.
         let probe = async {
             let mut lats: Vec<u128> = Vec::new();
             for _ in 0..15u32 {
@@ -205,7 +284,7 @@ fn run_bench(rt: &tokio::runtime::Runtime) {
 
 fn banner() {
     println!("========================================================");
-    println!("  Aero — portable Ethereum wallet console (aero_core)");
+    println!("  Aero - portable Ethereum wallet console (aero_core)");
     println!("  version {}", env!("CARGO_PKG_VERSION"));
     println!("========================================================");
     println!("  Keys stay local. Network calls go over Tor when a SOCKS");
@@ -252,7 +331,7 @@ fn restore_wallet() -> Wallet {
                 println!("  restored. address #0: {}", w.address(0).unwrap());
                 return w;
             }
-            Err(e) => println!("  {e} — try again"),
+            Err(e) => println!("  {e} - try again"),
         }
     }
 }

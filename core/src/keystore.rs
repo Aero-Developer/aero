@@ -25,9 +25,9 @@ use zeroize::Zeroize;
 use crate::error::{CoreError, Result};
 
 // File format versions:
-//   v1 — no stored Argon2 params (used `Argon2::default()`).
-//   v2 — stores Argon2 params in the (unauthenticated) header.
-//   v3 — additionally binds the header (version/kdf/params/salt/nonce) as AES-GCM associated data,
+//   v1 - no stored Argon2 params (used `Argon2::default()`).
+//   v2 - stores Argon2 params in the (unauthenticated) header.
+//   v3 - additionally binds the header (version/kdf/params/salt/nonce) as AES-GCM associated data,
 //        so the KDF parameters can't be tampered with or downgraded. New wallets are written as v3.
 // Older versions still decrypt for backward compatibility.
 const VERSION: u32 = 3;
@@ -46,7 +46,7 @@ pub struct TokenRef {
     pub decimals: u8,
 }
 
-/// Watch-only descriptor for a hardware-wallet file. Contains NO secrets — only the device kind
+/// Watch-only descriptor for a hardware-wallet file. Contains NO secrets - only the device kind
 /// and the public addresses derived at create time (so the UI can show accounts). The private keys
 /// never leave the Ledger/Trezor; every signature requires the device to be connected.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,7 +59,7 @@ pub struct HwDescriptor {
 
 /// One account slot, giving each unified account index a *stable* identity. Without this, deriving
 /// "HD accounts first, then imported keys" meant adding an HD account shifted every imported key's
-/// index — remapping which key an index signs with, and misaligning per-index labels/history.
+/// index - remapping which key an index signs with, and misaligning per-index labels/history.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AccountEntry {
     /// HD account at the standard BIP44 derivation index `m/44'/60'/0'/0/{0}`.
@@ -96,7 +96,7 @@ pub struct WalletSecrets {
     #[serde(default)]
     pub hardware: Option<HwDescriptor>,
     /// Address-only watch wallet: when non-empty (and no mnemonic/hardware), the wallet tracks these
-    /// addresses with no keys — balances/history work, signing/sending is refused. Absent in older
+    /// addresses with no keys - balances/history work, signing/sending is refused. Absent in older
     /// files (serde default).
     #[serde(default)]
     pub watch_addresses: Vec<String>,
@@ -162,7 +162,7 @@ fn header_aad(version: u32, kdf: &str, m: u32, t: u32, p: u32, salt_hex: &str, n
         .into_bytes()
 }
 
-// Opaque binary format (v4). The whole file is a raw byte blob — no self-describing JSON — so
+// Opaque binary format (v4). The whole file is a raw byte blob - no self-describing JSON - so
 // casual inspection reveals nothing (matching Feather's look and leaking no metadata about the
 // wallet). Layout:
 //   MAGIC(4) | version(1)=4 | m_cost(4 BE) | t_cost(4 BE) | p_cost(4 BE) |
@@ -274,7 +274,7 @@ fn decrypt_legacy_json(data: &[u8], password: &str) -> Result<WalletSecrets> {
     let ciphertext =
         hex::decode(&env.ciphertext).map_err(|e| CoreError::Keystore(e.to_string()))?;
 
-    // Only version-1 files predate stored params (crate default). v2/v3 MUST carry their params —
+    // Only version-1 files predate stored params (crate default). v2/v3 MUST carry their params -
     // refusing the default fallback here stops an attacker from stripping params to force a weaker
     // KDF (a downgrade). For v3 the params are additionally authenticated via the AAD below.
     let (argon, params) = match (env.version, env.m_cost, env.t_cost, env.p_cost) {
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn tampering_binary_header_fails() {
         // The v4 header (magic/version/params/salt/nonce) is bound as AES-GCM AAD, so flipping any
-        // header byte — e.g. trying to lower the Argon2 memory cost — fails authentication.
+        // header byte - e.g. trying to lower the Argon2 memory cost - fails authentication.
         let mut blob = encrypt(&sample(""), "pw").unwrap();
         assert!(decrypt(&blob, "pw").is_ok());
         // Flip the LOW m_cost byte (offset 8): the value stays plausible (passes the param clamp), so
@@ -345,7 +345,7 @@ mod tests {
         aad_tampered[8] ^= 0xff;
         assert!(matches!(decrypt(&aad_tampered, "pw"), Err(CoreError::BadPassword)));
         // Flip a HIGH m_cost byte (offset 6): now the value is implausibly large and is rejected up
-        // front by the param clamp (before any multi-GiB allocation) — still a rejection.
+        // front by the param clamp (before any multi-GiB allocation) - still a rejection.
         blob[6] ^= 0xff;
         assert!(decrypt(&blob, "pw").is_err());
     }

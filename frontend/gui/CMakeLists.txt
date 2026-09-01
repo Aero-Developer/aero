@@ -48,6 +48,8 @@ add_executable(aero_gui WIN32 MACOSX_BUNDLE
     TorManager.h
     WalletWizard.cpp
     WalletWizard.h
+    XmrTradeTab.cpp
+    XmrTradeTab.h
     qrcodegen.cpp
     qrcodegen.hpp
     # Vendored quirc QR decoder (image-based Scan). MIT.
@@ -141,3 +143,33 @@ add_custom_command(TARGET aero_gui POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${AERO_CORE_RUNTIME} $<TARGET_FILE_DIR:aero_gui>/
 )
+
+# Opens the XMR1 trading window on its own against a watch-only wallet, for looking at it while
+# working on it. Off by default: it is a development tool, not part of the wallet.
+option(AERO_BUILD_XMR_PREVIEW "Build the standalone XMR1 trading-window preview" OFF)
+if(AERO_BUILD_XMR_PREVIEW)
+    add_executable(xmr_preview
+        XmrPreview.cpp
+        XmrTradeTab.cpp
+        XmrTradeTab.h
+        ${ETHWALLET_DIR}/Wallet.cpp
+        ${ETHWALLET_DIR}/Wallet.h
+        ${ETHWALLET_DIR}/HistoryModel.cpp
+        ${ETHWALLET_DIR}/HistoryModel.h
+        qdarkstyle/style.qrc
+        assets.qrc
+    )
+    target_include_directories(xmr_preview PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        ${ETHWALLET_DIR}
+    )
+    target_link_libraries(xmr_preview PRIVATE
+        Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Network
+        ${AERO_CORE_LINK}
+    )
+    add_custom_command(TARGET xmr_preview POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${AERO_CORE_RUNTIME} $<TARGET_FILE_DIR:xmr_preview>/
+    )
+endif()

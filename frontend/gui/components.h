@@ -52,7 +52,7 @@ public:
     explicit HelpLabel(QWidget *parent = nullptr) : QLabel(parent) {}
 };
 
-// Feather's InfoFrame: a framed row with a 32px icon on the left and a wrapped message —
+// Feather's InfoFrame: a framed row with a 32px icon on the left and a wrapped message -
 // used for the "encrypted with a password" (lock) banner, seed warning, etc.
 class InfoFrame : public QFrame
 {

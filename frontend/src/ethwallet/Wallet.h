@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-// Aero — Ethereum wallet wrapper. Replaces Feather's Monero libwalletqt/Wallet.
+// Aero - Ethereum wallet wrapper. Replaces Feather's Monero libwalletqt/Wallet.
 //
 // This QObject keeps the same *shape* as Feather's Wallet (status, address, seed, store,
 // create/commit transaction, and updated()/refreshed()/balanceUpdated()/transactionCommitted()
@@ -71,7 +71,7 @@ struct HistoryItem {
     QString buyFormatted;  // human amount received
     QString status;        // "pending" | "done" | "failed"
     quint64 expiry = 0;    // swap order validTo (unix secs); 0 = unknown. A pending swap isn't marked
-                           // failed before this — CoW orders can legitimately stay open for minutes.
+                           // failed before this - CoW orders can legitimately stay open for minutes.
 };
 
 struct NftCollection {
@@ -123,7 +123,7 @@ public:
     bool isWatchOnly() const;
 
     // Ask the core's background network loops (funded scan, per-account history) to stop ASAP so they
-    // release the core lock — call this before a blocking close-time save so the UI can't hang waiting
+    // release the core lock - call this before a blocking close-time save so the UI can't hang waiting
     // on an in-flight multi-minute scan/history load. Process-global; safe to call from the UI thread.
     static void requestShutdown();
 
@@ -140,11 +140,11 @@ public:
     // Sign a UTF-8 message with account `index`; returns 0x 65-byte sig, or "" on error.
     QString signMessage(quint32 index, const QString &message);
     // Recover the signer address from a personal_sign signature; returns checksummed address, or ""
-    // on error (bad signature). Pure function — no keys involved.
+    // on error (bad signature). Pure function - no keys involved.
     QString verifyMessage(const QString &message, const QString &signature);
 
     // Resolve an ENS name ("alice.eth") to a checksummed 0x address (Ethereum mainnet only); ""
-    // on failure. Blocking (network) — call from a worker (runBusy).
+    // on failure. Blocking (network) - call from a worker (runBusy).
     QString resolveEns(const QString &name);
 
     // ##### Persistence #####
@@ -177,6 +177,11 @@ public:
     // endpoints: list of RPC URLs; socksProxy e.g. "socks5h://127.0.0.1:9050" ("" disables Tor).
     bool setProvider(quint64 chainId, const QStringList &endpoints, const QString &socksProxy);
 
+    // Point transaction history for `chainId` at explorer APIs of the user's choosing (comma
+    // separated), tried ahead of the built-in ones; blank restores the built-ins. Applies to the
+    // whole process rather than one wallet, hence static.
+    static void setHistoryApis(quint64 chainId, const QString &csv);
+
     // Async connect: try Tor first (if socksProxy set), probe connectivity, and fall back to a
     // direct connection if Tor is unreachable. Emits providerConnected(mode, message) where
     // mode is 2=Tor, 1=Direct, 0=Offline.
@@ -205,7 +210,7 @@ public:
     void refreshHistoryAll(quint32 numAccounts, quint32 priorityIndex = 0);
 
     // Async: full history (native + tokens + CoW swaps) for a SINGLE account. Emits
-    // accountHistoryReady(index, items) — the caller appends it to the model (no clear), enabling
+    // accountHistoryReady(index, items) - the caller appends it to the model (no clear), enabling
     // Electrum-style lazy/on-demand and status-gated refresh instead of an all-account fan-out.
     void refreshAccountHistory(quint32 accountIndex);
 
@@ -257,7 +262,7 @@ public:
     // the balance/history confirm the instant the tx lands (not on a fixed timer).
     void txReceipt(const QString &txHash);
 
-    // ##### Per-wallet metadata (labels/contacts/notes/funded) — encrypted inside the wallet file #####
+    // ##### Per-wallet metadata (labels/contacts/notes/funded) - encrypted inside the wallet file #####
     // Opaque JSON blob owned by the UI. Read once on open; setMetadata()+save() persists it.
     QString metadata() const;
     void setMetadata(const QString &json);
@@ -285,7 +290,7 @@ public:
     void refreshFees();
     // Signs + broadcasts; emits transactionCommitted() (and transactionSent() on success).
     // To speed up a stuck tx, re-call this with the same PendingEthTx but tx.nonce set to the
-    // pending nonce and a higher fee — it replaces the original.
+    // pending nonce and a higher fee - it replaces the original.
     void commitTransaction(const PendingEthTx &tx);
 
     // Cancel a pending tx: broadcast a 0-value self-send at `nonce` with a bumped fee (wei strings).
@@ -357,6 +362,10 @@ public:
                     const QString &dataHex);
 
     // --- Across cross-chain bridge ---
+    // What Across will bridge out of the connected chain right now; emits acrossAssetsReady(json,err)
+    // with {origin_chain, assets:[{symbol,display,decimals,native,destinations:[id]}]}. Asked rather
+    // than assumed, because Across retires routes (it has dropped DAI entirely).
+    void acrossAssets();
     // Fee quote for bridging `symbol` from the connected chain to `destChainId`; emits
     // acrossQuoteReady(json,err).
     void acrossQuote(quint32 fromIndex, const QString &symbol, quint64 destChainId,
@@ -367,6 +376,31 @@ public:
                      const QString &amountWei);
     // Bridge send legs (reuse the generic router FFI but emit bridge-specific signals so they never
     // collide with the Swap tab's state): allowance -> approve -> send the depositV3 calldata.
+    // --- Hyperliquid (XMR1) ---
+    // The book, balances, resting orders and recent fills in one shot; emits hlOverviewReady().
+    // Fetched together because they are read together - a book from one moment beside balances from
+    // another would be quietly misleading.
+    void hlOverview(quint32 index);
+    // Whether this account has authorised Aero's trading key; emits hlAgentReady(ready,err).
+    void hlAgentReady(quint32 index);
+    // Authorise it (one signature with the account key); emits hlAgentApproved(err).
+    void hlApproveAgent(quint32 index);
+    // Place an order; emits hlOrderPlaced(json,err) with {state,size,price,oid}.
+    void hlPlaceOrder(quint32 index, bool isBuy, double price, double size, bool marketOrder);
+    // Cancel a resting order; emits hlOrderCancelled(err).
+    void hlCancelOrder(quint32 index, quint64 oid);
+    // Move USDC from Arbitrum onto the exchange; emits hlDeposited(txHash,err).
+    void hlDeposit(quint32 index, const QString &amountUsdc);
+    // Withdraw USDC back to Arbitrum; emits hlWithdrawn(err).
+    void hlWithdraw(quint32 index, const QString &amountUsdc);
+
+    // What redeeming XMR1 for real Monero would cost; emits xmrRedeemQuoted(quote,err).
+    void xmrRedeemQuote(quint32 index, const QString &amountXmr1);
+    // Redeem XMR1 for Monero paid to moneroAddress; emits xmrRedeemed(order,err).
+    void xmrRedeem(quint32 index, const QString &moneroAddress, const QString &amountXmr1);
+    // Progress of a redemption; emits xmrRedeemStatusReady(status,err).
+    void xmrRedeemStatus(const QString &orderId, const QString &sessionId);
+
     void bridgeAllowance(quint32 fromIndex, const QString &token, const QString &spender);
     void bridgeApprove(quint32 fromIndex, const QString &token, const QString &spender,
                        const QString &amountWei);
@@ -375,9 +409,9 @@ public:
 
     // The CoW BUY_ETH sentinel (used as buyToken to receive native ETH).
     static QString buyEthSentinel() { return QStringLiteral("0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"); }
-    // The CoW Vault Relayer (approval target) — same on every supported chain.
+    // The CoW Vault Relayer (approval target) - same on every supported chain.
     static QString cowVaultRelayer() { return QStringLiteral("0xC92E8bdf79f0507f65a392b0ab4667716BFE0110"); }
-    // The GPv2 Settlement contract (EIP-712 verifying contract) — shown in the confirm dialog.
+    // The GPv2 Settlement contract (EIP-712 verifying contract) - shown in the confirm dialog.
     static QString cowSettlement() { return QStringLiteral("0x9008D19f58AAbD9eD0D60971565AA8510560ab41"); }
 
     // Utility: convert human amount -> base units for `decimals`.
@@ -404,7 +438,7 @@ signals:
     // arrives after a network switch (otherwise a previous chain's rows leak into the new chain).
     void historyRefreshed(const QVector<HistoryItem> &items, quint64 chainId);
     // Emitted (synchronously, on the caller/UI thread) at the very start of an all-account refresh,
-    // before any batch is dispatched — the UI clears the model + resets dedup here. This must NOT be
+    // before any batch is dispatched - the UI clears the model + resets dedup here. This must NOT be
     // driven off "done==1", because with parallel per-account fetches batches complete out of order
     // and a later batch could be delivered first.
     void historyRefreshStarted();
@@ -453,12 +487,27 @@ signals:
     void routerApproved(const QString &txHash, const QString &error);
     void routerSwapSent(const QString &txHash, const QString &error);
     // Across bridge signals (kept separate from the Swap tab's router signals).
+    void acrossAssetsReady(const QString &json, const QString &error);
     void acrossQuoteReady(const QString &json, const QString &error);
     void acrossBuilt(const QString &json, const QString &error);
     void bridgeAllowanceReady(const QString &token, const QString &spender, const QString &weiOrErr,
                               const QString &error);
     void bridgeApproved(const QString &txHash, const QString &error);
     void bridgeSent(const QString &txHash, const QString &error);
+    // Hyperliquid (XMR1) signals.
+    // Carries the account it was fetched for. Switching accounts leaves the previous account's
+    // request in flight, and a reply that does not say whose it is cannot be told apart from the new
+    // one: balances and resting orders would be shown against the wrong address.
+    void hlOverviewReady(quint32 account, const QString &json, const QString &error);
+    void hlAgentReadyResult(bool ready, const QString &error);
+    void hlAgentApproved(const QString &error);
+    void hlOrderPlaced(const QString &json, const QString &error);
+    void hlOrderCancelled(const QString &error);
+    void hlDeposited(const QString &txHash, const QString &error);
+    void hlWithdrawn(const QString &error);
+    void xmrRedeemQuoted(const QJsonObject &quote, const QString &error);
+    void xmrRedeemed(const QJsonObject &order, const QString &error);
+    void xmrRedeemStatusReady(const QJsonObject &status, const QString &error);
 
 private:
     QString takeLastError() const;
@@ -482,7 +531,7 @@ private:
 
     // Dedicated pool for network (Tor) tasks. All refresh/fetch methods run here instead of the
     // global QThreadPool, so (a) they never contend with Qt's own worker threads, and (b) the bound
-    // caps how many Tor circuits open at once — flooding one SOCKS proxy with dozens of simultaneous
+    // caps how many Tor circuits open at once - flooding one SOCKS proxy with dozens of simultaneous
     // requests (balances + history + prices + fees + NFTs + liquidity + images) is what made data
     // arrive in stuttering waves. A modest bound lets the essentials run together and queues the
     // rest right behind them.
@@ -492,6 +541,12 @@ private:
     // (balances took minutes to update after a send). Its own bounded lane keeps history off the
     // essentials' threads; the core RPC semaphore still caps total Tor concurrency.
     QThreadPool m_historyPool;
+    // And a third for anything the user has pressed a button to send: orders, cancels, exchange
+    // deposits and withdrawals. These share nothing with a refresh - they are one small request each,
+    // and the person who pressed the button is watching. On the shared pool an order could be queued
+    // behind eight in-flight Tor fetches of prices and images and simply not go out for a while,
+    // which is exactly how a payment came to be sent twice here once before.
+    QThreadPool m_tradePool;
 
     // Serialize async saves: only one encrypt/atomic-write runs at a time; a request arriving while
     // one is in flight sets m_saveQueued so exactly one follow-up save runs afterwards (coalescing a
@@ -521,10 +576,10 @@ private:
     mutable QString m_hwKindCache;               // immutable once computed
     mutable bool m_hwKindCached = false;
     // Bumped on every invalidation. A getter reads it before the (unlocked) core read and only stores
-    // the result if it hasn't changed since — so a mutation that races an in-flight read can never
+    // the result if it hasn't changed since - so a mutation that races an in-flight read can never
     // poison the cache with a stale value (the read simply isn't cached and re-runs next call).
     mutable quint64 m_metaGen = 0;
-    void invalidateMetaCache();   // clears the account-count cache (NOT tokens — see .cpp)
+    void invalidateMetaCache();   // clears the account-count cache (NOT tokens - see .cpp)
     void invalidateTokensCache(); // clears the tracked-tokens cache (addToken/removeToken only)
 
     // Metadata queued from the UI thread (lock-free); applied to the core off-thread by saveAsync.

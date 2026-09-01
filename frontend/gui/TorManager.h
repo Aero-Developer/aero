@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Starts and supervises a bundled Tor process so the wallet is always routed through Tor with no
 // clearnet fallback. We use a dedicated SOCKS port (not the common 9050) so the app never depends
-// on — or accidentally routes through — some other SOCKS service; it runs its own Tor. If our own
+// on - or accidentally routes through - some other SOCKS service; it runs its own Tor. If our own
 // instance from a previous run is still listening on that port we reuse it, otherwise we launch the
 // tor.exe shipped next to the app and wait for it to bootstrap to 100%.
 
@@ -38,7 +38,7 @@ signals:
     void statusChanged(const QString &message); // human-readable progress
     void ready();                                // SOCKS proxy is usable
     void failed(const QString &error);           // Tor could not be started (no fallback)
-    void ended();                                // Tor exited AFTER being ready (crash/kill) — recover
+    void ended();                                // Tor exited AFTER being ready (crash/kill) - recover
 
 private:
     bool socksPortOpen() const;

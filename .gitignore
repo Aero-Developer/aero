@@ -5,6 +5,8 @@ Cargo.lock
 
 # Build output (any CMake build dir at any depth)
 build/
+build-gui/
+build-preview/
 
 # Portable/packaged builds (binaries, bundled Tor, dev screenshots) — ship via GitHub Releases,
 # not in the source tree.
