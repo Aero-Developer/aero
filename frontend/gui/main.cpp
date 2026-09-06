@@ -21,6 +21,7 @@
 #include <QThread>
 
 #include "AeroMainWindow.h"
+#include "Updater.h"
 #include "WalletWizard.h"
 #include "components.h"
 #include "ethwallet/WalletManager.h"
@@ -96,6 +97,11 @@ int main(int argc, char *argv[]) {
         QSettings::setPath(QSettings::IniFormat, QSettings::SystemScope, cfg);
     }
 
+    // Clear out what the last update displaced. Windows will not delete a running executable, so an
+    // update can only rename the old one aside; this is the first moment the old files are no longer
+    // in use and can actually go. Runs before anything else touches the application folder.
+    Updater::sweepPreviousUpdate();
+
 #if defined(Q_OS_MAC)
     // Feather only bumps the font size on macOS; on Windows/Linux it uses the plain system font.
     QFont fontDef = QApplication::font();
@@ -122,15 +128,26 @@ int main(int argc, char *argv[]) {
     if (!wallet)
         return 0;
 
-    AeroMainWindow window;
-    window.setWallet(wallet);
-    // Match Feather's default window size (from MainWindow.ui), then center on screen.
-    window.resize(977, 499);
-    if (QScreen *screen = QGuiApplication::primaryScreen()) {
-        const QRect avail = screen->availableGeometry();
-        window.move(avail.center() - window.rect().center());
-    }
-    window.show();
+    // Scoped so the window - and with it the bundled Tor, which is one of its children - is fully
+    // torn down before the block below decides whether to start an updated copy. Restarting while
+    // this process is still alive hands the new one a Tor that is seconds from exiting.
+    int rc = 0;
+    {
+        AeroMainWindow window;
+        window.setWallet(wallet);
+        // Match Feather's default window size (from MainWindow.ui), then center on screen.
+        window.resize(977, 499);
+        if (QScreen *screen = QGuiApplication::primaryScreen()) {
+            const QRect avail = screen->availableGeometry();
+            window.move(avail.center() - window.rect().center());
+        }
+        window.show();
 
-    return app.exec();
+        rc = app.exec();
+    }
+
+    // An update was installed and the user asked to restart into it. Everything this process held -
+    // the wallet file, the Tor data directory, the SOCKS port - is released by now.
+    Updater::launchInstalledVersion();
+    return rc;
 }

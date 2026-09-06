@@ -3,12 +3,13 @@
 **/*.rs.bk
 Cargo.lock
 
-# Build output (any CMake build dir at any depth)
+# Build output (any CMake build dir at any depth). A pattern rather than a list: the preview
+# targets each want their own build dir, and naming them one at a time means the next one gets
+# committed by accident.
 build/
-build-gui/
-build-preview/
+build-*/
 
-# Portable/packaged builds (binaries, bundled Tor, dev screenshots) — ship via GitHub Releases,
+# Portable/packaged builds (binaries, bundled Tor, dev screenshots) - ship via GitHub Releases,
 # not in the source tree.
 /dist/
 

@@ -35,12 +35,19 @@ static bool hasHomoglyphSymbol(const QString &symbol) {
 // covers both unsolicited incoming airdrops and spoofed "outgoing" transactions you never signed.
 bool HistoryModel::isSpamToken(const HistoryItem &h) const {
     if (h.token.isEmpty())
-        return false; // native ETH transfers cannot be spoofed
+        return false; // native transfers cannot be spoofed
     if (hasHomoglyphSymbol(h.symbol))
         return true; // non-ASCII symbol => homoglyph impersonation
+    // The allow-list is the whole point of this function, so consult it before any rule about what
+    // a symbol is allowed to be. It used to come last, which meant the "an ERC-20 calling itself
+    // ETH is always fake" rule fired first - true on Ethereum, but on BNB Smart Chain the real,
+    // curated, Binance-pegged ETH is an ERC-20 called ETH, so every genuine transfer of it was
+    // hidden and no amount of tracking the token could bring it back.
+    if (m_knownTokens.contains(h.token.toLower()))
+        return false;
     if (h.symbol.compare(QLatin1String("ETH"), Qt::CaseInsensitive) == 0)
-        return true; // an ERC-20 calling itself "ETH" is always fake
-    return !m_knownTokens.contains(h.token.toLower());
+        return true; // an untracked ERC-20 calling itself "ETH" is impersonating the native coin
+    return true;
 }
 
 // Cap a full-precision decimal string to a readable number of places (tokens routinely report 18
@@ -173,6 +180,8 @@ bool HistoryModel::matchesSearch(const HistoryItem &h) const {
         return true;
     if (h.counterparty.toLower().contains(m_search)) return true;
     if (h.txHash.toLower().contains(m_search)) return true;
+    // So typing an account's name narrows history to that account without touching the filter combo.
+    if (accountName(h).toLower().contains(m_search)) return true;
     if (h.symbol.toLower().contains(m_search)) return true;
     if (h.buySymbol.toLower().contains(m_search)) return true;
     if (h.formatted.contains(m_search)) return true;
@@ -220,6 +229,14 @@ bool HistoryModel::lessThan(const HistoryItem &a, const HistoryItem &b) const {
         const int bk = b.failed ? 2 : (b.direction == QLatin1String("in") ? 0 : 1);
         return ak < bk;
     }
+    case Column_Account: {
+        // By the name on screen, not the account index: a user sorting this column is looking for
+        // all the rows that say "Savings" next to each other.
+        const QString an = accountName(a), bn = accountName(b);
+        if (an != bn)
+            return an.localeAwareCompare(bn) < 0;
+        return a.account < b.account;
+    }
     case Column_Counterparty:
         return a.counterparty < b.counterparty;
     case Column_TxHash:
@@ -239,9 +256,21 @@ void HistoryModel::sortFiltered() {
 // Recompute the full filtered + sorted result set, then show only the current page.
 void HistoryModel::rebuildVisible() {
     rebuildPoisonRefs(); // refresh the legit-address index before filtering (look-alike detection)
+    // Transactions that are the on-chain half of a swap we placed ourselves. The explorer reports
+    // the leg that left the wallet as an ordinary transfer, and only later - once it has indexed the
+    // internal transfer coming back - folds both legs into one swap. In between, showing our swap
+    // row and that lone outgoing transfer would be the same action listed twice, the second time
+    // looking like money that went out and never came back.
+    QSet<QString> swapLegs;
+    for (const HistoryItem &l : m_localSwaps)
+        if (!l.txHash.isEmpty())
+            swapLegs.insert(l.txHash.toLower());
     m_filtered.clear();
     m_filtered.reserve(m_allItems.size());
     for (const HistoryItem &h : m_allItems) {
+        if (h.kind != QLatin1String("swap") && !h.txHash.isEmpty() &&
+            swapLegs.contains(h.txHash.toLower()))
+            continue;
         if (m_hideSpam && isHiddenSpam(h))
             continue;
         if (!matchesSearch(h))
@@ -403,11 +432,15 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
 
     const HistoryItem &h = m_items.at(index.row());
 
-    // Show the asset's logo next to the amount. Only *native* ETH (empty token address) may use the
-    // ETH logo - an ERC-20 that calls itself "ETH" is a scam and must not borrow it. Unknown tokens
-    // get no logo (QIcon(path) is never null even when the resource is missing, so check existence).
+    // Show the asset's logo next to the amount. Only the *native* coin (empty token address) may use
+    // the native logo - an ERC-20 that calls itself "ETH" is a scam and must not borrow it. Unknown
+    // tokens get no logo (QIcon(path) is never null even when the resource is missing, so check
+    // existence). The native row names its own coin, so read the symbol rather than assuming ether:
+    // hardcoding "ETH" stamped the Ethereum logo on every POL, BNB, XDAI and AVAX transfer.
     if (role == Qt::DecorationRole && index.column() == Column_Amount) {
-        const QString sym = h.token.isEmpty() ? QStringLiteral("ETH") : h.symbol.toUpper();
+        const QString sym = h.token.isEmpty()
+                                ? (h.symbol.isEmpty() ? QStringLiteral("ETH") : h.symbol.toUpper())
+                                : h.symbol.toUpper();
         if (!h.token.isEmpty() && sym == QLatin1String("ETH"))
             return {}; // ERC-20 impersonating native ETH
         const QString path = QStringLiteral(":/assets/images/tokens/%1.png").arg(sym);
@@ -462,6 +495,8 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
             // outrank a genuinely high-value transfer.
             return price > 0.0 ? amt * price : 0.0;
         }
+        case Column_Account:
+            return accountName(h);
         case Column_Direction:
             return h.failed ? 2 : (h.direction == QLatin1String("in") ? 0 : 1);
         case Column_Counterparty:
@@ -487,6 +522,7 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
                 return QDateTime::fromSecsSinceEpoch(static_cast<qint64>(h.timestamp))
                     .toString(QStringLiteral("yyyy-MM-dd HH:mm"));
             return h.block == 0 ? tr("pending") : QString::number(h.block);
+        case Column_Account:      return accountName(h);
         case Column_Direction:
             if (h.kind == QLatin1String("swap")) {
                 if (h.status == QLatin1String("pending")) return tr("Swap · pending");
@@ -516,6 +552,24 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
     }
 }
 
+QString HistoryModel::accountName(const HistoryItem &h) const {
+    // Rows cached before history recorded an account have nothing to name. Inventing "Account #0"
+    // for them would be a guess, and a wrong one for anybody whose transaction came from elsewhere.
+    if (h.account == HistoryItem::unknownAccount)
+        return {};
+    const QString named = m_accountNames.value(h.account);
+    return named.isEmpty() ? tr("Account #%1").arg(h.account) : named;
+}
+
+void HistoryModel::setAccountNames(const QHash<quint32, QString> &names) {
+    if (m_accountNames == names)
+        return;
+    m_accountNames = names;
+    // Renaming an account changes what the column says and what a search for that name matches, so
+    // the filter has to run again rather than just repainting.
+    rebuildVisible();
+}
+
 void HistoryModel::setTxNotes(const QHash<QString, QString> &notes) {
     m_txNotes.clear();
     for (auto it = notes.constBegin(); it != notes.constEnd(); ++it)
@@ -542,6 +596,7 @@ QVariant HistoryModel::headerData(int section, Qt::Orientation orientation, int 
         return {};
     switch (section) {
         case Column_Date:         return tr("Date");
+        case Column_Account:      return tr("Account");
         case Column_Direction:    return tr("Direction");
         case Column_Amount:       return tr("Amount");
         case Column_Value:        return tr("Value (USD)");
@@ -553,7 +608,38 @@ QVariant HistoryModel::headerData(int section, Qt::Orientation orientation, int 
 
 void HistoryModel::onHistoryRefreshed(const QVector<HistoryItem> &items) {
     m_fetched = items;
+    reindexFetched(); // the old positions describe a list that no longer exists
     rebuildAll();
+}
+
+// Where an already-held copy of `key` lives in m_fetched, or -1. Bounds-checked so a stale index
+// can only cost us a duplicate row, never a read past the end of the list.
+int HistoryModel::fetchedIndex(const QString &key) const {
+    const auto at = m_fetchedAt.constFind(key);
+    if (at == m_fetchedAt.constEnd())
+        return -1;
+    return (*at >= 0 && *at < m_fetched.size()) ? *at : -1;
+}
+
+// Rebuild the key -> position index after m_fetched has been replaced wholesale.
+void HistoryModel::reindexFetched() {
+    m_fetchedAt.clear();
+    m_fetchedAt.reserve(m_fetched.size());
+    for (int i = 0; i < m_fetched.size(); ++i)
+        m_fetchedAt.insert(dedupKey(m_fetched.at(i)), i);
+}
+
+QList<quint32> HistoryModel::pendingSwapAccounts() const {
+    QSet<quint32> out;
+    const auto collect = [&out](const QVector<HistoryItem> &v) {
+        for (const HistoryItem &h : v)
+            if (h.kind == QLatin1String("swap") && h.status == QLatin1String("pending") &&
+                h.account != HistoryItem::unknownAccount)
+                out.insert(h.account);
+    };
+    collect(m_localSwaps);
+    collect(m_fetched);
+    return out.values();
 }
 
 void HistoryModel::clearLocal() {
@@ -570,13 +656,62 @@ QString HistoryModel::dedupKey(const HistoryItem &h) {
     return QStringLiteral("%1|%2|%3|%4").arg(h.txHash, h.token, h.direction, h.amount);
 }
 
+// How settled a row is. A later fetch may carry a row forward through these, never back: an order
+// that has filled does not go back to resting, and a mined transaction does not un-mine. Without
+// that floor, one stale reply mid-poll would flick a finished swap back to "pending".
+static int settledRank(const HistoryItem &h) {
+    if (h.status == QLatin1String("pending"))
+        return 0;
+    if (h.status == QLatin1String("done") || h.status == QLatin1String("failed"))
+        return 2;
+    return 1; // an ordinary transfer: the explorer only lists it once it is on chain
+}
+
+bool HistoryModel::supersedes(const HistoryItem &prev, const HistoryItem &next) {
+    if (settledRank(next) < settledRank(prev))
+        return false;
+    if (next.status != prev.status)
+        return true;
+    if (prev.block == 0 && next.block != 0)     // gained its mined position
+        return true;
+    if (prev.timestamp == 0 && next.timestamp != 0)
+        return true;
+    if (prev.failed != next.failed)
+        return true;
+    // A filled order reports what was actually traded, which is rarely exactly what was quoted.
+    return prev.status == QLatin1String("done") && next.status == QLatin1String("done") &&
+           (prev.formatted != next.formatted || prev.buyFormatted != next.buyFormatted);
+}
+
+QString HistoryModel::assetKey(const QString &symbol) {
+    // The two sides of one swap can arrive under different names. Our own optimistic row uses the
+    // ticker shown in the Swap tab ("ETH"), while the settled order names what the protocol really
+    // traded: the wrapped token ("WETH"), or the 0xEeee... sentinel that stands for the chain's coin
+    // inside a field that otherwise holds a token address. Left unfolded, a native-coin swap never
+    // recognises its own settled copy, so the pending row lingers next to it and is later marked
+    // failed - a swap that worked, shown twice, one of them as a failure.
+    static const QSet<QString> kCoin = {
+        QStringLiteral("ETH"),   QStringLiteral("WETH"),  QStringLiteral("POL"),
+        QStringLiteral("WPOL"),  QStringLiteral("MATIC"), QStringLiteral("WMATIC"),
+        QStringLiteral("BNB"),   QStringLiteral("WBNB"),  QStringLiteral("AVAX"),
+        QStringLiteral("WAVAX"), QStringLiteral("XDAI"),  QStringLiteral("WXDAI"),
+    };
+    const QString s = symbol.trimmed().toUpper();
+    if (s.startsWith(QLatin1String("0XEEEE")) || kCoin.contains(s))
+        return QStringLiteral("NATIVE");
+    return s;
+}
+
+bool HistoryModel::samePair(const HistoryItem &a, const HistoryItem &b) {
+    return assetKey(a.symbol) == assetKey(b.symbol) &&
+           assetKey(a.buySymbol) == assetKey(b.buySymbol);
+}
+
 // Seed the model from persisted (wallet-file) history without any network fetch, and pre-populate the
-// dedup set so a later targeted appendBatch() of the same account merges/dedups correctly.
+// dedup index so a later targeted appendBatch() of the same account merges/dedups correctly.
 void HistoryModel::loadCachedHistory(const QVector<HistoryItem> &items) {
     m_fetched = items;
-    m_seen.clear();
-    for (const HistoryItem &h : items)
-        m_seen.insert(dedupKey(h));
+    reindexFetched();
     rebuildAll();
 }
 
@@ -584,7 +719,7 @@ void HistoryModel::loadCachedHistory(const QVector<HistoryItem> &items) {
 // local swaps on top, and reset to the first page.
 void HistoryModel::beginFullRefresh() {
     m_fetched.clear();
-    m_seen.clear();
+    m_fetchedAt.clear();
     // Show any optimistic pending swaps on top until the fetched (settled) copy arrives, which
     // appendBatch then reconciles. NOTE: we deliberately do NOT seed m_seen with local swap UIDs -
     // doing so made appendBatch skip the fetched settled order, so the pending row never flipped to
@@ -600,6 +735,7 @@ void HistoryModel::beginFullRefresh() {
 void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
     QVector<HistoryItem> add;
     add.reserve(items.size());
+    bool updated = false; // a row we already held has changed (an order filled, a tx mined)
     for (const HistoryItem &h : items) {
         if (h.kind == QLatin1String("swap") && !h.txHash.isEmpty()) {
             const QString uid = h.txHash.toLower();
@@ -625,8 +761,8 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
                     // order of the same pair from reconciling a freshly-placed pending row.
                     const qint64 dt =
                         static_cast<qint64>(h.timestamp) - static_cast<qint64>(l.timestamp);
-                    if (l.symbol == h.symbol && l.buySymbol == h.buySymbol && h.timestamp > 0 &&
-                        l.timestamp > 0 && dt >= -300 && dt <= 6 * 3600) {
+                    if (samePair(l, h) && h.timestamp > 0 && l.timestamp > 0 && dt >= -300 &&
+                        dt <= 6 * 3600) {
                         removedLocalHash = l.txHash.toLower();
                         m_localSwaps.removeAt(i);
                         break;
@@ -642,9 +778,20 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
                                                e.txHash.toLower() == removedLocalHash);
                                    }),
                     m_allItems.end());
-            if (m_seen.contains(uid)) // cross-account/page dedup of the fetched swap itself
+            // We may already hold this swap from an earlier poll. That is the normal case, not a
+            // duplicate to throw away: an order is fetched again and again precisely because its
+            // outcome is still being decided, and the reply that matters is the one saying it
+            // filled. Discarding it here is what left a completed swap reading "pending" for the
+            // rest of the session, and - because the status is cached - after the next restart too.
+            const int at = fetchedIndex(uid);
+            if (at >= 0) {
+                if (supersedes(m_fetched.at(at), h)) {
+                    m_fetched[at] = h;
+                    updated = true;
+                }
                 continue;
-            m_seen.insert(uid);
+            }
+            m_fetchedAt.insert(uid, m_fetched.size() + add.size());
             add.append(h);
             continue;
         }
@@ -652,6 +799,24 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
         // pending local copy so the confirmed row (with block/timestamp/fee) replaces it - no duplicate.
         if (!h.txHash.isEmpty()) {
             const QString hx = h.txHash.toLower();
+            // The same transaction may be the one our optimistic swap row is waiting on. A router
+            // swap only becomes a swap row once the explorer has indexed both legs, and the leg paid
+            // back to the user is often an internal transfer that lands hours later - until then the
+            // wallet can see the transaction mined perfectly well and still be counting down to
+            // calling it failed. Settle it on the evidence we have: the transaction is on chain, and
+            // the receipt says whether it worked.
+            if (h.block != 0) {
+                for (HistoryItem &l : m_localSwaps)
+                    if (l.txHash.toLower() == hx && l.status == QLatin1String("pending")) {
+                        l.status = h.failed ? QStringLiteral("failed") : QStringLiteral("done");
+                        l.failed = h.failed;
+                        l.block = h.block;
+                        if (h.timestamp)
+                            l.timestamp = h.timestamp;
+                        updated = true;
+                        break;
+                    }
+            }
             bool wasLocal = false;
             for (int i = 0; i < m_localSends.size(); ++i)
                 if (m_localSends.at(i).txHash.toLower() == hx) {
@@ -670,14 +835,30 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
         }
         const QString key = QStringLiteral("%1|%2|%3|%4")
                                 .arg(h.txHash, h.token, h.direction, h.amount);
-        if (m_seen.contains(key))
+        const int at = fetchedIndex(key);
+        if (at >= 0) {
+            // A transfer keeps its key when it mines, so this is where a row picks up its block,
+            // timestamp and fee - and where a transaction that reverted stops looking successful.
+            if (supersedes(m_fetched.at(at), h)) {
+                m_fetched[at] = h;
+                updated = true;
+            }
             continue;
-        m_seen.insert(key);
+        }
+        m_fetchedAt.insert(key, m_fetched.size() + add.size());
         add.append(h);
+    }
+    if (!add.isEmpty())
+        m_fetched += add;
+    if (updated) {
+        // m_allItems holds copies, so recompose it from m_fetched rather than trying to patch both
+        // lists in step. This also re-runs the local reconciliation, which is what finally drops an
+        // optimistic row once its real copy settles.
+        rebuildAll();
+        return;
     }
     if (add.isEmpty())
         return;
-    m_fetched += add;
     m_allItems += add;
     scheduleRebuild();
 }
@@ -686,19 +867,25 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
 // pending swap that has since appeared in fetched data (matched by tx hash / CoW order uid).
 void HistoryModel::rebuildAll() {
     if (!m_localSwaps.isEmpty() || !m_localSends.isEmpty()) {
-        QSet<QString> fetchedIds;
+        QSet<QString> fetchedIds, fetchedSwapIds;
         for (const HistoryItem &h : m_fetched)
-            if (!h.txHash.isEmpty())
+            if (!h.txHash.isEmpty()) {
                 fetchedIds.insert(h.txHash.toLower());
-        const auto dropReconciled = [&](QVector<HistoryItem> &v) {
+                if (h.kind == QLatin1String("swap"))
+                    fetchedSwapIds.insert(h.txHash.toLower());
+            }
+        const auto dropReconciled = [](QVector<HistoryItem> &v, const QSet<QString> &ids) {
             v.erase(std::remove_if(v.begin(), v.end(),
                                    [&](const HistoryItem &h) {
-                                       return fetchedIds.contains(h.txHash.toLower());
+                                       return ids.contains(h.txHash.toLower());
                                    }),
                     v.end());
         };
-        dropReconciled(m_localSwaps);
-        dropReconciled(m_localSends);
+        // A swap steps aside only for a fetched row that is itself a swap. Standing aside for any
+        // row sharing its transaction meant the outgoing leg alone could take its place, and the
+        // trade the user made would be listed as a payment to a router with nothing coming back.
+        dropReconciled(m_localSwaps, fetchedSwapIds);
+        dropReconciled(m_localSends, fetchedIds);
         // Content-match fallback for swaps whose ids differ from the fetched copy (CoW eth-flow - see
         // appendBatch), so a settled order also clears its optimistic pending row here.
         m_localSwaps.erase(
@@ -709,9 +896,8 @@ void HistoryModel::rebuildAll() {
                                        continue;
                                    const qint64 dt = static_cast<qint64>(f.timestamp) -
                                                      static_cast<qint64>(l.timestamp);
-                                   if (l.symbol == f.symbol && l.buySymbol == f.buySymbol &&
-                                       f.timestamp > 0 && l.timestamp > 0 && dt >= -300 &&
-                                       dt <= 6 * 3600)
+                                   if (samePair(l, f) && f.timestamp > 0 && l.timestamp > 0 &&
+                                       dt >= -300 && dt <= 6 * 3600)
                                        return true;
                                }
                                return false;
@@ -739,6 +925,21 @@ void HistoryModel::expireStalePendingSwaps(qint64 maxAgeSecs) {
             h.status = QStringLiteral("failed");
             changed = true;
         }
+    }
+    // A fetched order can hang too. CoW returns the most recent 200 orders, so one that ages out of
+    // that window stops being mentioned at all, and a row nobody will ever speak about again would
+    // rest at "pending" forever, keeping the poll it depends on alive to ask about it every thirty
+    // seconds for the life of the session. Only rows whose own deadline we know are called off, well
+    // past it: an order with no stated deadline may genuinely still be open.
+    const qint64 grace = 15 * 60;
+    for (HistoryItem &h : m_fetched) {
+        if (h.kind != QLatin1String("swap") || h.status != QLatin1String("pending"))
+            continue;
+        if (h.expiry == 0 || now <= static_cast<qint64>(h.expiry) + grace)
+            continue;
+        h.status = QStringLiteral("failed");
+        h.failed = true;
+        changed = true;
     }
     if (changed)
         rebuildAll();

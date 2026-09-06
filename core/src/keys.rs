@@ -103,11 +103,18 @@ impl SeedPhrase {
     /// Build a signer from a raw hex private key (imported outside the HD tree).
     pub fn signer_from_hex(hex_key: &str) -> Result<PrivateKeySigner> {
         let clean = hex_key.trim().trim_start_matches("0x");
-        let bytes = hex::decode(clean).map_err(|e| CoreError::Derivation(format!("bad key hex: {e}")))?;
-        if bytes.len() != 32 {
-            return Err(CoreError::Derivation("private key must be 32 bytes".into()));
-        }
-        PrivateKeySigner::from_slice(&bytes).map_err(|e| CoreError::Derivation(e.to_string()))
+        let mut bytes =
+            hex::decode(clean).map_err(|e| CoreError::Derivation(format!("bad key hex: {e}")))?;
+        // Wiped on every path out, including the error ones. This runs once per signature, so
+        // without it each send would leave another copy of the raw key loose on the heap, waiting
+        // for the allocator to hand that memory to something that might write it down.
+        let result = if bytes.len() != 32 {
+            Err(CoreError::Derivation("private key must be 32 bytes".into()))
+        } else {
+            PrivateKeySigner::from_slice(&bytes).map_err(|e| CoreError::Derivation(e.to_string()))
+        };
+        bytes.zeroize();
+        result
     }
 
     /// Derive the signer (private key) for a given account index using the

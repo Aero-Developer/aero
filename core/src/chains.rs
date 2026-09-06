@@ -4,6 +4,15 @@
 //! model differ. This table lets the wallet operate across chains from a single lookup keyed by the
 //! chain id, so the rest of the code stays chain-agnostic.
 
+/// CoW Protocol's production EthFlow contract, which sells native coin by wrapping it and placing
+/// the order on the seller's behalf. CoW deploys it at the same address on every chain they support.
+///
+/// Aero previously pointed mainnet at `0x40A50cf069e992AA4536211B23F286eF88752187`, an earlier
+/// mainnet-only deployment. `createOrder` still exists there, so a sell would be accepted on chain
+/// and then never filled: CoW's order book and its refunder both watch the current contract, so the
+/// ETH would sit in the old one with nothing in Aero able to get it back.
+pub const ETH_FLOW_PROD: &str = "0xbA3cB449bD2B4ADddBc894D8697F5170800EAdeC";
+
 /// Static metadata for a supported EVM chain.
 #[derive(Clone, Copy)]
 pub struct ChainInfo {
@@ -27,8 +36,12 @@ pub struct ChainInfo {
     pub legacy_gas: bool,
     /// CoW Protocol order-book API network slug (e.g. "mainnet"). `None` => swaps unavailable here.
     pub cow_network: Option<&'static str>,
-    /// CoW eth-flow contract for native-ETH sells. `None` => native swaps disabled (only verified
-    /// addresses are hardcoded, to never risk sending ETH to a wrong contract).
+    /// CoW eth-flow contract for native-ETH sells. `None` => native swaps disabled.
+    ///
+    /// CoW deploys this at [`ETH_FLOW_PROD`], the same address on every chain it supports. Before
+    /// any native sell the wallet checks there is actually code there (see `eth_flow_for`), because
+    /// the failure mode if there is not is that `createOrder` degrades into a plain transfer of the
+    /// user's ETH to an address nobody controls.
     pub eth_flow: Option<&'static str>,
     /// Wrapped-native ERC-20 (WETH/WMATIC/…), used as the CoW sellToken for native swaps.
     pub wrapped_native: &'static str,
@@ -48,7 +61,7 @@ const CHAINS: &[ChainInfo] = &[
         dexscreener_slug: Some("ethereum"),
         legacy_gas: false,
         cow_network: Some("mainnet"),
-        eth_flow: Some("0x40A50cf069e992AA4536211B23F286eF88752187"),
+        eth_flow: Some(ETH_FLOW_PROD),
         wrapped_native: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
     },
     ChainInfo {
@@ -60,7 +73,7 @@ const CHAINS: &[ChainInfo] = &[
         dexscreener_slug: Some("arbitrum"),
         legacy_gas: false,
         cow_network: Some("arbitrum_one"),
-        eth_flow: None,
+        eth_flow: Some(ETH_FLOW_PROD),
         wrapped_native: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
     },
     ChainInfo {
@@ -72,7 +85,7 @@ const CHAINS: &[ChainInfo] = &[
         dexscreener_slug: Some("base"),
         legacy_gas: false,
         cow_network: Some("base"),
-        eth_flow: None,
+        eth_flow: Some(ETH_FLOW_PROD),
         wrapped_native: "0x4200000000000000000000000000000000000006",
     },
     ChainInfo {
@@ -96,7 +109,7 @@ const CHAINS: &[ChainInfo] = &[
         dexscreener_slug: Some("polygon"),
         legacy_gas: false,
         cow_network: Some("polygon"),
-        eth_flow: None,
+        eth_flow: Some(ETH_FLOW_PROD),
         wrapped_native: "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270",
     },
     ChainInfo {
@@ -109,8 +122,10 @@ const CHAINS: &[ChainInfo] = &[
         explorers: &[],
         dexscreener_slug: Some("bsc"),
         legacy_gas: true, // BSC uses legacy gasPrice transactions
-        cow_network: None, // CoW not deployed on BNB Smart Chain
-        eth_flow: None,
+        // CoW does run on BNB - `https://api.cow.fi/bnb/api/v1` answers - so the old comment here
+        // saying it was not deployed simply cost BNB users the gasless, MEV-protected route.
+        cow_network: Some("bnb"),
+        eth_flow: Some(ETH_FLOW_PROD),
         wrapped_native: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
     },
     ChainInfo {
@@ -122,7 +137,7 @@ const CHAINS: &[ChainInfo] = &[
         dexscreener_slug: Some("gnosischain"),
         legacy_gas: false,
         cow_network: Some("xdai"),
-        eth_flow: None,
+        eth_flow: Some(ETH_FLOW_PROD),
         wrapped_native: "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d",
     },
     ChainInfo {
@@ -136,7 +151,7 @@ const CHAINS: &[ChainInfo] = &[
         dexscreener_slug: Some("avalanche"),
         legacy_gas: false,
         cow_network: Some("avalanche"),
-        eth_flow: None,
+        eth_flow: Some(ETH_FLOW_PROD),
         wrapped_native: "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7",
     },
     // ---- Testnets (for safe testing). coingecko_id is "" so no misleading USD price is shown for
@@ -210,9 +225,17 @@ pub fn openocean_slug(chain_id: u64) -> Option<&'static str> {
     })
 }
 
-/// Whether Odos SOR supports `chain_id` (Odos uses the numeric chain id, no slug).
-pub fn odos_supported(chain_id: u64) -> bool {
-    matches!(chain_id, 1 | 10 | 56 | 137 | 8453 | 42161 | 43114)
+/// Whether Odos SOR supports `chain_id`.
+///
+/// Nothing does any more. Odos wound down its company and shut off `api.odos.xyz` on 30 July 2026;
+/// the host now answers 530 to everything. Left as a function returning false, rather than deleting
+/// the router outright, so the shape of the code still shows where a fourth aggregator plugs in.
+///
+/// This is not cosmetic. Every quote refresh asked Odos in parallel with the others, and over Tor a
+/// request to a dead host does not fail fast - it waits out the full timeout on every refresh, on
+/// every chain, for a route that can never come back.
+pub fn odos_supported(_chain_id: u64) -> bool {
+    false
 }
 
 /// Whether Paraswap supports `chain_id` (Paraswap uses `network=<chain_id>`).
@@ -238,4 +261,51 @@ pub fn chain_info(chain_id: u64) -> ChainInfo {
             eth_flow: None,
             wrapped_native: "",
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every chain Aero offers CoW on must also carry the eth-flow address, or selling the chain's
+    /// own coin through CoW is quietly impossible there. That is how Gnosis ended up with no way to
+    /// sell XDAI at all: CoW was its only venue, and CoW refuses native sells without eth-flow.
+    #[test]
+    fn a_cow_chain_can_always_sell_its_own_coin() {
+        for c in CHAINS {
+            if c.cow_network.is_some() {
+                assert_eq!(
+                    c.eth_flow,
+                    Some(ETH_FLOW_PROD),
+                    "{} offers CoW but cannot sell native {}",
+                    c.name,
+                    c.native_symbol
+                );
+            }
+        }
+    }
+
+    /// A chain that can swap at all needs a wrapped-native token, since that is what a native sell
+    /// is actually routed as.
+    #[test]
+    fn every_swappable_chain_knows_its_wrapped_coin() {
+        for c in CHAINS {
+            if c.cow_network.is_some() || openocean_slug(c.chain_id).is_some() {
+                assert!(
+                    c.wrapped_native.starts_with("0x") && c.wrapped_native.len() == 42,
+                    "{} has no wrapped-native address",
+                    c.name
+                );
+            }
+        }
+    }
+
+    /// Odos shut down on 30 July 2026 and `api.odos.xyz` answers 530. Asking it anyway costs a full
+    /// timeout on every quote refresh, which over Tor is the slowest thing in the swap tab.
+    #[test]
+    fn the_dead_router_is_never_asked() {
+        for c in CHAINS {
+            assert!(!odos_supported(c.chain_id), "{} still queries Odos", c.name);
+        }
+    }
 }

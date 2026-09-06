@@ -43,8 +43,10 @@ class QProgressDialog;
 class QListWidget;
 class QTableWidget;
 class QTreeWidget;
+class QTreeView;
 class QScrollArea;
 class XmrTradeTab;
+class Updater;
 
 class AeroMainWindow : public QMainWindow
 {
@@ -124,6 +126,10 @@ private:
     void setupTabs();
     void setupHomeTab();
     void setupStatusBar();
+    // The updater, created on first use and always pointed at the Tor proxy in effect right now
+    // (which can change while the app is open, if the user switches to an external Tor).
+    Updater *updater();
+    void scheduleUpdateCheck(); // once per run, after Tor is usable
     void autoConnect();
     void switchChain(quint64 chainId); // reconnect + relabel native coin + refresh for a new chain
     void relabelNative();              // update native-coin labels (Home ticker, status) after switch
@@ -168,6 +174,12 @@ private:
     void updateHistoryPricing();           // push per-symbol USD prices into the History dust filter
     QString fiatStr(double usd) const;     // format a USD value in the user's chosen fiat
     QString explorerTxUrl(const QString &hash) const;   // preferred explorer tx link
+    QString accountName(quint32 index) const;
+    double tokenBalanceOnThisChain(quint32 account, const QString &symbol) const;  // an account's label, or "Account #N"
+    void pushAccountNames();                   // feed those labels to the History Account column
+    // Hand a link to the system browser, which does NOT go through Tor. Asks first, because the
+    // browser fetches it from the user's own address and the link usually names their transaction.
+    void openOutsideTor(const QString &url);
     void lockWallet();                     // auto-lock: require the password to regain access
     // Copy a secret (seed / private key) to the clipboard and auto-clear it after the configured
     // timeout, so it doesn't linger in the OS clipboard (Feather-style).
@@ -398,6 +410,8 @@ private:
     quint64 m_lastBlock = 0;                   // last seen block height
     QSystemTrayIcon *m_tray = nullptr;         // desktop notifications (received / sent)
     TorManager *m_tor = nullptr;               // bundled Tor process supervisor
+    Updater *m_updater = nullptr;              // signed-update checks (Help menu + once a day)
+    bool m_updateCheckScheduled = false;       // the quiet check is armed at most once per run
     HistoryModel *m_historyModel = nullptr;
     QComboBox *m_historyCombo = nullptr;       // History filter: All / a specific account
     int m_historyFilter = -1;                  // -1 = All accounts, else account index
@@ -407,6 +421,7 @@ private:
     QSet<quint32> m_dirtyHistory;              // accounts whose balance changed -> need a targeted refetch
     QHash<quint32, double> m_histStatus;       // account balance when its history was last fetched (status gate)
     quint64 m_historyLoadedChain = ~Q_UINT64_C(0); // chain the history view was (re)loaded for
+    QTreeView *m_historyView = nullptr;        // the History table (owned by the .ui form)
     QToolButton *m_historyPrev = nullptr;      // pagination: previous 500-row page
     QToolButton *m_historyNext = nullptr;      // pagination: next 500-row page
     QLabel *m_historyPageLabel = nullptr;      // "Page X of Y (N transactions)"
@@ -446,6 +461,8 @@ private:
     int m_swapApprovePolls = 0;                // CoW: allowance re-check attempts after approving
     bool m_swapAwaitingRouterApprove = false;  // on-chain router: waiting for approve to mine
     int m_swapRouterApprovePolls = 0;          // on-chain router: allowance re-check attempts
+    bool m_swapAwaitingApproveReset = false;   // waiting for a USDT-style approve(0) to mine
+    QString m_swapApproveCap;                  // the real cap to approve once the reset has mined
     bool m_swapRouterExecuteAfterBuild = false;// on-chain router: routerBuilt should swap immediately
     // Built on-chain tx (from routerBuild), used across confirm -> allowance -> approve -> swap.
     QString m_swapBuiltTo, m_swapBuiltData, m_swapBuiltValue, m_swapBuiltSpender, m_swapBuiltMinBuy;

@@ -72,6 +72,11 @@ struct HistoryItem {
     QString status;        // "pending" | "done" | "failed"
     quint64 expiry = 0;    // swap order validTo (unix secs); 0 = unknown. A pending swap isn't marked
                            // failed before this - CoW orders can legitimately stay open for minutes.
+    // Which account this row was fetched for. An off-chain order can only be asked about through the
+    // address that placed it, so a swap made from an account other than the one on screen is
+    // unreachable without this. `unknownAccount` means an older cache that predates the field.
+    static constexpr quint32 unknownAccount = 0xFFFFFFFFu;
+    quint32 account = unknownAccount;
 };
 
 struct NftCollection {
@@ -413,6 +418,10 @@ public:
     static QString cowVaultRelayer() { return QStringLiteral("0xC92E8bdf79f0507f65a392b0ab4667716BFE0110"); }
     // The GPv2 Settlement contract (EIP-712 verifying contract) - shown in the confirm dialog.
     static QString cowSettlement() { return QStringLiteral("0x9008D19f58AAbD9eD0D60971565AA8510560ab41"); }
+    // CoW's production EthFlow contract, which receives the coin on a native sell. Must stay equal to
+    // ETH_FLOW_PROD in core/src/chains.rs: this is the address the confirm dialog shows the user, and
+    // showing one address while sending to another defeats the point of showing it.
+    static QString cowEthFlow() { return QStringLiteral("0xbA3cB449bD2B4ADddBc894D8697F5170800EAdeC"); }
 
     // Utility: convert human amount -> base units for `decimals`.
     static QString parseUnits(const QString &amount, quint8 decimals);

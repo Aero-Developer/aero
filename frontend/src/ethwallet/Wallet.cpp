@@ -676,6 +676,7 @@ static void parseHistoryArray(const QString &json, QVector<HistoryItem> &out) {
         h.buySymbol = o.value("buy_symbol").toString();
         h.buyFormatted = o.value("buy_formatted").toString();
         h.status = o.value("status").toString();
+        h.expiry = static_cast<quint64>(o.value("expiry").toDouble());
         out.append(h);
     }
 }
@@ -693,6 +694,8 @@ void Wallet::refreshHistory(quint32 accountIndex, const QString &fromBlock) {
         // Merge CoW Protocol swaps (pending + historical) for this account: they aren't on-chain
         // transfers, so the explorer never lists them.
         mergeCowOrders(accountIndex, items);
+        for (HistoryItem &h : items)
+            h.account = accountIndex;
         std::sort(items.begin(), items.end(),
                   [](const HistoryItem &a, const HistoryItem &b) { return a.timestamp > b.timestamp; });
         QMetaObject::invokeMethod(this, [this, items, chain]() { emit historyRefreshed(items, chain); },
@@ -712,12 +715,39 @@ void Wallet::mergeCowOrders(quint32 accountIndex, QVector<HistoryItem> &items) {
     for (const HistoryItem &h : items)
         if (h.kind == QLatin1String("swap"))
             haveUid.insert(h.txHash);
+    quint64 oldestCow = 0;
     for (const HistoryItem &h : cow) {
+        if (h.timestamp > 0 && (oldestCow == 0 || h.timestamp < oldestCow))
+            oldestCow = h.timestamp;
         if (haveUid.contains(h.txHash))
             continue;
         haveUid.insert(h.txHash);
         items.append(h);
     }
+
+    // A settled CoW order is on-chain twice over: the explorer reports the settlement's transfer
+    // legs ("sent USDC", "received WETH"), and CoW reports the order itself. The core deliberately
+    // does not collapse settlement legs into a swap - that is this function's job - but it also did
+    // not remove them, so one filled order rendered as three rows and read like a spend on top of a
+    // swap. Drop the legs now that the order they belong to is in the list.
+    //
+    // Only within the window CoW actually answered for. The order feed is capped, so a leg older
+    // than the oldest order returned has no replacement coming and is left as-is: showing a trade
+    // as two transfers is untidy, but silently deleting it is worse.
+    if (cow.isEmpty())
+        return; // nothing came back (non-CoW chain, or the API is down) - never drop evidence
+    static const QString kSettle = QStringLiteral("0x9008d19f58aabd9ed0d60971565aa8510560ab41");
+    static const QString kVault = QStringLiteral("0xc92e8bdf79f0507f65a392b0ab4667716bfe0110");
+    items.erase(std::remove_if(items.begin(), items.end(),
+                               [&](const HistoryItem &h) {
+                                   if (h.kind == QLatin1String("swap"))
+                                       return false; // the order rows themselves
+                                   if (h.timestamp < oldestCow)
+                                       return false; // beyond what CoW told us about
+                                   const QString cp = h.counterparty.toLower();
+                                   return cp == kSettle || cp == kVault;
+                               }),
+                items.end());
 }
 
 void Wallet::refreshHistoryAll(quint32 numAccounts, quint32 priorityIndex) {
@@ -754,6 +784,8 @@ void Wallet::refreshHistoryAll(quint32 numAccounts, quint32 priorityIndex) {
                 if (j)
                     parseHistoryArray(takeString(j), part);
                 mergeCowOrders(a, part); // CoW swaps for this account (off-chain; not the explorer)
+                for (HistoryItem &h : part)
+                    h.account = a;
             }
             const quint32 d = static_cast<quint32>(done->fetchAndAddOrdered(1)) + 1;
             QMetaObject::invokeMethod(
@@ -777,6 +809,8 @@ void Wallet::refreshAccountHistory(quint32 accountIndex) {
             if (j)
                 parseHistoryArray(takeString(j), part);
             mergeCowOrders(accountIndex, part);
+            for (HistoryItem &h : part)
+                h.account = accountIndex;
         }
         QMetaObject::invokeMethod(
             this,

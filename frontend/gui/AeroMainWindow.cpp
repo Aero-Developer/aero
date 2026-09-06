@@ -1,5 +1,6 @@
-// SPDX-License-Identifier: BSD-3-Clause
+﻿// SPDX-License-Identifier: BSD-3-Clause
 #include "AeroMainWindow.h"
+#include "Updater.h"
 #include "XmrTradeTab.h"
 
 #include <algorithm>
@@ -155,7 +156,7 @@ struct ChainDef {
     QString explorer;    // block-explorer base for tx links
     bool cow = false;            // CoW Protocol swaps available (mirrors core chains.rs cow_network)
     bool ethFlow = false;        // CoW eth-flow (native-ETH sells) available on this chain
-    QString wrappedNative;       // wrapped-native ERC-20 (WETH/WMATIC/…) for swaps
+    QString wrappedNative;       // wrapped-native ERC-20 (WETH/WMATIC/â€¦) for swaps
 };
 
 const QList<ChainDef> &chainDefs() {
@@ -174,7 +175,7 @@ const QList<ChainDef> &chainDefs() {
           QStringLiteral("https://arbitrum.meowrpc.com"),
           QStringLiteral("https://1rpc.io/arb")},
          QStringLiteral("https://arbiscan.io"),
-         true, false, QStringLiteral("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1")},
+         true, true, QStringLiteral("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1")},
         {8453, QStringLiteral("Base"), QStringLiteral("ETH"),
          QStringLiteral(":/assets/images/chains/base.png"),
          {QStringLiteral("https://base-rpc.publicnode.com"),
@@ -183,7 +184,7 @@ const QList<ChainDef> &chainDefs() {
           QStringLiteral("https://base.meowrpc.com"),
           QStringLiteral("https://1rpc.io/base")},
          QStringLiteral("https://basescan.org"),
-         true, false, QStringLiteral("0x4200000000000000000000000000000000000006")},
+         true, true, QStringLiteral("0x4200000000000000000000000000000000000006")},
         {10, QStringLiteral("Optimism"), QStringLiteral("ETH"),
          QStringLiteral(":/assets/images/chains/optimism.png"),
          {QStringLiteral("https://optimism-rpc.publicnode.com"),
@@ -199,7 +200,7 @@ const QList<ChainDef> &chainDefs() {
           QStringLiteral("https://1rpc.io/matic"),
           QStringLiteral("https://polygon-rpc.com")},
          QStringLiteral("https://polygonscan.com"),
-         true, false, QStringLiteral("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270")},
+         true, true, QStringLiteral("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270")},
         {56, QStringLiteral("BNB Smart Chain"), QStringLiteral("BNB"),
          QStringLiteral(":/assets/images/chains/bsc.png"),
          {QStringLiteral("https://bsc-rpc.publicnode.com"),
@@ -208,7 +209,7 @@ const QList<ChainDef> &chainDefs() {
           QStringLiteral("https://1rpc.io/bnb"),
           QStringLiteral("https://bsc.drpc.org")},
          QStringLiteral("https://bscscan.com"),
-         false, false, QStringLiteral("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c")},
+         true, true, QStringLiteral("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c")},
         {100, QStringLiteral("Gnosis"), QStringLiteral("XDAI"),
          QStringLiteral(":/assets/images/chains/gnosis.png"),
          {QStringLiteral("https://gnosis-rpc.publicnode.com"),
@@ -216,7 +217,7 @@ const QList<ChainDef> &chainDefs() {
           QStringLiteral("https://gnosis.drpc.org"),
           QStringLiteral("https://1rpc.io/gnosis")},
          QStringLiteral("https://gnosisscan.io"),
-         true, false, QStringLiteral("0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d")},
+         true, true, QStringLiteral("0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d")},
         {43114, QStringLiteral("Avalanche"), QStringLiteral("AVAX"),
          QStringLiteral(":/assets/images/chains/avalanche.png"),
          {QStringLiteral("https://avalanche-c-chain-rpc.publicnode.com"),
@@ -224,7 +225,7 @@ const QList<ChainDef> &chainDefs() {
           QStringLiteral("https://avalanche.drpc.org"),
           QStringLiteral("https://1rpc.io/avax/c")},
          QStringLiteral("https://snowtrace.io"),
-         true, false, QStringLiteral("0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7")},
+         true, true, QStringLiteral("0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7")},
         // Testnets (worthless coins, for safe testing). Shown only when "Show testnets" is enabled.
         {11155111, QStringLiteral("Sepolia (testnet)"), QStringLiteral("SepoliaETH"),
          QStringLiteral(":/assets/images/chains/ethereum.png"),
@@ -365,7 +366,7 @@ QVector<TokenInfo> curatedTopTokens(quint64 chainId) {
 
 QString shortAddr(const QString &a) {
     if (a.size() < 12) return a;
-    return a.left(8) + QStringLiteral("…") + a.right(6);
+    return a.left(8) + QStringLiteral("â€¦") + a.right(6);
 }
 
 // A normal (non-editable) combo box that, when its dropdown opens, shows a search box PINNED AT THE
@@ -378,7 +379,7 @@ public:
     explicit SearchableComboBox(QWidget *parent = nullptr) : QComboBox(parent) {
         setMaxVisibleItems(18);
         m_filter = new QLineEdit(this);
-        m_filter->setPlaceholderText(QObject::tr("Search account, label, or address…"));
+        m_filter->setPlaceholderText(QObject::tr("Search account, label, or addressâ€¦"));
         m_filter->setClearButtonEnabled(true);
         m_filter->hide();
         connect(m_filter, &QLineEdit::textChanged, this, [this](const QString &t) { filterRows(t); });
@@ -622,7 +623,7 @@ void AeroMainWindow::closeEvent(QCloseEvent *event) {
         // this function returns while the worker is still running, the worker doesn't write to a
         // destroyed stack variable.
         QSharedPointer<QAtomicInt> saved = QSharedPointer<QAtomicInt>::create(0);
-        QProgressDialog prog(tr("Saving…"), QString(), 0, 0, this);
+        QProgressDialog prog(tr("Savingâ€¦"), QString(), 0, 0, this);
         prog.setWindowModality(Qt::ApplicationModal);
         prog.setCancelButton(nullptr);
         prog.setMinimumDuration(400); // don't flash the dialog for a fast save
@@ -742,8 +743,14 @@ void AeroMainWindow::setupTabs() {
     m_historyCombo->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     m_historyCombo->setMinimumWidth(200);
     histUi.horizontalLayout_2->insertWidget(0, m_historyCombo);
+    // The view outlives this constructor's `histUi`, so hold the pointer, not the form.
+    m_historyView = histUi.history;
     connect(m_historyCombo, &QComboBox::currentIndexChanged, this, [this](int idx) {
         m_historyFilter = idx <= 0 ? -1 : (idx - 1); // item 0 = All; items 1..N = account idx-1
+        // Filtered to one account, every row would name that same account: the combo above already
+        // says it. The column earns its width only when more than one account is on screen.
+        if (m_historyView)
+            m_historyView->setColumnHidden(HistoryModel::Column_Account, m_historyFilter >= 0);
         refreshHistoryView();
     });
 
@@ -803,6 +810,7 @@ void AeroMainWindow::setupTabs() {
                 relabel(m_fromCombo, 0);
                 relabel(m_swapFrom, 0);
                 relabel(m_historyCombo, 1); // item 0 is "All accounts"
+                pushAccountNames();         // and into the History table's Account column
             });
     recvUi.addresses->setSelectionBehavior(QAbstractItemView::SelectRows);
     recvUi.addresses->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -903,7 +911,7 @@ void AeroMainWindow::setupTabs() {
         connect(menu->addAction(tr("Rescan for funded addresses (all chains)")), &QAction::triggered,
                 this, [this]() {
                     if (m_wallet) {
-                        setConnectionState(m_connMode, tr("Scanning for your addresses…"));
+                        setConnectionState(m_connMode, tr("Scanning for your addressesâ€¦"));
                         startScanProgress();
                         m_wallet->scanFundedMulti(allChainsScanConfig(), 40); // silent, cross-chain
                     }
@@ -932,7 +940,7 @@ void AeroMainWindow::setupTabs() {
     sendUi.formLayout->insertRow(0, tr("From"), m_fromCombo);
 
     // The stock .ui uses two dropdowns (a currency combo + an ETH/USD unit toggle). Replace them
-    // with a single row of clickable asset buttons (ETH / DAI / USDC / USDT / …): pick one, then
+    // with a single row of clickable asset buttons (ETH / DAI / USDC / USDT / â€¦): pick one, then
     // just type the amount in that asset.
     sendUi.comboCurrencySelection->hide();
     // Hide Monero/OpenAlias leftovers that were never wired for Ethereum.
@@ -1104,7 +1112,7 @@ void AeroMainWindow::setupTabs() {
     m_customPriority = new QLineEdit(m_customFeeWidget);
     m_customPriority->setPlaceholderText(tr("priority"));
     customRow->addWidget(m_customMaxFee);
-    customRow->addWidget(new QLabel(tr("gwei  ·  tip"), m_customFeeWidget));
+    customRow->addWidget(new QLabel(tr("gwei  Â·  tip"), m_customFeeWidget));
     customRow->addWidget(m_customPriority);
     customRow->addWidget(new QLabel(tr("gwei"), m_customFeeWidget));
     sendUi.formLayout->insertRow(feeRow >= 0 ? feeRow + 2 : 7, tr("Custom fee"), m_customFeeWidget);
@@ -1221,7 +1229,7 @@ void AeroMainWindow::updateFeeEstimate() {
     QString text = tr("Gas: %1 Gwei \u00d7 %2 units")
                        .arg(trimZeros(QString::number(maxFeeWei / 1e9, 'f', 2)),
                             grouped(QString::number(gasLimit, 'f', 0)));
-    text += tr("  ·  \u2248 %1 ETH").arg(grouped(trimZeros(QString::number(feeEth, 'f', 8))));
+    text += tr("  Â·  \u2248 %1 ETH").arg(grouped(trimZeros(QString::number(feeEth, 'f', 8))));
     if (m_nativeUsd > 0)
         text += tr(" (%1)").arg(fiatStr(feeEth * m_nativeUsd));
 
@@ -1231,7 +1239,7 @@ void AeroMainWindow::updateFeeEstimate() {
     else if (mode.compare(tr("Normal"), Qt::CaseInsensitive) == 0) eta = tr("~45 sec");
     else if (mode.compare(tr("Slow"), Qt::CaseInsensitive) == 0) eta = tr("~3 min");
     else if (mode.compare(tr("Custom"), Qt::CaseInsensitive) == 0) eta = tr("varies");
-    text += tr("  ·  ETA %1").arg(eta);
+    text += tr("  Â·  ETA %1").arg(eta);
     m_feeEstimateLabel->setText(text);
 }
 
@@ -1254,7 +1262,7 @@ void AeroMainWindow::setupHomeTab() {
         auto *v = new QVBoxLayout(box);
         v->setContentsMargins(6, 6, 6, 4);
         v->setSpacing(2);
-        auto *value = new QLabel(QStringLiteral("…"), box);
+        auto *value = new QLabel(QStringLiteral("â€¦"), box);
         value->setFont(relativeFont(0));
         value->setTextInteractionFlags(Qt::LinksAccessibleByMouse | Qt::TextSelectableByMouse);
         v->addWidget(value);
@@ -1483,7 +1491,7 @@ void AeroMainWindow::setupSwapTab() {
     paySub->addWidget(m_swapPayUsd);
     form->addRow(QString(), paySub);
 
-    // Reverse direction (swap the two assets). Transparent (no button chrome) horizontal ↔ arrows,
+    // Reverse direction (swap the two assets). Transparent (no button chrome) horizontal â†” arrows,
     // placed out in the empty space on the right rather than as a boxed button.
     auto *revRow = new QHBoxLayout();
     auto *reverseBtn = new QToolButton(m_swapTab);
@@ -1502,7 +1510,7 @@ void AeroMainWindow::setupSwapTab() {
         std::swap(m_swapSellSymbol, m_swapBuySymbol);
         std::swap(m_swapSellAddr, m_swapBuyAddr);
         std::swap(m_swapSellDecimals, m_swapBuyDecimals);
-        std::swap(m_swapLlamaSellUsd, m_swapLlamaBuyUsd); // prices follow their assets (no wrong "≈ $")
+        std::swap(m_swapLlamaSellUsd, m_swapLlamaBuyUsd); // prices follow their assets (no wrong "â‰ˆ $")
         if (m_swapSellButton) {
             m_swapSellButton->setIcon(tokenIcon(m_swapSellSymbol));
             m_swapSellButton->setText(m_swapSellSymbol + QStringLiteral(" \u25be"));
@@ -1727,6 +1735,7 @@ bool AeroMainWindow::isKnownRouter(const QString &addr) const {
     static const QSet<QString> known = {
         QStringLiteral("0xc92e8bdf79f0507f65a392b0ab4667716bfe0110"), // CoW Vault Relayer
         QStringLiteral("0x9008d19f58aabd9ed0d60971565aa8510560ab41"), // CoW Settlement
+        QStringLiteral("0xba3cb449bd2b4adddbc894d8697f5170800eadec"), // CoW EthFlow (production)
         QStringLiteral("0x6131b5fae19ea4f9d964eac0408e4408b66337b5"), // KyberSwap MetaAggregationRouterV2
         QStringLiteral("0xdef171fe48cf0115b1d80b88dc8eab59176fee57"), // Paraswap AugustusSwapper
         QStringLiteral("0x216b4b4ba9f3e719726886d34a177484278bfcae"), // Paraswap TokenTransferProxy
@@ -1948,6 +1957,8 @@ void AeroMainWindow::resetSwapFlow() {
     m_swapAwaitingRouterApprove = false;
     m_swapRouterApprovePolls = 0;
     m_swapRouterExecuteAfterBuild = false;
+    m_swapAwaitingApproveReset = false;
+    m_swapApproveCap.clear();
 }
 
 void AeroMainWindow::refreshSwapQuote() {
@@ -1955,10 +1966,10 @@ void AeroMainWindow::refreshSwapQuote() {
         return;
     // CRITICAL: never re-quote while a swap is being confirmed / approved / submitted. The live
     // 20s refresh would wipe the routes, reset the selection, and overwrite the flow's status with
-    // "Fetching quotes…", stranding the approve→submit sequence (the user would approve the token
+    // "Fetching quotesâ€¦", stranding the approveâ†’submit sequence (the user would approve the token
     // but never get to complete the swap). Reschedule and resume once the swap settles.
     const bool midFlight = m_swapCowExecuting || m_swapAwaitingApprove ||
-                           m_swapAwaitingRouterApprove ||
+                           m_swapAwaitingRouterApprove || m_swapAwaitingApproveReset ||
                            !m_swapExecQuote.isEmpty() || !m_swapBuiltTo.isEmpty();
     if (midFlight) {
         if (m_swapQuoteTimer)
@@ -1993,7 +2004,7 @@ void AeroMainWindow::refreshSwapQuote() {
     const QString sellAmountWei = m_wallet->parseUnits(amt, sellDec);
     const int from = m_swapFrom ? qMax(0, m_swapFrom->currentIndex()) : 0;
 
-    m_swapStatus->setText(tr("Fetching quotes from routers…"));
+    m_swapStatus->setText(tr("Fetching quotes from routersâ€¦"));
     const quint32 slipBps = swapSlippageBps();
     if (m_swapSlipNote) {
         const bool autoMode = m_swapSlippage &&
@@ -2086,7 +2097,7 @@ void AeroMainWindow::onSwapQuotesReady(const QString &json, const QString &error
         if (gasless)
             it->setToolTip(3, tr("MEV-protected off-chain order (no gas)"));
         else if (r.gasUsd > 0.0)
-            it->setToolTip(3, tr("On-chain swap · est. gas ~%1").arg(fiatStr(r.gasUsd)));
+            it->setToolTip(3, tr("On-chain swap Â· est. gas ~%1").arg(fiatStr(r.gasUsd)));
 
         QVariantMap d;
         d[QStringLiteral("router_id")] = r.id;
@@ -2166,11 +2177,11 @@ void AeroMainWindow::onSwapQuoteReady(const QString &quoteJson, const QString &e
     m_swapExecQuote = m_swapQuoteJson;
     m_swapExecNative = sellIsNative;
     if (sellIsNative) {
-        m_swapStatus->setText(tr("Submitting eth-flow order on-chain…"));
+        m_swapStatus->setText(tr("Submitting eth-flow order on-chainâ€¦"));
         m_wallet->swapEthFlow(m_swapExecFrom, m_swapExecQuote, m_swapExecBuyAddr,
                               m_swapExecSlippageBps);
     } else {
-        m_swapStatus->setText(tr("Checking token approval…"));
+        m_swapStatus->setText(tr("Checking token approvalâ€¦"));
         m_wallet->swapAllowance(m_swapExecFrom, m_swapExecSellAddr);
     }
 }
@@ -2186,7 +2197,7 @@ void AeroMainWindow::onDefillamaPricesReady(const QString &json, const QString &
     const QString buyKey = defillamaKey(m_chainId, buyIsNative ? QString() : m_swapBuyAddr);
     m_swapLlamaSellUsd = coins.value(sellKey).toObject().value(QStringLiteral("price")).toDouble();
     m_swapLlamaBuyUsd = coins.value(buyKey).toObject().value(QStringLiteral("price")).toDouble();
-    updateSwapPayUsd(); // now that we have a sell-token price, show the "≈ $X" under You pay
+    updateSwapPayUsd(); // now that we have a sell-token price, show the "â‰ˆ $X" under You pay
 }
 
 // Inline swap result (Feather-style): no modal popup. Sets a check-marked status line on the Swap
@@ -2224,6 +2235,9 @@ void AeroMainWindow::addPendingSwap(const QString &id) {
             h.expiry = static_cast<quint64>(qMax(validTo, now + 20 * 60) + 5 * 60);
         }
     }
+    // The swap tab sells from whichever account is selected there, which is not always the one on
+    // screen. Recording it is what lets the poll ask the right address about this order.
+    h.account = m_swapExecFrom;
     m_historyModel->addLocalSwap(h);
     startCowPoll(); // keep re-checking status until it settles (CoW auctions can take minutes)
 }
@@ -2246,8 +2260,23 @@ void AeroMainWindow::startCowPoll() {
                 m_cowPollTimer->stop();
                 return;
             }
-            if (m_connMode > 0) // only when connected - just re-poll the active account's orders
-                ensureAccountHistory(m_account, /*force*/ true);
+            if (m_connMode <= 0)
+                return; // offline: nothing to ask, but keep the timer for when we reconnect
+            // Ask about every account holding an open order, not only the one on screen. A swap can
+            // be placed from any account in the Swap tab, and after a restart the pending rows come
+            // back from the cache remembering which account they belong to.
+            QList<quint32> accounts = m_historyModel->pendingSwapAccounts();
+            if (accounts.isEmpty())
+                accounts.append(m_account); // an older cache, saved before rows recorded an account
+            for (quint32 a : accounts) {
+                // A single-account History view is served by refreshHistory(), whose batches
+                // onAccountHistoryReady() deliberately drops - so route through it, or the filtered
+                // view would never learn that the order settled.
+                if (m_historyFilter >= 0 && a == static_cast<quint32>(m_historyFilter))
+                    m_wallet->refreshHistory(a);
+                else
+                    ensureAccountHistory(a, /*force*/ true);
+            }
         });
     }
     if (m_historyModel && m_historyModel->hasPendingSwaps())
@@ -2262,13 +2291,20 @@ void AeroMainWindow::swapInlineDone(const QString &summary, const QString &url,
             msg += QStringLiteral("&nbsp;&nbsp;<a href=\"%1\">%2</a>")
                        .arg(url, linkText.toHtmlEscaped());
         m_swapStatus->setTextFormat(Qt::RichText);
-        m_swapStatus->setOpenExternalLinks(true);
+        // Not setOpenExternalLinks: that hands the URL straight to the system browser, outside Tor,
+        // with no chance to warn.
+        m_swapStatus->setOpenExternalLinks(false);
+        // Reconnected each time a swap finishes, so drop the previous swap's handler first.
+        disconnect(m_swapStatus, &QLabel::linkActivated, this, nullptr);
+        connect(m_swapStatus, &QLabel::linkActivated, this,
+                [this](const QString &href) { openOutsideTor(href); });
         m_swapStatus->setText(msg);
     }
-    ensureAccountHistory(m_account, /*force*/ true);
+    // The account that sold, which is not necessarily the account on screen.
+    const quint32 from = m_swapExecFrom;
+    ensureAccountHistory(from, /*force*/ true);
     // CoW/explorers need a moment to index; refresh once more so a just-placed order flips to a row.
-    QTimer::singleShot(20000, this,
-                       [this]() { ensureAccountHistory(m_account, /*force*/ true); });
+    QTimer::singleShot(20000, this, [this, from]() { ensureAccountHistory(from, /*force*/ true); });
 }
 
 bool AeroMainWindow::swapConfirmDialog(bool sellIsNative, bool buyIsNative, double sellH,
@@ -2300,7 +2336,7 @@ bool AeroMainWindow::swapConfirmDialog(bool sellIsNative, bool buyIsNative, doub
     cv->setContentsMargins(16, 16, 16, 12);
     cv->setSpacing(12);
 
-    auto *net = new QLabel(tr("on %1  ·  via %2").arg(chainDefFor(m_chainId).name, routerLabel),
+    auto *net = new QLabel(tr("on %1  Â·  via %2").arg(chainDefFor(m_chainId).name, routerLabel),
                            content);
     net->setStyleSheet(QStringLiteral("color:#8a8a8a;"));
     cv->addWidget(net);
@@ -2357,7 +2393,7 @@ bool AeroMainWindow::swapConfirmDialog(bool sellIsNative, bool buyIsNative, doub
     auto *df = new QFormLayout(det);
     df->setLabelAlignment(Qt::AlignRight);
     df->addRow(tr("From"),
-               new QLabel(tr("%1  ·  %2").arg(accountLabel(fromIndex),
+               new QLabel(tr("%1  Â·  %2").arg(accountLabel(fromIndex),
                                               shortAddr(m_wallet->address(fromIndex))), det));
     if (sellH > 0.0)
         df->addRow(tr("Rate"),
@@ -2387,17 +2423,17 @@ bool AeroMainWindow::swapConfirmDialog(bool sellIsNative, bool buyIsNative, doub
                           det));
     if (isCow) {
         df->addRow(tr("Network fee"), new QLabel(feeUsd > 0.0
-            ? tr("%1 %2  (%3)  ·  from the sold amount")
+            ? tr("%1 %2  (%3)  Â·  from the sold amount")
                   .arg(formatBalance(feeH), m_swapSellSymbol, fiatStr(feeUsd))
-            : tr("%1 %2  ·  from the sold amount").arg(formatBalance(feeH), m_swapSellSymbol), det));
+            : tr("%1 %2  Â·  from the sold amount").arg(formatBalance(feeH), m_swapSellSymbol), det));
     } else {
         // On-chain routers: the fee is gas, paid separately. Show the estimate (native + USD).
         QString feeTxt;
         if (feeH > 0.0 && feeUsd > 0.0)
-            feeTxt = tr("\u2248 %1 %2  (%3)  ·  network gas, est.")
+            feeTxt = tr("\u2248 %1 %2  (%3)  Â·  network gas, est.")
                          .arg(formatBalance(feeH), m_nativeSymbol, fiatStr(feeUsd));
         else if (feeUsd > 0.0)
-            feeTxt = tr("\u2248 %1  ·  network gas, est.").arg(fiatStr(feeUsd));
+            feeTxt = tr("\u2248 %1  Â·  network gas, est.").arg(fiatStr(feeUsd));
         else
             feeTxt = tr("paid separately in %1 gas (estimate unavailable)").arg(m_nativeSymbol);
         df->addRow(tr("Network fee"), new QLabel(feeTxt, det));
@@ -2447,8 +2483,7 @@ bool AeroMainWindow::swapConfirmDialog(bool sellIsNative, bool buyIsNative, doub
             buyIsNative ? -1 : (buyKnown ? 1 : 0));
     if (isCow) {
         if (sellIsNative)
-            addrRow(tr("CoW eth-flow"),
-                    QStringLiteral("0x40A50cf069e992AA4536211B23F286eF88752187"), 1);
+            addrRow(tr("CoW eth-flow"), Wallet::cowEthFlow(), 1);
         addrRow(tr("GPv2 Settlement"), Wallet::cowSettlement(), 1);
         if (!sellIsNative)
             addrRow(tr("Vault Relayer (spender)"), Wallet::cowVaultRelayer(), 1);
@@ -2625,12 +2660,12 @@ void AeroMainWindow::onSwapConfirm() {
     if (m_swapSelKind == QLatin1String("signed-order")) {
         // CoW: fetch a fresh full quote, then onSwapQuoteReady shows the confirm + executes.
         m_swapCowExecuting = true;
-        m_swapStatus->setText(tr("Getting a fresh CoW quote…"));
+        m_swapStatus->setText(tr("Getting a fresh CoW quoteâ€¦"));
         const QString buyParam = m_swapBuyAddr.isEmpty() ? Wallet::buyEthSentinel() : m_swapBuyAddr;
         m_wallet->swapQuote(m_swapExecFrom, m_swapSellAddr, buyParam, sellAmountWei, sellIsNative);
     } else {
         // On-chain router: build fresh calldata, then onRouterBuilt shows the confirm + executes.
-        m_swapStatus->setText(tr("Building %1 transaction…").arg(m_swapSelLabel));
+        m_swapStatus->setText(tr("Building %1 transactionâ€¦").arg(m_swapSelLabel));
         m_wallet->routerBuild(m_swapSelRouter, m_swapExecFrom, m_swapSellAddr, m_swapBuyAddr,
                               sellAmountWei, sellIsNative,
                               sellIsNative ? 18 : m_swapSellDecimals,
@@ -2681,7 +2716,7 @@ void AeroMainWindow::onRouterBuilt(const QString &json, const QString &error) {
                 return;
             }
         }
-        m_swapStatus->setText(tr("Sending swap through %1…").arg(m_swapSelLabel));
+        m_swapStatus->setText(tr("Sending swap through %1â€¦").arg(m_swapSelLabel));
         m_wallet->routerSwap(m_swapExecFrom, m_swapBuiltTo, m_swapBuiltValue, m_swapBuiltData);
         return;
     }
@@ -2711,10 +2746,10 @@ void AeroMainWindow::onRouterBuilt(const QString &json, const QString &error) {
     }
 
     if (sellIsNative) {
-        m_swapStatus->setText(tr("Sending swap through %1…").arg(m_swapSelLabel));
+        m_swapStatus->setText(tr("Sending swap through %1â€¦").arg(m_swapSelLabel));
         m_wallet->routerSwap(m_swapExecFrom, m_swapBuiltTo, m_swapBuiltValue, m_swapBuiltData);
     } else {
-        m_swapStatus->setText(tr("Checking token approval…"));
+        m_swapStatus->setText(tr("Checking token approvalâ€¦"));
         m_wallet->routerAllowance(m_swapExecFrom, m_swapExecSellAddr, m_swapBuiltSpender);
     }
 }
@@ -2750,7 +2785,7 @@ void AeroMainWindow::onRouterAllowanceReady(const QString &token, const QString 
             // Snapshot the min-out the user just confirmed; the fresh rebuild below may quote worse
             // after the ~1-block approval wait, and we re-prompt if it drops materially.
             m_swapConfirmedMinBuy = m_swapBuiltMinBuy;
-            m_swapStatus->setText(tr("Approval confirmed. Preparing swap through %1…")
+            m_swapStatus->setText(tr("Approval confirmed. Preparing swap through %1â€¦")
                                       .arg(m_swapSelLabel));
             m_wallet->routerBuild(m_swapSelRouter, m_swapExecFrom, m_swapExecSellAddr,
                                   m_swapExecBuyAddr, m_swapExecSellAmountWei, false,
@@ -2758,7 +2793,7 @@ void AeroMainWindow::onRouterAllowanceReady(const QString &token, const QString 
                                   m_swapExecBuyAddr.isEmpty() ? 18 : m_swapBuyDecimals,
                                   m_swapExecSlippageBps);
         } else if (++m_swapRouterApprovePolls <= 15) {
-            m_swapStatus->setText(tr("Waiting for the approval to confirm on-chain… (%1)")
+            m_swapStatus->setText(tr("Waiting for the approval to confirm on-chainâ€¦ (%1)")
                                       .arg(m_swapRouterApprovePolls));
             const QString sp = m_swapBuiltSpender;
             QTimer::singleShot(8000, this, [this, sp]() {
@@ -2773,8 +2808,32 @@ void AeroMainWindow::onRouterAllowanceReady(const QString &token, const QString 
         }
         return;
     }
+    // A USDT-style reset is in flight. Wait for the allowance to actually read zero before asking
+    // for the real one, because the whole point of the reset is that the token refuses the second
+    // approve until the first has mined.
+    if (m_swapAwaitingApproveReset) {
+        if (allowanceWei.isEmpty() || allowanceWei == QLatin1String("0")) {
+            m_swapAwaitingApproveReset = false;
+            m_swapStatus->setText(tr("Previous approval cleared. Approving %1â€¦").arg(m_swapSellSymbol));
+            m_wallet->routerApprove(m_swapExecFrom, m_swapExecSellAddr, spender, m_swapApproveCap);
+        } else if (++m_swapRouterApprovePolls <= 15) {
+            m_swapStatus->setText(tr("Waiting for the previous approval to clearâ€¦ (%1)")
+                                      .arg(m_swapRouterApprovePolls));
+            const QString sp = m_swapBuiltSpender;
+            QTimer::singleShot(8000, this, [this, sp]() {
+                if (m_wallet && m_swapAwaitingApproveReset && !m_swapBuiltTo.isEmpty())
+                    m_wallet->routerAllowance(m_swapExecFrom, m_swapExecSellAddr, sp);
+            });
+        } else {
+            m_swapStatus->setText(tr("The approval reset hasn't confirmed yet. Once it does, press "
+                                     "Confirm Swap again."));
+            m_swapConfirmBtn->setEnabled(true);
+            resetSwapFlow();
+        }
+        return;
+    }
     if (geq(allowanceWei, m_swapExecSellAmountWei)) {
-        m_swapStatus->setText(tr("Sending swap through %1…").arg(m_swapSelLabel));
+        m_swapStatus->setText(tr("Sending swap through %1â€¦").arg(m_swapSelLabel));
         m_wallet->routerSwap(m_swapExecFrom, m_swapBuiltTo, m_swapBuiltValue, m_swapBuiltData);
     } else {
         const QString cap = spendingApprovalDialog(
@@ -2786,7 +2845,24 @@ void AeroMainWindow::onRouterAllowanceReady(const QString &token, const QString 
             m_swapConfirmBtn->setEnabled(true);
             return;
         }
-        m_swapStatus->setText(tr("Approving %1…").arg(m_swapSellSymbol));
+        // The allowance is too small but not zero. USDT and the tokens that copied it revert an
+        // approve that moves a non-zero allowance straight to another non-zero value, so clear it
+        // first. One extra transaction, and only in this case. The bridge already did this; the
+        // swap path did not, which left USDT swaps stuck on a reverting approval with no way
+        // forward from inside the app.
+        const bool nonZero = !allowanceWei.isEmpty() && allowanceWei != QLatin1String("0");
+        if (nonZero) {
+            m_swapApproveCap = cap;
+            m_swapAwaitingApproveReset = true;
+            m_swapRouterApprovePolls = 0;
+            m_swapStatus->setText(tr("Clearing the previous %1 approval first (some tokens require "
+                                     "it) - this needs two transactions.")
+                                      .arg(m_swapSellSymbol));
+            m_wallet->routerApprove(m_swapExecFrom, m_swapExecSellAddr, spender,
+                                    QStringLiteral("0"));
+            return;
+        }
+        m_swapStatus->setText(tr("Approving %1â€¦").arg(m_swapSellSymbol));
         m_wallet->routerApprove(m_swapExecFrom, m_swapExecSellAddr, spender, cap);
     }
 }
@@ -2800,13 +2876,25 @@ void AeroMainWindow::onRouterApproved(const QString &txHash, const QString &erro
         resetSwapFlow();
         return;
     }
+    // That was the approve(0) of a two-step reset, not the approval itself. Poll until the token
+    // reports zero, then onRouterAllowanceReady sends the real one.
+    if (m_swapAwaitingApproveReset) {
+        m_swapStatus->setText(tr("Clearing approval (%1). Waiting for it to confirm on-chainâ€¦")
+                                  .arg(shortAddr(txHash)));
+        const QString sp = m_swapBuiltSpender;
+        QTimer::singleShot(8000, this, [this, sp]() {
+            if (m_wallet && m_swapAwaitingApproveReset && !m_swapBuiltTo.isEmpty())
+                m_wallet->routerAllowance(m_swapExecFrom, m_swapExecSellAddr, sp);
+        });
+        return;
+    }
     // The approve is only BROADCAST here. Sending the swap now would revert with
     // TransferHelper: TRANSFER_FROM_FAILED because the router can't transferFrom until the allowance
     // is MINED. Poll the on-chain allowance and only then rebuild + send the swap (see the
     // m_swapAwaitingRouterApprove branch in onRouterAllowanceReady).
     m_swapAwaitingRouterApprove = true;
     m_swapRouterApprovePolls = 0;
-    m_swapStatus->setText(tr("Approval sent (%1). Waiting for it to confirm on-chain…")
+    m_swapStatus->setText(tr("Approval sent (%1). Waiting for it to confirm on-chainâ€¦")
                               .arg(shortAddr(txHash)));
     const QString sp = m_swapBuiltSpender;
     QTimer::singleShot(8000, this, [this, sp]() {
@@ -2831,10 +2919,10 @@ void AeroMainWindow::onRouterSwapSent(const QString &txHash, const QString &erro
     m_lastSendFrom = 0xFFFFFFFFu;
     applyOptimisticSwap(); // instantly drop the sold asset (the mined receipt then reconciles it)
     startReceiptWatch(txHash);
-    swapInlineDone(tr("Swap sent via %1 - %2 → %3. Tracking in History.")
+    swapInlineDone(tr("Swap sent via %1 - %2 â†’ %3. Tracking in History.")
                        .arg(m_swapSelLabel, m_swapSellSymbol, m_swapBuySymbol),
                    explorerTxUrl(txHash), tr("View transaction"));
-    notify(tr("Swap submitted"), tr("%1 → %2 via %3").arg(m_swapSellSymbol, m_swapBuySymbol,
+    notify(tr("Swap submitted"), tr("%1 â†’ %2 via %3").arg(m_swapSellSymbol, m_swapBuySymbol,
                                                           m_swapSelLabel));
 }
 
@@ -2866,10 +2954,10 @@ void AeroMainWindow::onSwapAllowanceReady(const QString &token, const QString &a
     if (m_swapAwaitingApprove) {
         if (sufficient) {
             m_swapAwaitingApprove = false;
-            m_swapStatus->setText(tr("Approval confirmed. Signing and submitting order…"));
+            m_swapStatus->setText(tr("Approval confirmed. Signing and submitting orderâ€¦"));
             m_wallet->swapSubmit(m_swapExecFrom, m_swapExecQuote, m_swapExecSlippageBps);
         } else if (++m_swapApprovePolls <= 15) {
-            m_swapStatus->setText(tr("Waiting for the approval to confirm on-chain… (%1)")
+            m_swapStatus->setText(tr("Waiting for the approval to confirm on-chainâ€¦ (%1)")
                                       .arg(m_swapApprovePolls));
             QTimer::singleShot(8000, this, [this]() {
                 if (m_wallet && m_swapAwaitingApprove && !m_swapExecQuote.isEmpty())
@@ -2885,7 +2973,7 @@ void AeroMainWindow::onSwapAllowanceReady(const QString &token, const QString &a
     }
 
     if (sufficient) {
-        m_swapStatus->setText(tr("Signing and submitting order…"));
+        m_swapStatus->setText(tr("Signing and submitting orderâ€¦"));
         m_wallet->swapSubmit(m_swapExecFrom, m_swapExecQuote, m_swapExecSlippageBps);
     } else {
         // MetaMask-style spending-cap approval before the on-chain approve tx. Defaults to the exact
@@ -2900,8 +2988,8 @@ void AeroMainWindow::onSwapAllowanceReady(const QString &token, const QString &a
             return;
         }
         m_swapStatus->setText(cap == QLatin1String("max")
-            ? tr("Approving unlimited %1 for the CoW Vault Relayer…").arg(m_swapSellSymbol)
-            : tr("Approving %1 %2 for the CoW Vault Relayer…").arg(m_swapAmount->text().trimmed(),
+            ? tr("Approving unlimited %1 for the CoW Vault Relayerâ€¦").arg(m_swapSellSymbol)
+            : tr("Approving %1 %2 for the CoW Vault Relayerâ€¦").arg(m_swapAmount->text().trimmed(),
                                                                    m_swapSellSymbol));
         m_wallet->swapApprove(m_swapExecFrom, m_swapExecSellAddr, cap);
     }
@@ -2921,7 +3009,7 @@ void AeroMainWindow::onSwapApproved(const QString &txHash, const QString &error)
     // and submit once it's live.
     m_swapAwaitingApprove = true;
     m_swapApprovePolls = 0;
-    m_swapStatus->setText(tr("Approval sent (%1). Waiting for it to confirm on-chain…")
+    m_swapStatus->setText(tr("Approval sent (%1). Waiting for it to confirm on-chainâ€¦")
                               .arg(shortAddr(txHash)));
     QTimer::singleShot(8000, this, [this]() {
         if (m_wallet && m_swapAwaitingApprove && !m_swapExecQuote.isEmpty())
@@ -2941,10 +3029,10 @@ void AeroMainWindow::onSwapSubmitted(const QString &orderUid, const QString &err
     addPendingSwap(orderUid); // show it as pending in History right away (reconciled via cow_orders)
     applyOptimisticSwap();    // instantly drop the sold asset so a follow-up swap sees it reduced
     const QString url = QStringLiteral("https://explorer.cow.fi/orders/%1").arg(orderUid);
-    swapInlineDone(tr("Order placed - %1 → %2. Tracking in History.")
+    swapInlineDone(tr("Order placed - %1 â†’ %2. Tracking in History.")
                        .arg(m_swapSellSymbol, m_swapBuySymbol),
                    url, tr("Track on CoW Explorer"));
-    notify(tr("Swap submitted"), tr("%1 → %2 order placed.").arg(m_swapSellSymbol, m_swapBuySymbol));
+    notify(tr("Swap submitted"), tr("%1 â†’ %2 order placed.").arg(m_swapSellSymbol, m_swapBuySymbol));
 }
 
 void AeroMainWindow::onSwapEthFlowSent(const QString &txHash, const QString &error) {
@@ -2963,10 +3051,10 @@ void AeroMainWindow::onSwapEthFlowSent(const QString &txHash, const QString &err
     addPendingSwap(txHash);
     applyOptimisticSwap(); // instantly drop the sold native coin (eth-flow) so it doesn't linger
     m_swapExecQuote.clear();
-    swapInlineDone(tr("Swap sent - %1 → %2. Tracking in History.")
+    swapInlineDone(tr("Swap sent - %1 â†’ %2. Tracking in History.")
                        .arg(m_swapSellSymbol, m_swapBuySymbol),
                    explorerTxUrl(txHash), tr("View transaction"));
-    notify(tr("Swap submitted"), tr("%1 → %2 order sent.").arg(m_swapSellSymbol, m_swapBuySymbol));
+    notify(tr("Swap submitted"), tr("%1 â†’ %2 order sent.").arg(m_swapSellSymbol, m_swapBuySymbol));
 }
 
 // Well-known token-approval spenders to scan for. These are Ethereum-mainnet router/permit
@@ -3037,6 +3125,13 @@ void AeroMainWindow::showBridgeDialog() {
         enum { NoApproval = 0, AwaitingReset = 1, AwaitingApproval = 2 };
         int approveStage = NoApproval;
         int approvePolls = 0;
+        // Across bakes a quote timestamp and an output amount into the deposit calldata, and the
+        // SpokePool rejects a quote older than its buffer while relayers ignore one whose output no
+        // longer reflects the fee. Approving a token takes one transaction, or two for USDT, so by
+        // the time the deposit could be sent the calldata built before the confirm dialog can be
+        // minutes old. Rebuild it and send that instead.
+        bool rebuildBeforeSend = false;
+        QString confirmedOutput;   // what the user was promised, to catch a fee move on the rebuild
     };
     auto *st = new BridgeState;
     st->account = m_account;
@@ -3091,7 +3186,11 @@ void AeroMainWindow::showBridgeDialog() {
     auto *status = new QLabel(dlg);
     status->setWordWrap(true);
     status->setTextFormat(Qt::RichText);
-    status->setOpenExternalLinks(true);
+    // The bridge's status line carries explorer links for both chains. They leave Tor, so they go
+    // through the same warning as every other outbound link.
+    status->setOpenExternalLinks(false);
+    connect(status, &QLabel::linkActivated, this,
+            [this](const QString &href) { openOutsideTor(href); });
     v->addWidget(status);
 
     auto *btnRow = new QHBoxLayout();
@@ -3132,7 +3231,7 @@ void AeroMainWindow::showBridgeDialog() {
     connect(assetCombo, &QComboBox::currentIndexChanged, dlg, [=](int) { rebuildDest(); });
 
     // Ask Across what it will bridge out of this chain, and build the menus from the answer.
-    status->setText(tr("Checking which assets Across is bridging from %1…").arg(chainDefFor(origin).name));
+    status->setText(tr("Checking which assets Across is bridging from %1â€¦").arg(chainDefFor(origin).name));
     quoteBtn->setEnabled(false);
     connect(m_wallet, &Wallet::acrossAssetsReady, dlg, [=](const QString &json, const QString &err) {
         const QJsonArray assets = QJsonDocument::fromJson(json.toUtf8())
@@ -3190,14 +3289,7 @@ void AeroMainWindow::showBridgeDialog() {
         if (asset().value(QStringLiteral("native")).toBool()) {
             bal = qMax(0.0, m_ethRawByAccount.value(st->account, 0.0) - gasReserve());
         } else {
-            // Best-effort from tracked balances (matched by symbol on the bridging account).
-            for (const TokenInfo &t : m_wallet->tokens()) {
-                if (t.symbol.compare(sym, Qt::CaseInsensitive) != 0)
-                    continue;
-                const QString key = QStringLiteral("%1|%2").arg(st->account).arg(t.address.toLower());
-                bal = m_tokenRawByKey.value(key, 0.0);
-                break;
-            }
+            bal = qMax(0.0, tokenBalanceOnThisChain(st->account, sym));
         }
         if (bal > 0.0)
             amountEdit->setText(trimZeros(QString::number(bal, 'f', 8)));
@@ -3247,7 +3339,7 @@ void AeroMainWindow::showBridgeDialog() {
             status->setText(tr("Enter an amount to bridge."));
             return;
         }
-        status->setText(tr("Fetching Across quote…"));
+        status->setText(tr("Fetching Across quoteâ€¦"));
         quoteBtn->setEnabled(false);
         m_wallet->acrossQuote(st->account, sym, st->dest, wei);
     });
@@ -3317,7 +3409,7 @@ void AeroMainWindow::showBridgeDialog() {
                                 .arg(chainDefFor(origin).name));
             return;
         }
-        status->setText(tr("Sending bridge deposit over Tor…"));
+        status->setText(tr("Sending bridge deposit over Torâ€¦"));
         m_pendingBridge.active = true;
         m_pendingBridge.account = st->account;
         m_pendingBridge.dest = st->dest;
@@ -3326,7 +3418,7 @@ void AeroMainWindow::showBridgeDialog() {
         m_pendingBridge.to = st->to;
         m_pendingBridge.amountHuman = trimZeros(
             QString::number(st->amountWei.toDouble() / std::pow(10.0, st->decimals), 'f', 8));
-        beginSendProgress(tr("Broadcasting bridge deposit…"));
+        beginSendProgress(tr("Broadcasting bridge depositâ€¦"));
         m_wallet->bridgeSend(st->account, st->to, st->value, st->data);
     };
     connect(bridgeBtn, &QPushButton::clicked, dlg, [=]() {
@@ -3366,15 +3458,8 @@ void AeroMainWindow::showBridgeDialog() {
                                          trimZeros(QString::number(nativeBal, 'f', 8))));
                 return;
             }
-            // If the token is tracked, make sure the balance covers the amount.
-            double tokBal = -1.0;
-            for (const TokenInfo &t : m_wallet->tokens()) {
-                if (t.symbol.compare(gsym, Qt::CaseInsensitive) != 0)
-                    continue;
-                tokBal = m_tokenRawByKey.value(
-                    QStringLiteral("%1|%2").arg(st->account).arg(t.address.toLower()), 0.0);
-                break;
-            }
+            // If the balance for this chain's contract is known, make sure it covers the amount.
+            const double tokBal = tokenBalanceOnThisChain(st->account, gsym);
             if (tokBal >= 0.0 && amt > tokBal + 1e-15) {
                 status->setText(tr("Amount exceeds your %1 balance of %2.")
                                     .arg(gsym, trimZeros(QString::number(tokBal, 'f', 8))));
@@ -3393,7 +3478,7 @@ void AeroMainWindow::showBridgeDialog() {
         st->approveStage = BridgeState::NoApproval;
         st->approvePolls = 0;
         bridgeBtn->setEnabled(false);
-        status->setText(tr("Preparing bridge transaction…"));
+        status->setText(tr("Preparing bridge transactionâ€¦"));
         m_wallet->acrossBuild(st->account, st->symbol, st->dest, wei);
     });
 
@@ -3417,6 +3502,34 @@ void AeroMainWindow::showBridgeDialog() {
         const QString sym = st->display;
         const double dec = st->decimals;
         const double amt = st->amountWei.toDouble() / std::pow(10.0, dec);
+        // A rebuild after the approval confirmed. The user already agreed to this bridge, so send
+        // the fresh calldata straight out - unless the fee moved enough that what they agreed to is
+        // no longer what they would get, in which case ask again rather than decide for them.
+        if (st->rebuildBeforeSend) {
+            st->rebuildBeforeSend = false;
+            const double freshOut =
+                o.value(QStringLiteral("output_amount")).toString().toDouble() / std::pow(10.0, dec);
+            const double promised = st->confirmedOutput.toDouble() / std::pow(10.0, dec);
+            if (promised > 0.0 && freshOut < promised * 0.99) {
+                const QString ask =
+                    tr("The bridge fee rose while the approval confirmed.\n\nYou would now receive "
+                       "about %1 %2 instead of the %3 %2 you agreed to. Continue?")
+                        .arg(trimZeros(QString::number(freshOut, 'f', 8)), sym,
+                             trimZeros(QString::number(promised, 'f', 8)));
+                if (QMessageBox::question(dlg, tr("Confirm bridge"), ask) != QMessageBox::Yes) {
+                    st->bridging = false;
+                    bridgeBtn->setEnabled(true);
+                    status->setText(tr("Bridge cancelled. The approval stays in place."));
+                    return;
+                }
+                if (!contextStillValid()) {
+                    st->bridging = false;
+                    return;
+                }
+            }
+            sendBuilt();
+            return;
+        }
         // acrossBuild re-quotes, so the amount that will actually be delivered is the one baked into
         // THIS calldata - show that, and flag it when fees moved against the earlier estimate.
         const QString freshOut = o.value(QStringLiteral("output_amount")).toString();
@@ -3442,10 +3555,11 @@ void AeroMainWindow::showBridgeDialog() {
             st->bridging = false;
             return;
         }
+        st->confirmedOutput = freshOut; // what was promised, to compare against a post-approval requote
         if (st->native) {
             sendBuilt(); // native deposit sends value directly, no approval
         } else {
-            status->setText(tr("Checking token approval…"));
+            status->setText(tr("Checking token approvalâ€¦"));
             m_wallet->bridgeAllowance(st->account, st->inputToken, st->spender);
         }
     });
@@ -3494,12 +3608,12 @@ void AeroMainWindow::showBridgeDialog() {
                 };
                 if (st->approveStage == BridgeState::AwaitingReset) {
                     // The old allowance is cleared - now approve the amount we actually need.
-                    poll(tr("Waiting for the allowance reset to confirm… (%1)").arg(st->approvePolls + 1),
+                    poll(tr("Waiting for the allowance reset to confirmâ€¦ (%1)").arg(st->approvePolls + 1),
                          [=]() {
                              st->approveStage = BridgeState::AwaitingApproval;
-                             status->setText(tr("Approving %1 for the bridge…").arg(st->symbol));
+                             status->setText(tr("Approving %1 for the bridgeâ€¦").arg(st->symbol));
                              m_pendingBridge.approving = true;
-                             beginSendProgress(tr("Broadcasting approval…"));
+                             beginSendProgress(tr("Broadcasting approvalâ€¦"));
                              m_wallet->bridgeApprove(st->account, st->inputToken, st->spender,
                                                      st->amountWei);
                          },
@@ -3507,10 +3621,14 @@ void AeroMainWindow::showBridgeDialog() {
                     return;
                 }
                 if (st->approveStage == BridgeState::AwaitingApproval) {
-                    poll(tr("Waiting for the approval to confirm on-chain… (%1)").arg(st->approvePolls + 1),
+                    poll(tr("Waiting for the approval to confirm on-chainâ€¦ (%1)").arg(st->approvePolls + 1),
                          [=]() {
                              st->approveStage = BridgeState::NoApproval;
-                             sendBuilt();
+                             // The calldata was built before the approval; re-quote so the deposit
+                             // carries a timestamp and an output amount relayers will still honour.
+                             st->rebuildBeforeSend = true;
+                             status->setText(tr("Approval confirmed. Refreshing the bridge quoteâ€¦"));
+                             m_wallet->acrossBuild(st->account, st->symbol, st->dest, st->amountWei);
                          },
                          sufficient);
                     return;
@@ -3534,13 +3652,13 @@ void AeroMainWindow::showBridgeDialog() {
                     status->setText(tr("Clearing the previous %1 approval first (some tokens require "
                                        "it) - this needs two transactions.")
                                         .arg(st->symbol));
-                    beginSendProgress(tr("Broadcasting approval reset…"));
+                    beginSendProgress(tr("Broadcasting approval resetâ€¦"));
                     m_wallet->bridgeApprove(st->account, st->inputToken, st->spender,
                                             QStringLiteral("0"));
                 } else {
                     st->approveStage = BridgeState::AwaitingApproval;
-                    status->setText(tr("Approving %1 for the bridge…").arg(st->symbol));
-                    beginSendProgress(tr("Broadcasting approval…"));
+                    status->setText(tr("Approving %1 for the bridgeâ€¦").arg(st->symbol));
+                    beginSendProgress(tr("Broadcasting approvalâ€¦"));
                     m_wallet->bridgeApprove(st->account, st->inputToken, st->spender, st->amountWei);
                 }
             });
@@ -3557,9 +3675,9 @@ void AeroMainWindow::showBridgeDialog() {
         }
         st->approvePolls = 0;
         status->setText(st->approveStage == BridgeState::AwaitingReset
-                            ? tr("Allowance reset sent (%1). Waiting for it to confirm…")
+                            ? tr("Allowance reset sent (%1). Waiting for it to confirmâ€¦")
                                   .arg(shortAddr(txHash))
-                            : tr("Approval sent (%1). Waiting for it to confirm…").arg(shortAddr(txHash)));
+                            : tr("Approval sent (%1). Waiting for it to confirmâ€¦").arg(shortAddr(txHash)));
         QTimer::singleShot(8000, dlg, [=]() {
             if (st->bridging && st->approveStage != BridgeState::NoApproval)
                 m_wallet->bridgeAllowance(st->account, st->inputToken, st->spender);
@@ -3700,9 +3818,9 @@ void AeroMainWindow::showRevokeApprovals() {
     // Manual entry.
     auto *manRow = new QHBoxLayout();
     auto *manToken = new QLineEdit(dlg);
-    manToken->setPlaceholderText(tr("Token 0x…"));
+    manToken->setPlaceholderText(tr("Token 0xâ€¦"));
     auto *manSpender = new QLineEdit(dlg);
-    manSpender->setPlaceholderText(tr("Spender 0x…"));
+    manSpender->setPlaceholderText(tr("Spender 0xâ€¦"));
     auto *manCheck = new QPushButton(tr("Check"), dlg);
     manRow->addWidget(manToken, 2);
     manRow->addWidget(manSpender, 2);
@@ -3789,7 +3907,7 @@ void AeroMainWindow::showRevokeApprovals() {
                 != QMessageBox::Yes)
                 return;
             revoke->setEnabled(false);
-            revoke->setText(tr("Revoking…"));
+            revoke->setText(tr("Revokingâ€¦"));
             m_wallet->revokeApproval(idx, token, spender);
         });
     };
@@ -3832,7 +3950,7 @@ void AeroMainWindow::showRevokeApprovals() {
                 // If a "Revoke All" batch is running, fire the next one now that this was broadcast.
                 if (!revokeQueue->isEmpty()) {
                     const QPair<QString, QString> next = revokeQueue->takeFirst();
-                    status->setText(tr("Revoke sent (%1). %2 more…")
+                    status->setText(tr("Revoke sent (%1). %2 moreâ€¦")
                                         .arg(shortAddr(txHash)).arg(revokeQueue->size() + 1));
                     m_wallet->revokeApproval(static_cast<quint32>(acct->currentIndex()), next.first,
                                              next.second);
@@ -3870,8 +3988,8 @@ void AeroMainWindow::showRevokeApprovals() {
             return;
         }
         scanBtn->setEnabled(false);
-        scanBtn->setText(tr("Scanning…"));
-        status->setText(tr("Scanning %1 token(s) × %2 spender(s)…")
+        scanBtn->setText(tr("Scanningâ€¦"));
+        status->setText(tr("Scanning %1 token(s) Ã— %2 spender(s)â€¦")
                             .arg(tokens.size()).arg(spenders.size()));
         m_wallet->tokenAllowances(fromIndex, QString::fromUtf8(QJsonDocument(tokens).toJson(
                                                  QJsonDocument::Compact)),
@@ -3891,7 +4009,7 @@ void AeroMainWindow::showRevokeApprovals() {
         }
         QJsonArray tokens{tk};
         QJsonArray spenders{sp};
-        status->setText(tr("Checking…"));
+        status->setText(tr("Checkingâ€¦"));
         m_wallet->tokenAllowances(static_cast<quint32>(acct->currentIndex()),
                                   QString::fromUtf8(QJsonDocument(tokens).toJson(QJsonDocument::Compact)),
                                   QString::fromUtf8(QJsonDocument(spenders).toJson(QJsonDocument::Compact)));
@@ -3918,11 +4036,11 @@ void AeroMainWindow::showRevokeApprovals() {
             revokeQueue->append({token, spender});
             if (auto *b = qobject_cast<QPushButton *>(table->cellWidget(r, 3))) {
                 b->setEnabled(false);
-                b->setText(tr("Queued…"));
+                b->setText(tr("Queuedâ€¦"));
             }
         }
         const QPair<QString, QString> first = revokeQueue->takeFirst();
-        status->setText(tr("Revoking all %1… (1 of %1)").arg(rows));
+        status->setText(tr("Revoking all %1â€¦ (1 of %1)").arg(rows));
         m_wallet->revokeApproval(static_cast<quint32>(acct->currentIndex()), first.first,
                                  first.second);
     });
@@ -4212,19 +4330,19 @@ void AeroMainWindow::setupMenu() {
 
     // --- Tools: drop the Monero-specific actions and expose Aero tools. ---
     ui.menuTools->clear();
-    connect(ui.menuTools->addAction(tr("Sign / Verify Message…")), &QAction::triggered, this,
+    connect(ui.menuTools->addAction(tr("Sign / Verify Messageâ€¦")), &QAction::triggered, this,
             &AeroMainWindow::onSignVerifyMessage);
-    connect(ui.menuTools->addAction(tr("Broadcast Raw Transaction…")), &QAction::triggered, this,
+    connect(ui.menuTools->addAction(tr("Broadcast Raw Transactionâ€¦")), &QAction::triggered, this,
             &AeroMainWindow::onBroadcastRaw);
-    connect(ui.menuTools->addAction(tr("Sign Unsigned Transaction…")), &QAction::triggered, this,
+    connect(ui.menuTools->addAction(tr("Sign Unsigned Transactionâ€¦")), &QAction::triggered, this,
             &AeroMainWindow::onSignUnsigned);
-    connect(ui.menuTools->addAction(tr("Send to Many…")), &QAction::triggered, this,
+    connect(ui.menuTools->addAction(tr("Send to Manyâ€¦")), &QAction::triggered, this,
             &AeroMainWindow::onSendMany);
-    connect(ui.menuTools->addAction(tr("Revoke Token Approvals…")), &QAction::triggered, this,
+    connect(ui.menuTools->addAction(tr("Revoke Token Approvalsâ€¦")), &QAction::triggered, this,
             &AeroMainWindow::showRevokeApprovals);
-    connect(ui.menuTools->addAction(tr("Bridge to another chain (Across)…")), &QAction::triggered,
+    connect(ui.menuTools->addAction(tr("Bridge to another chain (Across)â€¦")), &QAction::triggered,
             this, &AeroMainWindow::showBridgeDialog);
-    connect(ui.menuTools->addAction(tr("Buy XMR (Hyperliquid)…")), &QAction::triggered, this,
+    connect(ui.menuTools->addAction(tr("Buy XMR (Hyperliquid)â€¦")), &QAction::triggered, this,
             &AeroMainWindow::showXmrTradeTab);
     ui.menuTools->addSeparator();
     m_speedUpAction = ui.menuTools->addAction(tr("Speed Up Last Transaction"));
@@ -4234,13 +4352,20 @@ void AeroMainWindow::setupMenu() {
     connect(m_speedUpAction, &QAction::triggered, this, &AeroMainWindow::onSpeedUpLast);
     connect(m_cancelTxAction, &QAction::triggered, this, &AeroMainWindow::onCancelLast);
 
-    // --- Help: keep About; the rest have no Aero targets. ---
+    // --- Help: keep About and Check for Updates; the rest have no Aero targets. ---
     connect(ui.actionAbout, &QAction::triggered, this, [this]() {
-        QMessageBox::about(this, tr("About Aero"),
-                           tr("<b>Aero</b> - a lightweight, Tor-routed Ethereum wallet.<br><br>"
-                              "Local key custody, trustless RPC over Tor, no telemetry."));
+        QMessageBox::about(
+            this, tr("About Aero"),
+            tr("<b>Aero %1</b> - a lightweight, Tor-routed Ethereum wallet.<br><br>"
+               "Local key custody, trustless RPC over Tor, no telemetry.<br><br>"
+               "Updates are accepted only when signed by the Aero release key<br><tt>%2</tt>")
+                .arg(Updater::currentVersion(), Updater::signingKeyFingerprint()));
     });
-    hide(ui.actionCheckForUpdates);
+    ui.actionCheckForUpdates->setVisible(true);
+    ui.actionCheckForUpdates->setEnabled(true);
+    connect(ui.actionCheckForUpdates, &QAction::triggered, this, [this]() {
+        updater()->checkNow();
+    });
     hide(ui.actionOfficialWebsite);
     hide(ui.actionDocumentation);
     hide(ui.actionReport_bug);
@@ -4366,6 +4491,69 @@ QString AeroMainWindow::explorerTxUrl(const QString &hash) const {
     return QStringLiteral("%1/tx/%2").arg(base, hash);
 }
 
+// Every byte Aero sends goes through Tor. The system browser does not. Opening an explorer link in
+// it fetches a page named after the user's own transaction, from the user's own address, seconds
+// after that transaction was broadcast - which is precisely the link Tor was there to prevent. So
+// ask, offer the clipboard instead, and let anyone who has a Tor browser open say so once.
+void AeroMainWindow::openOutsideTor(const QString &url) {
+    if (url.isEmpty())
+        return;
+    QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+    if (s.value(QStringLiteral("privacy/allowClearnetLinks"), false).toBool()) {
+        QDesktopServices::openUrl(QUrl(url));
+        return;
+    }
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Open outside Tor?"));
+    dlg.setModal(true);
+    auto *v = new QVBoxLayout(&dlg);
+    auto *warn = new QLabel(
+        tr("This opens in your normal browser, which does not use Tor.\n\n"
+           "The explorer will see your real IP address next to this transaction. Copying the link "
+           "and pasting it into Tor Browser keeps that connection hidden."),
+        &dlg);
+    warn->setWordWrap(true);
+    v->addWidget(warn);
+
+    auto *link = new QLabel(url, &dlg);
+    link->setWordWrap(true);
+    link->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    link->setStyleSheet(QStringLiteral("color:#8a8a8a;"));
+    v->addWidget(link);
+
+    auto *remember = new QCheckBox(tr("Don't ask again; my browser is set up for this"), &dlg);
+    v->addWidget(remember);
+
+    auto *row = new QHBoxLayout();
+    auto *copyBtn = new QPushButton(tr("Copy link"), &dlg);
+    copyBtn->setDefault(true);
+    auto *openBtn = new QPushButton(tr("Open anyway"), &dlg);
+    auto *cancelBtn = new QPushButton(tr("Cancel"), &dlg);
+    row->addStretch(1);
+    row->addWidget(copyBtn);
+    row->addWidget(openBtn);
+    row->addWidget(cancelBtn);
+    v->addLayout(row);
+
+    int choice = 0; // 1 = copy, 2 = open
+    connect(copyBtn, &QPushButton::clicked, &dlg, [&]() { choice = 1; dlg.accept(); });
+    connect(openBtn, &QPushButton::clicked, &dlg, [&]() { choice = 2; dlg.accept(); });
+    connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
+    dlg.exec();
+
+    if (choice == 1) {
+        QApplication::clipboard()->setText(url);
+        return;
+    }
+    if (choice != 2)
+        return;
+    // Only remember a choice to open, since that is the only one there is anything to remember.
+    if (remember->isChecked())
+        s.setValue(QStringLiteral("privacy/allowClearnetLinks"), true);
+    QDesktopServices::openUrl(QUrl(url));
+}
+
 void AeroMainWindow::lockWallet() {
     if (m_locked || !m_wallet || !m_wallet->hasPassword())
         return; // nothing to lock behind if the wallet has no password
@@ -4426,7 +4614,7 @@ void AeroMainWindow::showConnectionMenu() {
                                           : m_connText;
     if (m_tor && !m_tor->isReady() && m_tor->bootstrapPercent() > 0 &&
         m_tor->bootstrapPercent() < 100)
-        status = tr("Bootstrapping Tor… %1%").arg(m_tor->bootstrapPercent());
+        status = tr("Bootstrapping Torâ€¦ %1%").arg(m_tor->bootstrapPercent());
     QAction *head = menu.addAction(status);
     head->setEnabled(false);
     if (m_tor)
@@ -4447,7 +4635,7 @@ void AeroMainWindow::reconnectTor(const QString &reason) {
         return;
     m_reconnecting = true;
     m_connHealthFails = 0;
-    setConnectionState(0, tr("Reconnecting… (%1)").arg(reason));
+    setConnectionState(0, tr("Reconnectingâ€¦ (%1)").arg(reason));
     if (m_tor && !m_tor->isReady() && !m_tor->isRunning()) {
         m_tor->start(); // bundled Tor is down - bring it back up; ready() -> connectCurrentChain
     } else {
@@ -4456,8 +4644,10 @@ void AeroMainWindow::reconnectTor(const QString &reason) {
 }
 
 void AeroMainWindow::newTorCircuit() {
-    // When sharing an external Tor we don't own its process, so we can't rotate its circuit - just
-    // reconnect over it. (Rotate the circuit in the app that owns that Tor, e.g. Feather.)
+    // Sharing an external Tor means not owning its process, so there is nothing here to restart.
+    // Reconnecting is enough anyway: it builds a new provider, and a new provider asks Tor for its
+    // circuits under names it has never used, which is a new circuit and a new exit whoever owns
+    // the daemon.
     if (!externalSocks().isEmpty()) {
         reconnectTor(tr("external Tor"));
         return;
@@ -4468,7 +4658,7 @@ void AeroMainWindow::newTorCircuit() {
     }
     m_reconnecting = true;
     m_connHealthFails = 0;
-    setConnectionState(0, tr("Getting a fresh Tor circuit…"));
+    setConnectionState(0, tr("Getting a fresh Tor circuitâ€¦"));
     m_tor->restart(); // relaunch bundled Tor; ready() -> connectCurrentChain
 }
 
@@ -4552,13 +4742,13 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
                 m_historyModel->appendBatch(items);
                 requestHistoricalPrices(items);
                 // Only touch the status bar when we're actually connected (m_connMode>0). Otherwise a
-                // history refresh triggered while still "Connecting to Tor…" / "Offline" would clobber
+                // history refresh triggered while still "Connecting to Torâ€¦" / "Offline" would clobber
                 // that with a misleading "Connected". Also skip while a funded scan owns the status.
                 const bool scanning = m_scanProgressTimer && m_scanProgressTimer->isActive();
                 if (m_connMode > 0 && !scanning) {
                     if (done < total)
                         setConnectionState(m_connMode,
-                                           tr("Loading history… %1/%2").arg(done).arg(total));
+                                           tr("Loading historyâ€¦ %1/%2").arg(done).arg(total));
                     else
                         setConnectionState(m_connMode,
                                            m_connText.isEmpty() ? tr("Connected") : m_connText);
@@ -4827,6 +5017,20 @@ QString AeroMainWindow::socksFor(quint64 chainId) const {
     return m_tor ? m_tor->socksProxy() : kDefaultSocks;
 }
 
+// The updater, pointed at whatever Tor is in effect at the moment it is asked.
+//
+// Per-chain node proxies are deliberately not consulted: those describe how to reach someone's own
+// Ethereum node, which has nothing to do with fetching a release from GitHub. Update traffic gets
+// the wallet's ordinary Tor path, on its own circuit.
+Updater *AeroMainWindow::updater() {
+    if (!m_updater)
+        m_updater = new Updater(this);
+    const QString ext = externalSocks();
+    m_updater->setSocksProxy(!ext.isEmpty() ? ext
+                                            : (m_tor ? m_tor->socksProxy() : kDefaultSocks));
+    return m_updater;
+}
+
 // The external Tor SOCKS the user opted into (Settings -> Tor), normalised to a socks5h:// URL so DNS
 // is resolved through Tor. Empty when the bundled Tor should be used.
 QString AeroMainWindow::externalSocks() const {
@@ -4882,7 +5086,7 @@ void AeroMainWindow::autoConnect() {
         QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
         const QString key = QStringLiteral("node/%1/socks").arg(m_chainId);
         if (s.contains(key) && s.value(key).toString().trimmed().isEmpty()) {
-            setConnectionState(0, tr("Connecting to your node…"));
+            setConnectionState(0, tr("Connecting to your nodeâ€¦"));
             connectCurrentChain();
             return;
         }
@@ -4893,13 +5097,14 @@ void AeroMainWindow::autoConnect() {
     {
         const QString ext = externalSocks();
         if (!ext.isEmpty()) {
-            setConnectionState(0, tr("Connecting via external Tor (%1)…").arg(ext));
+            setConnectionState(0, tr("Connecting via external Tor (%1)â€¦").arg(ext));
             connectCurrentChain(); // socksFor() returns the external SOCKS
+            scheduleUpdateCheck();
             return;
         }
     }
 
-    setConnectionState(0, tr("Connecting to Tor…"));
+    setConnectionState(0, tr("Connecting to Torâ€¦"));
 
     // Otherwise always route through Tor - start (or reuse) Tor first, then connect only once it has
     // bootstrapped. There is no clearnet fallback, so the wallet never leaks the user's IP.
@@ -4908,8 +5113,9 @@ void AeroMainWindow::autoConnect() {
         connect(m_tor, &TorManager::statusChanged, this,
                 [this](const QString &msg) { setConnectionState(0, msg); });
         connect(m_tor, &TorManager::ready, this, [this]() {
-            setConnectionState(0, tr("Connecting to Tor…"));
+            setConnectionState(0, tr("Connecting to Torâ€¦"));
             connectCurrentChain();
+            scheduleUpdateCheck();
         });
         connect(m_tor, &TorManager::failed, this, [this](const QString &err) {
             m_reconnecting = false;
@@ -4920,9 +5126,23 @@ void AeroMainWindow::autoConnect() {
     }
     if (m_tor->isReady()) {
         connectCurrentChain();
+        scheduleUpdateCheck();
     } else {
         m_tor->start();
     }
+}
+
+// Arm the automatic update check, once per run and only once there is a Tor path to use.
+//
+// Delayed rather than immediate: startup is already busy loading a wallet, bootstrapping Tor and
+// fetching balances, and an update prompt landing in the middle of that is both slower and more
+// startling than one that arrives when things have settled. A check that runs before Tor is usable
+// would also fail and then count as the day's check, so it waits for Tor rather than for the clock.
+void AeroMainWindow::scheduleUpdateCheck() {
+    if (m_updateCheckScheduled)
+        return;
+    m_updateCheckScheduled = true;
+    QTimer::singleShot(60000, this, [this]() { updater()->checkQuietly(); });
 }
 
 // Switch the active network: relabel the native coin, clear cached balances/history (addresses are
@@ -4949,6 +5169,9 @@ void AeroMainWindow::switchChain(quint64 chainId) {
     m_historyLoadedChain = ~Q_UINT64_C(0);
     // The spam/known-token allow-list is chain-specific (curated top tokens differ per chain), so
     // recompute it for the new chain - otherwise legit tokens get hidden as spam / wrong ones trusted.
+    // The liquidity verdicts feeding that list are per-chain too, so reload them first.
+    loadLiquidityCache();
+    m_liquidityInFlight.clear(); // in-flight checks belong to the chain we just left
     applyVerifiedTokens();
 
     // Reflect the new chain in the selector button.
@@ -4990,7 +5213,7 @@ void AeroMainWindow::switchChain(quint64 chainId) {
 
     // Reconnect to the new chain's endpoints (custom node if configured for it, else registry
     // defaults over the existing Tor transport).
-    setConnectionState(0, tr("Switching to %1…").arg(c.name));
+    setConnectionState(0, tr("Switching to %1â€¦").arg(c.name));
     {
         QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
         const QString key = QStringLiteral("node/%1/socks").arg(chainId);
@@ -5017,8 +5240,8 @@ void AeroMainWindow::onProviderConnected(int mode, const QString &message) {
         m_connHealthFails = 0;
         m_everConnected = true;
     }
-    const QString text = mode > 0 ? tr("%1 · %2").arg(message, chainDefFor(m_chainId).name) : message;
-    m_connMode = mode;      // remembered so the "Scanning…" state can restore the connected status
+    const QString text = mode > 0 ? tr("%1 Â· %2").arg(message, chainDefFor(m_chainId).name) : message;
+    m_connMode = mode;      // remembered so the "Scanningâ€¦" state can restore the connected status
     m_connText = text;
     setConnectionState(mode, text);
     if (mode > 0) {
@@ -5050,7 +5273,7 @@ void AeroMainWindow::onProviderConnected(int mode, const QString &message) {
         if (!m_fundedScanned && !m_fundedScanTried) {
             m_fundedScanTried = true;
             // Keep the connected icon but show progress; onFundedScanned restores the status.
-            setConnectionState(m_connMode, tr("Scanning for your addresses…"));
+            setConnectionState(m_connMode, tr("Scanning for your addressesâ€¦"));
             startScanProgress();
             m_wallet->scanFundedMulti(allChainsScanConfig(), 40);
         }
@@ -5081,7 +5304,7 @@ void AeroMainWindow::saveFundedSet() {
 }
 
 // Poll the core's live scan counters and show them in the status bar, so the user actively sees the
-// scan progress ("N checked, M found") instead of a static "Scanning…".
+// scan progress ("N checked, M found") instead of a static "Scanningâ€¦".
 void AeroMainWindow::startScanProgress() {
     if (!m_scanProgressTimer) {
         m_scanProgressTimer = new QTimer(this);
@@ -5091,7 +5314,7 @@ void AeroMainWindow::startScanProgress() {
             const quint64 checked = m_wallet->scanProgress();
             const quint64 found = m_wallet->scanFound();
             setConnectionState(m_connMode,
-                               tr("Scanning addresses… %1 checked, %2 found")
+                               tr("Scanning addressesâ€¦ %1 checked, %2 found")
                                    .arg(checked).arg(found));
         });
     }
@@ -5156,7 +5379,7 @@ void AeroMainWindow::onFundedScanned(const QList<quint32> &indices) {
         selectAddressRow(stillVisible ? m_account : m_addressModel->accountAt(0));
     }
     // Restore the real connected status (Tor/direct). Only when actually connected - never overwrite
-    // a "Connecting…"/"Offline" state with a bogus "Connected".
+    // a "Connectingâ€¦"/"Offline" state with a bogus "Connected".
     if (m_connMode > 0)
         setConnectionState(m_connMode, m_connText.isEmpty() ? tr("Connected") : m_connText);
     notify(tr("Scan complete"),
@@ -5166,11 +5389,11 @@ void AeroMainWindow::onFundedScanned(const QList<quint32> &indices) {
 void AeroMainWindow::refreshAllBalances() {
     if (!m_wallet) return;
     // ONE batched request fetches native + tracked-token balances for every account, instead of
-    // firing numAccounts × (1 + numTokens) independent Tor calls. Results arrive via per-account signals.
+    // firing numAccounts Ã— (1 + numTokens) independent Tor calls. Results arrive via per-account signals.
     //
     // The curated top-tokens are added as EXTRAS only for SMALL wallets. Each extra token adds one
     // eth_call PER ACCOUNT, so bundling ~24 curated tokens across a big HD wallet (e.g. 167 accounts)
-    // meant ~24×167 mostly-zero token reads - which blew the per-request budget down to one account
+    // meant ~24Ã—167 mostly-zero token reads - which blew the per-request budget down to one account
     // per batch, instantly tripped the public RPC's rate limit, and (with retries) thrashed forever so
     // balances never finished loading. For a large wallet we fetch native + the user's TRACKED tokens
     // only; the current account's curated-token balances are loaded on demand elsewhere (Send/Swap).
@@ -5319,6 +5542,15 @@ static QJsonObject histItemToJson(const HistoryItem &h) {
     if (!h.buySymbol.isEmpty()) o[QStringLiteral("bs")] = h.buySymbol;
     if (!h.buyFormatted.isEmpty()) o[QStringLiteral("bf")] = h.buyFormatted;
     if (!h.status.isEmpty()) o[QStringLiteral("st")] = h.status;
+    // Kept so a swap that was still open when the app closed can be judged on reopen: without its
+    // deadline there is no way to tell an order that is still working from one that died unremarked.
+    if (h.expiry) o[QStringLiteral("ex")] = static_cast<double>(h.expiry);
+    // Which account a row belongs to has to survive the write. Dropping it meant every restored row
+    // came back as "unknown account": the Account column was blank, and - because the pending-order
+    // poll only asks about accounts it can name - a CoW order left open at shutdown was never
+    // queried again and sat at "pending" until it aged out as failed.
+    if (h.account != HistoryItem::unknownAccount)
+        o[QStringLiteral("ac")] = static_cast<double>(h.account);
     return o;
 }
 static HistoryItem histItemFromJson(const QJsonObject &o) {
@@ -5338,6 +5570,10 @@ static HistoryItem histItemFromJson(const QJsonObject &o) {
     h.buySymbol = o.value(QStringLiteral("bs")).toString();
     h.buyFormatted = o.value(QStringLiteral("bf")).toString();
     h.status = o.value(QStringLiteral("st")).toString();
+    h.expiry = static_cast<quint64>(o.value(QStringLiteral("ex")).toDouble());
+    h.account = o.contains(QStringLiteral("ac"))
+                    ? static_cast<quint32>(o.value(QStringLiteral("ac")).toDouble())
+                    : HistoryItem::unknownAccount;
     return h;
 }
 
@@ -5365,6 +5601,28 @@ void AeroMainWindow::saveHistoryCache() {
 void AeroMainWindow::foldHistoryCacheIntoMeta() {
     if (!m_wallet || !m_historyModel) return;
     QVector<HistoryItem> items = m_historyModel->fetchedItems();
+
+    // The model holds whatever the last refresh fetched, which after viewing a single account is
+    // that account alone. Writing it straight out therefore replaced the whole chain's snapshot with
+    // one account's rows: quit while filtered to "Account #3" and every other account's history was
+    // gone on reopen - and, because a restored account is marked already-fetched, it did not come
+    // back without a forced rescan. Carry forward the stored rows for accounts this refresh did not
+    // cover. An account present in `items` is authoritative, so nothing is duplicated.
+    QSet<quint32> covered;
+    for (const HistoryItem &h : items)
+        covered.insert(h.account);
+    const QJsonArray previous = m_meta.value(QStringLiteral("histcache"))
+                                    .toObject()
+                                    .value(QString::number(m_chainId))
+                                    .toObject()
+                                    .value(QStringLiteral("items"))
+                                    .toArray();
+    for (const QJsonValue &v : previous) {
+        const HistoryItem h = histItemFromJson(v.toObject());
+        if (!covered.contains(h.account))
+            items.append(h);
+    }
+
     // Bound the file, but generously: a wallet with many funded accounts legitimately has thousands
     // of transactions, and the on-reopen cache is marked "already fetched" per account (status-gate),
     // so anything dropped here is NOT re-fetched - it just vanishes from the restored view until a
@@ -5417,6 +5675,11 @@ void AeroMainWindow::loadHistoryCache() {
         m_histFetched.insert(idx);
     }
     m_historyLoadedChain = m_chainId; // we already have this chain's history; connect just status-gates
+    // A swap that was still open when the app closed comes back from the cache saying "pending", and
+    // nothing was left running to ever ask again. The poll starts itself only when an order is
+    // placed, so without this the row keeps that status for good - it was true once, and looked true
+    // forever. startCowPoll() is a no-op when nothing is pending.
+    startCowPoll();
 }
 
 // Show 0 immediately for any account we don't yet have a balance for, so a freshly created wallet (or
@@ -5542,7 +5805,7 @@ void AeroMainWindow::refreshSendContacts() {
         return;
     QSignalBlocker b(m_sendContactsCombo);
     m_sendContactsCombo->clear();
-    m_sendContactsCombo->addItem(tr("Select a saved contact…"), QString());
+    m_sendContactsCombo->addItem(tr("Select a saved contactâ€¦"), QString());
     if (m_contactsTable) {
         for (int r = 0; r < m_contactsTable->rowCount(); ++r) {
             const QString name = m_contactsTable->item(r, 0) ? m_contactsTable->item(r, 0)->text() : QString();
@@ -5550,7 +5813,7 @@ void AeroMainWindow::refreshSendContacts() {
             if (addr.isEmpty())
                 continue;
             const QString label =
-                name.isEmpty() ? shortAddr(addr) : tr("%1  ·  %2").arg(name, shortAddr(addr));
+                name.isEmpty() ? shortAddr(addr) : tr("%1  Â·  %2").arg(name, shortAddr(addr));
             m_sendContactsCombo->addItem(label, addr);
         }
     }
@@ -5714,7 +5977,7 @@ void AeroMainWindow::updateAvailable() {
     if (!m_wallet || !m_fromCombo || !m_availLabel) return;
     const int fromIndex = qMax(0, m_fromCombo->currentIndex());
     m_availAmount.clear();
-    m_availLabel->setText(tr("Fetching…"));
+    m_availLabel->setText(tr("Fetchingâ€¦"));
     m_wallet->fetchAvailable(static_cast<quint32>(fromIndex), currentTokenAddr());
 }
 
@@ -5752,8 +6015,15 @@ void AeroMainWindow::onAvailableBalance(quint32 index, const QString &token,
             m_addressModel->setUsed(index, true);
         scheduleHomeRecompute();
         // Any change (incoming or outgoing) means a new tx touched this address -> refresh history.
-        if (oldBal >= 0.0 && qAbs(newBal - oldBal) > 1e-9)
+        // The account has to be marked dirty as well, not just the "something moved" flag: only the
+        // dirty set actually drives a refetch, and receiving an ERC-20 does not move the native
+        // balance, so a plain incoming USDC transfer left History showing nothing new until some
+        // later, unrelated native transaction happened to touch the same account. On chains where
+        // tokens are most of the activity this is nearly every receipt.
+        if (oldBal >= 0.0 && qAbs(newBal - oldBal) > 1e-9) {
             m_balancesChanged = true;
+            m_dirtyHistory.insert(index);
+        }
         // Notify on an incoming token payment - but ONLY for verified/tracked tokens. Random airdropped
         // spam tokens (the bulk of unsolicited transfers) aren't in the trusted set, so they no longer
         // pop a "Payment received" notification.
@@ -5800,17 +6070,35 @@ void AeroMainWindow::updateAvailableLabel() {
 
 // Build an account row label with a caller-supplied balance string (so callers that already have the
 // account's USD value can avoid recomputing it).
-QString AeroMainWindow::accountLabelWith(quint32 index, const QString &balanceStr) const {
-    // Use the address's Receive label if the user has set one; otherwise "Account #i".
-    QString name = tr("Account #%1").arg(index);
+// Just the account's name, with no address or balance attached: what the History table shows, and
+// the first part of the longer label the account selectors show.
+QString AeroMainWindow::accountName(quint32 index) const {
     if (m_addressModel) {
         const QString custom = m_addressModel->labelAt(index);
         if (!custom.isEmpty())
-            name = custom;
+            return custom;
     }
-    QString label = tr("%1  ·  %2").arg(name, shortAddr(m_wallet->address(index)));
+    return tr("Account #%1").arg(index);
+}
+
+// Hand the History table the name of every account, so its Account column can say "Savings" rather
+// than the index it stores.
+void AeroMainWindow::pushAccountNames() {
+    if (!m_historyModel || !m_wallet)
+        return;
+    QHash<quint32, QString> names;
+    const quint32 n = m_wallet->numAccounts();
+    for (quint32 i = 0; i < n; ++i)
+        names.insert(i, accountName(i));
+    m_historyModel->setAccountNames(names);
+}
+
+QString AeroMainWindow::accountLabelWith(quint32 index, const QString &balanceStr) const {
+    // Use the address's Receive label if the user has set one; otherwise "Account #i".
+    const QString name = accountName(index);
+    QString label = tr("%1  Â·  %2").arg(name, shortAddr(m_wallet->address(index)));
     if (!balanceStr.isEmpty())
-        label += QStringLiteral("  ·  %1").arg(balanceStr);
+        label += QStringLiteral("  Â·  %1").arg(balanceStr);
     return label;
 }
 
@@ -5915,6 +6203,11 @@ void AeroMainWindow::rebuildHistoryCombo() {
     if (want >= m_historyCombo->count())
         want = 0;
     m_historyCombo->setCurrentIndex(want);
+    // Rebuilt whenever the account list changes, which is exactly when the Account column needs to
+    // learn about a new account.
+    pushAccountNames();
+    if (m_historyView)
+        m_historyView->setColumnHidden(HistoryModel::Column_Account, m_historyFilter >= 0);
 }
 
 // Full (re)load of the History view. Feather/Electrum model: do NOT fan out a fetch across every
@@ -6056,6 +6349,39 @@ void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, c
         showCachedBalance(m_account); // bottom-left status balance (native + tokens), from the batch
         updateReceive();              // refresh the balance shown under the QR
     }
+}
+
+// Balance of a token, named by ticker, on the chain that is currently connected. Returns -1 when it
+// cannot be determined, which callers must treat as "unknown" rather than "zero".
+//
+// The distinction matters because a ticker does not identify a contract. The wallet's tracked-token
+// list is chain-agnostic and seeded with Ethereum addresses, so looking up "USDC" in it while
+// connected to Arbitrum finds the mainnet contract, whose balance on Arbitrum was never fetched and
+// so reads as zero. That is what made bridging USDC off any L2 refuse to send with "exceeds your
+// USDC balance of 0". The curated list is per-chain and does identify the right contract, so it is
+// consulted first; if the balance for that contract has not come back yet, the answer is unknown.
+double AeroMainWindow::tokenBalanceOnThisChain(quint32 account, const QString &symbol) const {
+    auto lookup = [&](const QString &addr) {
+        return m_tokenRawByKey.value(QStringLiteral("%1|%2").arg(account).arg(addr.toLower()), -1.0);
+    };
+    for (const TokenInfo &t : curatedTopTokens(m_chainId))
+        if (t.symbol.compare(symbol, Qt::CaseInsensitive) == 0)
+            return lookup(t.address);
+    const ChainDef cd = chainDefFor(m_chainId);
+    if (!cd.wrappedNative.isEmpty() &&
+        symbol.compare(QStringLiteral("W%1").arg(m_nativeSymbol), Qt::CaseInsensitive) == 0)
+        return lookup(cd.wrappedNative);
+    // Only fall back to a tracked token when its address is one this chain actually uses.
+    if (m_wallet) {
+        for (const TokenInfo &t : m_wallet->tokens()) {
+            if (t.symbol.compare(symbol, Qt::CaseInsensitive) != 0)
+                continue;
+            const double bal = lookup(t.address);
+            if (bal >= 0.0)
+                return bal;
+        }
+    }
+    return -1.0;
 }
 
 // Total USD value of an account: native coin + every tracked/curated token it holds. Mirrors the
@@ -6260,7 +6586,7 @@ void AeroMainWindow::onCreateAddress() {
         // Derive the next address from the device off the UI thread - a slow/unresponsive device
         // would otherwise freeze the app for the whole USB timeout.
         quint32 idx = 0xFFFFFFFFu;
-        runBusy(tr("Confirm on your device…"), [&]() { idx = m_wallet->addHardwareAccount(); });
+        runBusy(tr("Confirm on your deviceâ€¦"), [&]() { idx = m_wallet->addHardwareAccount(); });
         if (idx == 0xFFFFFFFFu) {
             QMessageBox::warning(this, tr("Create address"),
                                  tr("Couldn't derive an address from the device:\n%1")
@@ -6318,7 +6644,7 @@ void AeroMainWindow::onImportKey() {
     quint32 idx = 0xFFFFFFFFu;
     bool saved = true;
     const bool hasPath = !m_wallet->walletPath().isEmpty();
-    runBusy(tr("Importing key…"), [&]() {
+    runBusy(tr("Importing keyâ€¦"), [&]() {
         idx = m_wallet->importPrivateKey(hexKey);
         if (idx != 0xFFFFFFFFu && hasPath)
             saved = m_wallet->save();
@@ -6385,7 +6711,7 @@ void AeroMainWindow::onAddressContextMenu(const QPoint &pos) {
         return;
 
     QString key;
-    runBusy(tr("Exporting key…"), [&]() { key = m_wallet->exportPrivateKey(row); });
+    runBusy(tr("Exporting keyâ€¦"), [&]() { key = m_wallet->exportPrivateKey(row); });
     if (key.isEmpty()) {
         QMessageBox::warning(this, tr("Export failed"), m_wallet->errorString());
         return;
@@ -6638,6 +6964,50 @@ void AeroMainWindow::onSettings() {
     spamForm->addRow(manageTokensBtn);
     tabs->addTab(spamTab, tr("Spam filter"));
 
+    // --- Updates tab: the automatic check, and what the check is actually trusting ---
+    QCheckBox *autoUpdateChk = nullptr;
+    {
+        auto *updTab = new QWidget(&dlg);
+        auto *updLay = new QVBoxLayout(updTab);
+
+        updLay->addWidget(new QLabel(tr("You are running Aero %1.").arg(Updater::currentVersion()),
+                                     updTab));
+
+        autoUpdateChk = new QCheckBox(tr("Check for updates automatically (once a day, over Tor)"),
+                                      updTab);
+        autoUpdateChk->setChecked(Updater::automaticChecksEnabled());
+        updLay->addWidget(autoUpdateChk);
+
+        auto *checkBtn = new QPushButton(tr("Check for updates now"), updTab);
+        connect(checkBtn, &QPushButton::clicked, &dlg, [this, &dlg]() {
+            dlg.accept();
+            updater()->checkNow();
+        });
+        updLay->addWidget(checkBtn);
+
+        // The security story is the feature, so state it where the setting lives rather than only
+        // in a README. A user who understands what the fingerprint is for can compare it against
+        // the key published elsewhere; one who does not still learns that their wallets are not
+        // part of what an update replaces.
+        auto *updInfo = new QLabel(
+            tr("Aero installs an update only if it is signed by the Aero release key:\n"
+               "  %1\n\n"
+               "Nothing is downloaded until that signature checks out, and nothing is installed "
+               "until the archive matches the hash the signed release notes gave. An update can "
+               "never move you to an older version.\n\n"
+               "Updates replace Aero's own program files only. Your wallets, settings, Trezor "
+               "pairing and Tor data are never touched.\n\n"
+               "With automatic checks off, Aero contacts nothing on its own; use the button above "
+               "or Help \u2023 Check for Updates.")
+                .arg(Updater::signingKeyFingerprint()),
+            updTab);
+        updInfo->setWordWrap(true);
+        updInfo->setStyleSheet(QStringLiteral("color:#8a8a8a; font-size:11px;"));
+        updLay->addWidget(updInfo);
+        updLay->addStretch(1);
+        tabs->addTab(updTab, tr("Updates"));
+    }
+
     outer->addWidget(tabs);
     auto *box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     connect(box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
@@ -6645,6 +7015,10 @@ void AeroMainWindow::onSettings() {
     outer->addWidget(box);
 
     if (dlg.exec() != QDialog::Accepted) return;
+
+    // Updates.
+    if (autoUpdateChk)
+        Updater::setAutomaticChecksEnabled(autoUpdateChk->isChecked());
 
     // Appearance.
     if (hideBalances->isChecked() != m_hideBalances) {
@@ -6766,7 +7140,7 @@ void AeroMainWindow::onSettings() {
             switchChain(chainId); // uses socksFor() -> honours bundled/external Tor
         } else if (customNode) {
             m_chainId = chainId;
-            setConnectionState(0, tr("Connecting…"));
+            setConnectionState(0, tr("Connectingâ€¦"));
             m_wallet->connectProvider(chainId, endpoints, socks); // explicit custom node
         } else {
             // No custom node: reconnect via autoConnect so the (possibly just-toggled) Tor mode -
@@ -6935,7 +7309,7 @@ void AeroMainWindow::onChangePassword() {
     const QString path = m_wallet->walletPath();
     const QString newPw = p1->text();
     bool ok = false;
-    runBusy(tr("Updating password…"), [&]() { ok = m_wallet->store(path, newPw); });
+    runBusy(tr("Updating passwordâ€¦"), [&]() { ok = m_wallet->store(path, newPw); });
     if (ok)
         QMessageBox::information(this, tr("Change password"), tr("Password updated."));
     else
@@ -6983,7 +7357,7 @@ void AeroMainWindow::onSignVerifyMessage() {
 
     v->addWidget(new QLabel(tr("Signature"), &dlg));
     auto *sig = new QLineEdit(&dlg);
-    sig->setPlaceholderText(tr("0x… - produced by Sign, or paste a signature to Verify"));
+    sig->setPlaceholderText(tr("0xâ€¦ - produced by Sign, or paste a signature to Verify"));
     v->addWidget(sig);
 
     auto *result = new QLabel(&dlg);
@@ -7018,7 +7392,7 @@ void AeroMainWindow::onSignVerifyMessage() {
         const quint32 idx = static_cast<quint32>(qMax(0, accountCombo->currentIndex()));
         QString s;
         const QString message = msg->toPlainText();
-        runBusy(tr("Signing…"), [&]() { s = m_wallet->signMessage(idx, message); });
+        runBusy(tr("Signingâ€¦"), [&]() { s = m_wallet->signMessage(idx, message); });
         if (s.isEmpty()) {
             result->setText(tr("<span style='color:#e74c3c;'>Sign failed: %1</span>")
                                 .arg(m_wallet->errorString().toHtmlEscaped()));
@@ -7056,15 +7430,15 @@ void AeroMainWindow::onBroadcastRaw() {
     dlg.setMinimumWidth(540);
     auto *v = new QVBoxLayout(&dlg);
     v->addWidget(new QLabel(
-        tr("Paste a signed raw transaction (0x…). It will be broadcast over Tor. Use this to relay "
+        tr("Paste a signed raw transaction (0xâ€¦). It will be broadcast over Tor. Use this to relay "
            "a transaction signed on an offline machine."),
         &dlg));
     auto *edit = new QPlainTextEdit(&dlg);
     edit->setMinimumHeight(120);
-    edit->setPlaceholderText(QStringLiteral("0x02f8…"));
+    edit->setPlaceholderText(QStringLiteral("0x02f8â€¦"));
     v->addWidget(edit);
     auto *scanRow = new QHBoxLayout();
-    auto *scanBtn = new QPushButton(tr("Scan QR…"), &dlg);
+    auto *scanBtn = new QPushButton(tr("Scan QRâ€¦"), &dlg);
     scanRow->addWidget(scanBtn);
     scanRow->addStretch();
     v->addLayout(scanRow);
@@ -7087,7 +7461,7 @@ void AeroMainWindow::onBroadcastRaw() {
     // onTransactionCommitted skips the optimistic "Payment sent"/balance-drop path entirely (never
     // reusing a previous send's committed details).
     m_committedIsReplacement = true;
-    beginSendProgress(tr("Broadcasting the raw transaction over Tor…"));
+    beginSendProgress(tr("Broadcasting the raw transaction over Torâ€¦"));
     m_wallet->broadcastRaw(raw); // result surfaces via onTransactionCommitted
 }
 
@@ -7102,8 +7476,8 @@ void AeroMainWindow::onUnsignedTxReady(const QString &json, const QString &error
     dlg.setMinimumWidth(560);
     auto *v = new QVBoxLayout(&dlg);
     v->addWidget(new QLabel(
-        tr("Move this to your offline wallet and sign it there (Tools → Sign Unsigned "
-           "Transaction), then broadcast the signed result here (Tools → Broadcast Raw "
+        tr("Move this to your offline wallet and sign it there (Tools â†’ Sign Unsigned "
+           "Transaction), then broadcast the signed result here (Tools â†’ Broadcast Raw "
            "Transaction)."),
         &dlg));
     auto *edit = new QPlainTextEdit(&dlg);
@@ -7113,7 +7487,7 @@ void AeroMainWindow::onUnsignedTxReady(const QString &json, const QString &error
     v->addWidget(edit);
     auto *row = new QHBoxLayout();
     auto *copyBtn = new QPushButton(tr("Copy"), &dlg);
-    auto *saveBtn = new QPushButton(tr("Save to file…"), &dlg);
+    auto *saveBtn = new QPushButton(tr("Save to fileâ€¦"), &dlg);
     auto *qrBtn = new QPushButton(tr("Show QR"), &dlg);
     auto *closeBtn = new QPushButton(tr("Close"), &dlg);
     row->addWidget(copyBtn);
@@ -7157,7 +7531,7 @@ void AeroMainWindow::onSignUnsigned() {
     in->setMinimumHeight(120);
     v->addWidget(in);
     auto *inRow = new QHBoxLayout();
-    auto *scanBtn = new QPushButton(tr("Scan QR…"), &dlg);
+    auto *scanBtn = new QPushButton(tr("Scan QRâ€¦"), &dlg);
     auto *signBtn = new QPushButton(tr("Sign"), &dlg);
     inRow->addWidget(scanBtn);
     inRow->addStretch();
@@ -7236,7 +7610,7 @@ void AeroMainWindow::onSendMany() {
 
     v->addWidget(new QLabel(tr("One recipient per line, as  address, amount"), &dlg));
     auto *edit = new QPlainTextEdit(&dlg);
-    edit->setPlaceholderText(QStringLiteral("0xabc…, 0.1\n0xdef…, 0.25"));
+    edit->setPlaceholderText(QStringLiteral("0xabcâ€¦, 0.1\n0xdefâ€¦, 0.25"));
     edit->setMinimumHeight(140);
     v->addWidget(edit);
 
@@ -7300,12 +7674,12 @@ void AeroMainWindow::onManySent(const QString &resultJson, const QString &error)
         const QString to = o.value(QStringLiteral("to")).toString();
         if (o.contains(QStringLiteral("tx_hash"))) {
             ++sent;
-            detail += tr("%1 → %2\n").arg(o.value(QStringLiteral("tx_hash")).toString().left(14), to);
+            detail += tr("%1 â†’ %2\n").arg(o.value(QStringLiteral("tx_hash")).toString().left(14), to);
         } else {
             stopped = true;
             // Sequential ERC-20 path stops at the first failure to avoid a nonce gap that would
             // strand later sends. Tell the user exactly where it stopped and how to finish.
-            failed = tr("\n\n⚠ Stopped at %1:\n%2\n\nThis recipient and every recipient AFTER it "
+            failed = tr("\n\nâš  Stopped at %1:\n%2\n\nThis recipient and every recipient AFTER it "
                         "were NOT sent. Re-run Send to Many with just the remaining recipients "
                         "(starting from this one) to finish.")
                          .arg(to, o.value(QStringLiteral("error")).toString());
@@ -7364,7 +7738,7 @@ void AeroMainWindow::onSpeedUpLast() {
     tx.fee.maxFee = fee.first;
     tx.fee.maxPriorityFee = fee.second;
     m_committedIsReplacement = true; // replaces an already-shown tx - don't re-drop the balance
-    beginSendProgress(tr("Rebroadcasting at a higher fee over Tor…"));
+    beginSendProgress(tr("Rebroadcasting at a higher fee over Torâ€¦"));
     m_wallet->commitTransaction(tx); // result surfaces via onTransactionCommitted
 }
 
@@ -7378,7 +7752,7 @@ void AeroMainWindow::onCancelLast() {
         return;
     const QPair<QString, QString> fee = bumpedFeeWei();
     m_committedIsReplacement = true; // a 0-value replacement - don't drop the balance or add a row
-    beginSendProgress(tr("Broadcasting the cancel transaction over Tor…"));
+    beginSendProgress(tr("Broadcasting the cancel transaction over Torâ€¦"));
     m_wallet->cancelTransaction(m_lastSent.fromIndex, m_lastSent.nonce, fee.first, fee.second);
 }
 
@@ -7398,7 +7772,7 @@ void AeroMainWindow::onShowSeed() {
         return;
 
     QString seed;
-    runBusy(tr("Reading seed…"), [&]() { seed = m_wallet->getSeed(); });
+    runBusy(tr("Reading seedâ€¦"), [&]() { seed = m_wallet->getSeed(); });
     if (seed.isEmpty()) {
         QMessageBox::warning(this, tr("Show seed"), tr("No seed available for this wallet."));
         return;
@@ -7443,14 +7817,31 @@ void AeroMainWindow::onRefresh() {
 
 static bool isStablecoin(const QString &symbol) {
     const QString s = symbol.toUpper();
-    return s == "USDT" || s == "USDC" || s == "DAI";
+    // Every chain renames its dollars. Base has USDbC, Polygon and Avalanche carry the bridged
+    // USDC.e / USDT.e / DAI.e, and BSC uses BUSD. Listing only the three mainnet tickers left those
+    // valued at $0, which is not merely a blank Value column: Auto slippage reads this to size the
+    // trade, so a $10k USDC.e sell looked like an unknown amount and fell back to a wide default.
+    static const QSet<QString> kDollar = {
+        QStringLiteral("USDT"),   QStringLiteral("USDC"),   QStringLiteral("DAI"),
+        QStringLiteral("USDC.E"), QStringLiteral("USDT.E"), QStringLiteral("DAI.E"),
+        QStringLiteral("USDBC"),  QStringLiteral("BUSD"),   QStringLiteral("USDC.B"),
+    };
+    return kDollar.contains(s);
 }
 
 double AeroMainWindow::unitPriceUsd(const QString &symbol) const {
     const QString s = symbol.toUpper();
     if (s == m_nativeSymbol.toUpper()) return m_nativeUsd;
-    // WETH tracks ETH - only equal to the native price on ETH-native chains (not e.g. Polygon/POL).
-    if (s == "WETH" && m_nativeSymbol.compare(QStringLiteral("ETH"), Qt::CaseInsensitive) == 0)
+    // The wrapped coin is redeemable 1:1 for the native one, so it carries the native price - but
+    // only where it really is this chain's coin. "W" + native symbol covers WETH on Ethereum and the
+    // ETH L2s, WPOL on Polygon, WBNB on BSC, WXDAI on Gnosis and WAVAX on Avalanche; previously only
+    // WETH-on-an-ETH-chain was handled and the other four priced at zero. WETH on Polygon or Gnosis
+    // is a bridged asset, not the coin, so it deliberately does not match here.
+    if (s == QLatin1String("W") + m_nativeSymbol.toUpper())
+        return m_nativeUsd;
+    // Polygon renamed MATIC to POL and both names are still in circulation.
+    if ((s == "WMATIC" || s == "MATIC") && m_nativeSymbol.compare(QStringLiteral("POL"),
+                                                                 Qt::CaseInsensitive) == 0)
         return m_nativeUsd;
     if (isStablecoin(s)) return 1.0; // stablecoins ~ $1
     return 0.0; // unknown -> no conversion
@@ -7517,14 +7908,22 @@ void AeroMainWindow::applyVerifiedTokens() {
         m_historyModel->setKnownTokens(verifiedTokenAddresses());
 }
 
+// A liquidity verdict belongs to one contract on one chain, so the keys carry the chain id. Stored
+// flat, a decision made on Arbitrum was reused on Ethereum for whatever happened to sit at the same
+// address - and the same address across two chains is usually two unrelated contracts. That turned
+// an auto-trust into a green "verified" badge on a token nobody had ever checked.
+static QString liquidityKey(const char *name, quint64 chainId) {
+    return QStringLiteral("tokens/%1/%2").arg(QLatin1String(name)).arg(chainId);
+}
+
 void AeroMainWindow::loadLiquidityCache() {
     QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
     m_liquidityThresholdUsd = s.value(QStringLiteral("tokens/liquidityUsd"), 1000000.0).toDouble();
     m_liquidityVerified.clear();
-    for (const QString &a : s.value(QStringLiteral("tokens/liquidityVerified")).toStringList())
+    for (const QString &a : s.value(liquidityKey("liquidityVerified", m_chainId)).toStringList())
         m_liquidityVerified.insert(a.toLower());
     m_liquidityChecked.clear();
-    for (const QString &a : s.value(QStringLiteral("tokens/liquidityChecked")).toStringList())
+    for (const QString &a : s.value(liquidityKey("liquidityChecked", m_chainId)).toStringList())
         m_liquidityChecked.insert(a.toLower());
 }
 
@@ -7606,10 +8005,10 @@ void AeroMainWindow::onTokenLiquidity(const QString &tokenAddress, double usd) {
         m_liquidityVerified.insert(a);
 
     QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
-    s.setValue(QStringLiteral("tokens/liquidityChecked"),
+    s.setValue(liquidityKey("liquidityChecked", m_chainId),
                QStringList(m_liquidityChecked.values()));
     if (trusted) {
-        s.setValue(QStringLiteral("tokens/liquidityVerified"),
+        s.setValue(liquidityKey("liquidityVerified", m_chainId),
                    QStringList(m_liquidityVerified.values()));
         applyVerifiedTokens(); // token is now trusted -> its history rows become visible
     }
@@ -7880,7 +8279,7 @@ void AeroMainWindow::openTokenPicker() {
         // Offer to look up a pasted-but-unknown contract address.
         if (f.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive) && f.size() == 42 &&
             !seen.contains(f.toLower())) {
-            auto *it = new QListWidgetItem(tr("Look up token %1 …").arg(shortAddr(f)), list);
+            auto *it = new QListWidgetItem(tr("Look up token %1 â€¦").arg(shortAddr(f)), list);
             it->setData(Qt::UserRole, -1);
             it->setData(Qt::UserRole + 1, f);
         }
@@ -7896,7 +8295,7 @@ void AeroMainWindow::openTokenPicker() {
         } else {
             // Pasted contract: resolve on-chain over Tor; onTokenMetaResolved sets the asset.
             m_pendingSendAsset = it->data(Qt::UserRole + 1).toString();
-            m_assetButton->setText(tr("Looking up… \u25be"));
+            m_assetButton->setText(tr("Looking upâ€¦ \u25be"));
             m_wallet->resolveTokenMeta(m_pendingSendAsset);
         }
         popup->close();
@@ -7917,7 +8316,7 @@ void AeroMainWindow::onTokenMetaResolved(const QString &address, const QString &
         return; // not the token the picker is waiting on
     m_pendingSendAsset.clear();
     if (symbol.isEmpty()) {
-        setSendAsset(m_nativeSymbol, QString(), 18); // revert the "Looking up…" label
+        setSendAsset(m_nativeSymbol, QString(), 18); // revert the "Looking upâ€¦" label
         QMessageBox::warning(this, tr("Token"), tr("Couldn't read this token (not an ERC-20?)."));
         return;
     }
@@ -7952,7 +8351,7 @@ void AeroMainWindow::onSendClicked() {
     if (!to.isEmpty() && !to.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive) && to.contains('.')) {
         const QString name = to;
         QString resolved;
-        runBusy(tr("Resolving %1…").arg(name), [&]() { resolved = m_wallet->resolveEns(name); });
+        runBusy(tr("Resolving %1â€¦").arg(name), [&]() { resolved = m_wallet->resolveEns(name); });
         if (resolved.isEmpty()) {
             QMessageBox::warning(this, tr("Send"),
                                  tr("Couldn't resolve \u201c%1\u201d.\n\n%2")
@@ -8109,7 +8508,7 @@ void AeroMainWindow::onTransactionCreated(const PendingEthTx &tx) {
         amountUsd = amount * unitPriceUsd(sym);
     }
 
-    // Network fee (gas price × gas units) is always paid in the chain's native coin.
+    // Network fee (gas price Ã— gas units) is always paid in the chain's native coin.
     const double gasLimit = isEth ? 21000.0 : 65000.0;
     const double feeEth = tx.fee.maxFee.toDouble() * gasLimit / 1e18;
     const double feeUsd = feeEth * unitPriceUsd(m_nativeSymbol);
@@ -8128,7 +8527,7 @@ void AeroMainWindow::onTransactionCreated(const PendingEthTx &tx) {
         totalRow = withUsd(tr("%1 %2 + %3 %4 fee").arg(amt(amount), sym, amt(feeEth), m_nativeSymbol),
                            amountUsd + feeUsd);
 
-    // Address shown in full (monospace) with the 0x… start and the ending emphasised, so the
+    // Address shown in full (monospace) with the 0xâ€¦ start and the ending emphasised, so the
     // user can eyeball both ends against the intended recipient (address-poisoning defence).
     const QString a = tx.to.trimmed();
     QString addrHtml;
@@ -8217,7 +8616,7 @@ void AeroMainWindow::onTransactionCreated(const PendingEthTx &tx) {
     m_committedTo = tx.to.trimmed();
     m_committedFrom = tx.fromIndex; // the account it's really sent from (the combo may change meanwhile)
     m_committedIsReplacement = false;
-    beginSendProgress(tr("Broadcasting your transaction over Tor…\nThis can take a moment - please "
+    beginSendProgress(tr("Broadcasting your transaction over Torâ€¦\nThis can take a moment - please "
                          "don't send again."));
     m_wallet->commitTransaction(tx);
 }
@@ -8280,7 +8679,7 @@ void AeroMainWindow::onTxReceiptReady(const QString &txHash, bool mined, bool su
     m_lastSendFrom = 0xFFFFFFFFu;
 }
 
-// Show a modal, non-cancellable "Broadcasting…" spinner and mark a send as in-flight. This both
+// Show a modal, non-cancellable "Broadcastingâ€¦" spinner and mark a send as in-flight. This both
 // gives the user feedback while the (possibly slow, Tor-routed) broadcast runs AND blocks a second
 // Send from being fired - the double-send bug was caused by re-clicking during this silent window.
 void AeroMainWindow::beginSendProgress(const QString &text) {
@@ -8392,10 +8791,8 @@ void AeroMainWindow::showTransactionDialog(const HistoryItem &tx) {
     auto *explorerBtn =
         new QPushButton(isCowOrder ? tr("View on CoW Explorer") : tr("View on explorer"), idBox);
     connect(explorerBtn, &QPushButton::clicked, &dlg, [this, hash = tx.txHash, isCowOrder]() {
-        const QString url = isCowOrder
-                                ? QStringLiteral("https://explorer.cow.fi/orders/%1").arg(hash)
-                                : explorerTxUrl(hash);
-        QDesktopServices::openUrl(QUrl(url));
+        openOutsideTor(isCowOrder ? QStringLiteral("https://explorer.cow.fi/orders/%1").arg(hash)
+                                  : explorerTxUrl(hash));
     });
     idLay->addWidget(explorerBtn);
     v->addWidget(idBox);
@@ -8421,6 +8818,18 @@ void AeroMainWindow::showTransactionDialog(const HistoryItem &tx) {
 
     form->addRow(tr("Direction:"),
                  new QLabel(tx.direction == "in" ? tr("Received") : tr("Sent"), &dlg));
+
+    // Which of the wallet's accounts this went through. Omitted rather than guessed for rows cached
+    // before history recorded one.
+    if (tx.account != HistoryItem::unknownAccount && m_wallet) {
+        QString who = accountName(tx.account);
+        const QString addr = m_wallet->address(tx.account);
+        if (!addr.isEmpty())
+            who += tr("  \u00b7  %1").arg(shortAddr(addr));
+        auto *acctLabel = new QLabel(who, &dlg);
+        acctLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        form->addRow(tr("Account:"), acctLabel);
+    }
 
     const double amountUsd = tx.formatted.toDouble() * unitPriceUsd(tx.symbol);
     QString amountStr = tr("%1 %2").arg(tx.formatted, tx.symbol);
@@ -8458,7 +8867,7 @@ void AeroMainWindow::showTransactionDialog(const HistoryItem &tx) {
 
     // Per-transaction note (Electrum-style): a private label stored in the encrypted wallet metadata.
     auto *noteEdit = new QLineEdit(m_historyModel ? m_historyModel->txNote(tx.txHash) : QString(), &dlg);
-    noteEdit->setPlaceholderText(tr("Add a private note for this transaction…"));
+    noteEdit->setPlaceholderText(tr("Add a private note for this transactionâ€¦"));
     form->addRow(tr("Note:"), noteEdit);
 
     v->addLayout(form);
@@ -8556,7 +8965,7 @@ void AeroMainWindow::showQrPopup(const QString &title, const QString &text) {
     QDialog dlg(this);
     dlg.setWindowTitle(title);
     auto *v = new QVBoxLayout(&dlg);
-    v->addWidget(new QLabel(tr("Scan this with the other machine (Tools → Sign / Broadcast → "
+    v->addWidget(new QLabel(tr("Scan this with the other machine (Tools â†’ Sign / Broadcast â†’ "
                                "Scan QR)."),
                             &dlg));
     auto *lbl = new QLabel(&dlg);

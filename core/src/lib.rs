@@ -22,9 +22,11 @@ pub mod hardware;
 pub mod hyperliquid;
 pub mod keys;
 pub mod keystore;
+pub mod pgp;
 pub mod provider;
 pub mod thp;
 pub mod thp_conn;
+pub mod update;
 pub mod wagyu;
 pub mod wallet;
 

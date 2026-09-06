@@ -9,6 +9,7 @@
 //! When the `helios` feature is enabled, [`ProviderConfig::exec_rpc`] should point at the local
 //! Helios RPC (`http://127.0.0.1:8545`), which cryptographically verifies upstream data.
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -250,15 +251,66 @@ impl Default for ProviderConfig {
     }
 }
 
+/// How long a lane keeps one circuit before Aero asks Tor for another.
+///
+/// Tor gives new streams a fresh circuit every ten minutes, but that only applies to streams it is
+/// asked to open. A wallet polls without pause - blocks, balances, fees - so its connection never
+/// goes idle, is never closed, and the stream stays on the circuit it was born on for as long as the
+/// app is open. The rotation everyone assumes is happening does not happen. Retiring the connection
+/// on a timer is what makes it real: the client is rebuilt under a new SOCKS username, the old
+/// pooled connections go with it, and Tor has no choice but to build somewhere new.
+const RPC_CIRCUIT_MS: u64 = 10 * 60 * 1000;
+/// The market and exchange lane rotates more slowly on purpose. These hosts sit behind Cloudflare,
+/// which treats an unfamiliar Tor exit as something to challenge, and the wallet learned the hard
+/// way that changing exits often enough makes them fail outright.
+const API_CIRCUIT_MS: u64 = 30 * 60 * 1000;
+/// The isolated pool retires its circuits too. They were built once and kept for the life of the
+/// connection, which is the same trap the wallet lane was in: these carry the block-explorer read of
+/// every address the wallet owns, so an exit that is never replaced ends up holding the longest list
+/// of them. Longer than the wallet lane because a full history load can run for minutes and there is
+/// no reason to change exits underneath one.
+const ISO_CIRCUIT_MS: u64 = 15 * 60 * 1000;
+
+/// One lane's current circuit, and when it was built.
+struct Lane {
+    client: reqwest::Client,
+    born_ms: u64,
+    epoch: u64,
+}
+
+/// Serial number for single-use broadcast circuits, so two sends in the same millisecond still get
+/// their own.
+static BROADCAST_SEQ: AtomicUsize = AtomicUsize::new(0);
+/// Serial number behind each provider's circuit nonce.
+static PROVIDER_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// A tag that makes this provider's SOCKS usernames unlike any other provider's, including the ones
+/// this same process used a minute ago.
+///
+/// Without it the names are fixed strings, and a fixed name is a fixed circuit: reconnecting, or
+/// switching chain and coming back, would hand the wallet the exact exit it had just left. That is
+/// the opposite of what "New Tor circuit" promises, and it is why the button restarting Tor was
+/// doing more work than it should have needed to.
+fn circuit_nonce() -> String {
+    let seq = PROVIDER_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}{:x}", now_ms(), seq)
+}
+
 /// A Tor-routed JSON-RPC client with endpoint rotation.
 pub struct RpcProvider {
     http: reqwest::Client,
-    /// Pool of clients on ISOLATED Tor circuits (distinct SOCKS auth => distinct exit IP). Bulk,
-    /// per-address HTTP GETs (block-explorer history, price APIs) round-robin across these so that
-    /// many concurrent fetches leave through DIFFERENT exits and don't all trip one exit's per-IP
-    /// rate limit - turning a slow, rate-limited, one-at-a-time history load into a parallel one.
-    /// Empty when running without Tor (clearnet), in which case the main `http` client is used.
-    iso_http: Vec<reqwest::Client>,
+    /// `host:port` of the Tor SOCKS proxy, kept so a lane can be rebuilt under a new username.
+    /// `None` in clearnet mode, where there are no circuits to separate.
+    socks_hostport: Option<String>,
+    /// Makes every circuit this provider asks for unlike the last provider's. See [`circuit_nonce`].
+    nonce: String,
+    timeout: Duration,
+    /// Traffic separated by what it reveals: "rpc" carries the addresses and the transactions, "api"
+    /// carries prices and trading. Kept apart so the exit that watches the wallet is not also the one
+    /// watching the trades.
+    lanes: Mutex<HashMap<&'static str, Lane>>,
+    /// Cursor for handing out isolated circuits round-robin. The circuits themselves live in `lanes`
+    /// under [`ISO_NAMES`], so they are retired on a timer like every other circuit.
     iso_cursor: AtomicUsize,
     endpoints: Vec<Endpoint>,
     cursor: AtomicUsize,
@@ -359,8 +411,40 @@ fn is_about_the_request(message: &str) -> bool {
     REQUEST_FAULTS.iter().any(|f| m.contains(f))
 }
 
+/// What Aero calls itself to every server it talks to.
+///
+/// It used to say `aero/0.1`, described in a comment as generic. It is the opposite of generic: it
+/// names the wallet and its version to every RPC provider, explorer, price feed and exchange, and
+/// the number of people running this program is small enough that saying so is most of the way to
+/// being identified. It also undoes the work of separating traffic into circuits - two services
+/// comparing notes, or one service behind two names, can rejoin the lanes on sight, because every
+/// lane introduced itself with the same unusual string.
+///
+/// This is Tor Browser's user agent, which is the largest crowd available to stand in over this
+/// network. It is deliberately identical on every platform - Tor Browser reports Windows from macOS
+/// and Linux too, and a wallet that reported the truth would be handing over the one detail the
+/// string is there to withhold.
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0";
+
 /// How many isolated Tor circuits to spread bulk GETs over.
 const ISO_CIRCUITS: usize = 8;
+
+/// Lane names for the isolated pool. Fixed strings so a lane lookup costs no allocation, and one per
+/// circuit so each can be retired on its own schedule.
+const ISO_NAMES: [&str; ISO_CIRCUITS] =
+    ["iso0", "iso1", "iso2", "iso3", "iso4", "iso5", "iso6", "iso7"];
+
+/// FNV-1a. Used only to put a key on a circuit, so it needs to be stable and cheap, not strong -
+/// and it must not be the standard hasher, whose seed changes every run and would scatter the same
+/// address across a different exit each time the wallet opened.
+fn stable_hash(key: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
 
 impl RpcProvider {
     pub fn new(cfg: &ProviderConfig) -> Result<Self> {
@@ -369,7 +453,7 @@ impl RpcProvider {
         }
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_secs))
-            .user_agent("aero/0.1") // deliberately generic; no identifying telemetry
+            .user_agent(USER_AGENT) // see USER_AGENT: blend in, don't announce the wallet
             // Ignore any system/env proxy (HTTP(S)_PROXY / ALL_PROXY): a Tor-only wallet must never
             // route through an ambient proxy. We attach ONLY our explicit Tor proxy below.
             .no_proxy();
@@ -403,36 +487,17 @@ impl RpcProvider {
         // Build the isolated-circuit pool (only when going through Tor). Each client uses a distinct
         // SOCKS username, and Tor's IsolateSOCKSAuth (on by default) gives each its own circuit/exit,
         // so concurrent bulk GETs leave through different IPs and don't share a per-IP rate limit.
-        let mut iso_http: Vec<reqwest::Client> = Vec::new();
-        if let Some(proxy) = &cfg.socks_proxy {
-            let norm = normalize_socks(proxy); // socks5h://[user:pass@]host:port
-            let hostport = norm
-                .strip_prefix("socks5h://")
-                .unwrap_or(&norm)
-                .rsplit('@')
-                .next()
-                .unwrap_or("127.0.0.1:9050")
-                .to_string();
-            for k in 0..ISO_CIRCUITS {
-                // Distinct username per client => distinct Tor circuit (password is irrelevant to Tor).
-                let url = format!("socks5h://aeroiso{k}:x@{hostport}");
-                if let Ok(p) = reqwest::Proxy::all(&url) {
-                    if let Ok(c) = reqwest::Client::builder()
-                        .timeout(Duration::from_secs(cfg.timeout_secs))
-                        .user_agent("aero/0.1")
-                        .no_proxy()
-                        .proxy(p)
-                        .build()
-                    {
-                        iso_http.push(c);
-                    }
-                }
-            }
-        }
+        let timeout = Duration::from_secs(cfg.timeout_secs);
+        let socks_hostport = cfg.socks_proxy.as_deref().map(socks_hostport);
 
         Ok(Self {
             http,
-            iso_http,
+            socks_hostport,
+            nonce: circuit_nonce(),
+            timeout,
+            // Circuits are built when first asked for, isolated pool included, and rebuilt whenever
+            // one has been in use long enough. Nothing here is built once and kept forever.
+            lanes: Mutex::new(HashMap::new()),
             iso_cursor: AtomicUsize::new(0),
             endpoints: cfg
                 .endpoints
@@ -448,14 +513,75 @@ impl RpcProvider {
         })
     }
 
-    /// Round-robin one of the isolated-circuit clients for a bulk GET; falls back to the main client
-    /// when there's no isolation pool (clearnet mode).
-    fn iso_client(&self) -> &reqwest::Client {
-        if self.iso_http.is_empty() {
-            return &self.http;
+    /// The SOCKS username for one lane at one point in its life. Tor keys a circuit on this string,
+    /// so two names that differ by a character are two different exits.
+    fn username(&self, name: &str, epoch: u64) -> String {
+        format!("aero{}{name}{epoch}", self.nonce)
+    }
+
+    /// The client for a named lane, rebuilt under a fresh SOCKS username once its circuit has been
+    /// carrying traffic for `max_age_ms`.
+    ///
+    /// Rebuilding is the point. A reqwest client pools its connections, and a pooled connection is
+    /// one Tor stream on one circuit; keeping the client is keeping the exit. Dropping it is the only
+    /// way to make Tor choose again.
+    fn lane(&self, name: &'static str, max_age_ms: u64) -> reqwest::Client {
+        let Some(hostport) = &self.socks_hostport else {
+            return self.http.clone(); // clearnet: no circuits to keep apart
+        };
+        let now = now_ms();
+        let mut lanes = match self.lanes.lock() {
+            Ok(l) => l,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let epoch = match lanes.get(name) {
+            Some(l) if now.saturating_sub(l.born_ms) < max_age_ms => return l.client.clone(),
+            Some(l) => l.epoch + 1,
+            None => 0,
+        };
+        match socks_client(hostport, &self.username(name, epoch), self.timeout) {
+            Some(client) => {
+                lanes.insert(name, Lane { client: client.clone(), born_ms: now, epoch });
+                client
+            }
+            None => self.http.clone(),
         }
-        let i = self.iso_cursor.fetch_add(1, Ordering::Relaxed) % self.iso_http.len();
-        &self.iso_http[i]
+    }
+
+    /// A circuit used for exactly one request and then abandoned.
+    ///
+    /// For broadcasting a signed transaction. Everything else the wallet asks a node is a question;
+    /// this is the one message that hands over something permanent and public with the sender's name
+    /// on it. Sending it down the same circuit that just asked after a dozen balances tells the node
+    /// which wallet those balances belong to - so it goes out through an exit that has never been
+    /// used for anything else and is never used again.
+    fn one_shot_circuit(&self) -> reqwest::Client {
+        let Some(hostport) = &self.socks_hostport else {
+            return self.http.clone();
+        };
+        let n = BROADCAST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let username = format!("aero{}t{}x{n}", self.nonce, now_ms());
+        socks_client(hostport, &username, self.timeout).unwrap_or_else(|| self.http.clone())
+    }
+
+    /// Round-robin one of the isolated circuits. For work where throughput is the point and there is
+    /// nothing to keep together - retrying a refused API call, pulling token artwork off a CDN.
+    fn iso_client(&self) -> reqwest::Client {
+        let i = self.iso_cursor.fetch_add(1, Ordering::Relaxed) % ISO_CIRCUITS;
+        self.lane(ISO_NAMES[i], ISO_CIRCUIT_MS)
+    }
+
+    /// The isolated circuit belonging to `key` - always the same one for the same key.
+    ///
+    /// Round-robin was the wrong instinct here, and backwards. Paging through one address's history
+    /// handed page one to the first exit, page two to the second, and so on, so across a full load
+    /// every exit ended up seeing a slice of every address - which is the clustering the isolated
+    /// pool exists to prevent, performed eight times over. Keyed by address instead, an exit only
+    /// ever learns about the addresses that hash to it, and the explorer sees one address being read
+    /// by one client rather than eight clients taking turns on it.
+    fn iso_client_for(&self, key: &str) -> reqwest::Client {
+        let i = (stable_hash(key) % ISO_CIRCUITS as u64) as usize;
+        self.lane(ISO_NAMES[i], ISO_CIRCUIT_MS)
     }
 
     pub fn chain_id(&self) -> u64 {
@@ -508,16 +634,18 @@ impl RpcProvider {
         self.cursor.store((i + 1) % self.endpoints.len(), Ordering::Relaxed);
     }
 
-    /// GET a URL and parse it as JSON, reusing the same (Tor-proxied) HTTP client. Used for the
-    /// market price API - routed through Tor so the price lookup can't be tied to the user's IP.
-    /// GET raw bytes (e.g. an NFT thumbnail) over the same Tor-proxied client, so fetching remote
-    /// images can't be tied to the user's IP.
+    /// GET raw bytes - an NFT thumbnail - over an isolated circuit.
+    ///
+    /// The URL here comes from a token's own metadata, which means an attacker chooses it. Anyone can
+    /// airdrop a token whose artwork lives on their server and watch who fetches it. On the wallet's
+    /// circuit that fetch would arrive from the same exit as the JSON-RPC that names the holder's
+    /// addresses; on an isolated one it arrives from an exit doing nothing else of interest.
     pub async fn http_get_bytes(&self, url: &str) -> Result<Vec<u8>> {
         let w0 = Instant::now();
         let _gate = gate().await; // priority-aware Tor concurrency gate
         let _probe = ReqProbe::begin(format!("GET  bytes {}", host_of(url)), w0.elapsed());
-        let resp = self
-            .http
+        let client = self.iso_client();
+        let resp = client
             .get(url)
             .send()
             .await
@@ -546,10 +674,11 @@ impl RpcProvider {
         // isolated circuit, which means a different Tor exit and usually a different rate-limit
         // bucket: the reason these get refused at all is that thousands of people share the handful
         // of exits in front of them.
+        let market = self.lane("api", API_CIRCUIT_MS);
         let mut last = CoreError::rpc("no attempt made");
         for attempt in 0..3u32 {
-            let client = if attempt == 0 { &self.http } else { self.iso_client() };
-            match self.get_json_with(client, url, &[]).await {
+            let client = if attempt == 0 { market.clone() } else { self.iso_client() };
+            match self.get_json_with(&client, url, &[]).await {
                 Ok(v) => return Ok(v),
                 Err(e) if !is_refusal(&e) => return Err(e),
                 Err(e) => last = e,
@@ -594,13 +723,18 @@ impl RpcProvider {
             .map_err(|e| CoreError::rpc(format!("bad json ({status}): {e}")))
     }
 
-    /// GET+parse JSON spread across ISOLATED Tor circuits (round-robin distinct exits). ONLY for the
-    /// bulk, per-address block-explorer history fan-out, where hundreds of requests to one endpoint
-    /// would otherwise share and rate-limit against a single exit IP. Do NOT use for router/price APIs.
-    pub async fn http_get_json_isolated(&self, url: &str) -> Result<Value> {
+    /// GET+parse JSON over the ISOLATED circuit belonging to `iso_key`. ONLY for the bulk,
+    /// per-address block-explorer history fan-out, where hundreds of requests to one endpoint would
+    /// otherwise share and rate-limit against a single exit IP. Do NOT use for router/price APIs.
+    ///
+    /// Pass the address being read as `iso_key`. Everything asked about one address then goes out
+    /// through one exit, and different addresses go out through different ones - which is the
+    /// separation this pool was built for.
+    pub async fn http_get_json_isolated(&self, url: &str, iso_key: &str) -> Result<Value> {
         // No retry here: the caller (the explorer paging loop) already backs off and, now, moves to
         // a different explorer entirely, which is a better answer than asking the same one again.
-        self.get_json_with(self.iso_client(), url, &[]).await
+        let client = self.iso_client_for(iso_key);
+        self.get_json_with(&client, url, &[]).await
     }
 
     /// POST a JSON body (over the same Tor client) and return the parsed JSON response.
@@ -611,10 +745,11 @@ impl RpcProvider {
     /// fails, and is retried on a fresh circuit rather than handed upwards as though the exchange had
     /// said something.
     pub async fn http_post_json(&self, url: &str, body: &Value) -> Result<Value> {
+        let market = self.lane("api", API_CIRCUIT_MS);
         let mut last = CoreError::rpc("no attempt made");
         for attempt in 0..3u32 {
-            let client = if attempt == 0 { &self.http } else { self.iso_client() };
-            match self.post_json_with(client, url, body).await {
+            let client = if attempt == 0 { market.clone() } else { self.iso_client() };
+            match self.post_json_with(&client, url, body).await {
                 Ok(v) => return Ok(v),
                 Err(e) if !is_refusal(&e) => return Err(e),
                 Err(e) => last = e,
@@ -669,10 +804,11 @@ impl RpcProvider {
         // Retried like the other single-host GETs. This one tracks the progress of a redemption
         // whose funds are already on their way, so "the server was busy" must not be allowed to look
         // like "your order is gone".
+        let market = self.lane("api", API_CIRCUIT_MS);
         let mut last = CoreError::rpc("no attempt made");
         for attempt in 0..3u32 {
-            let client = if attempt == 0 { &self.http } else { self.iso_client() };
-            match self.get_json_with(client, url, headers).await {
+            let client = if attempt == 0 { market.clone() } else { self.iso_client() };
+            match self.get_json_with(&client, url, headers).await {
                 Ok(v) => return Ok(v),
                 Err(e) if !is_refusal(&e) => return Err(e),
                 Err(e) => last = e,
@@ -694,11 +830,26 @@ impl RpcProvider {
             "params": params,
         });
 
+        self.call_on(&self.lane("rpc", RPC_CIRCUIT_MS), body).await
+    }
+
+    /// Broadcast a signed transaction over a circuit built for this one request.
+    pub async fn send_raw_transaction(&self, raw_hex: &str) -> Result<Value> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_sendRawTransaction",
+            "params": [raw_hex],
+        });
+        self.call_on(&self.one_shot_circuit(), body).await
+    }
+
+    async fn call_on(&self, client: &reqwest::Client, body: Value) -> Result<Value> {
         let mut refusals = 0usize;
         let mut last_err = CoreError::rpc("no endpoints");
         for i in self.attempt_order() {
             let url = self.endpoints[i].url.clone();
-            match self.try_call(&url, &body).await {
+            match self.try_call(client, &url, &body).await {
                 Outcome::Ok(v) => {
                     self.mark_healthy(i);
                     return Ok(v);
@@ -727,12 +878,12 @@ impl RpcProvider {
         })
     }
 
-    async fn try_call(&self, url: &str, body: &Value) -> Outcome {
+    async fn try_call(&self, client: &reqwest::Client, url: &str, body: &Value) -> Outcome {
         let w0 = Instant::now();
         let _gate = gate().await; // priority-aware Tor concurrency gate
         let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("rpc");
         let _probe = ReqProbe::begin(format!("RPC  {method} @{}", host_of(url)), w0.elapsed());
-        let resp = match self.http.post(url).json(body).send().await {
+        let resp = match client.post(url).json(body).send().await {
             Ok(r) => r,
             Err(e) => return Outcome::Unavailable(CoreError::rpc(format!("request failed: {e}"))),
         };
@@ -785,10 +936,11 @@ impl RpcProvider {
                 .collect(),
         );
 
+        let client = self.lane("rpc", RPC_CIRCUIT_MS);
         let mut last_err = CoreError::rpc("no endpoints");
         for i in self.attempt_order() {
             let url = self.endpoints[i].url.clone();
-            match self.try_call_batch(&url, &body, calls.len()).await {
+            match self.try_call_batch(&client, &url, &body, calls.len()).await {
                 Ok(v) => {
                     self.mark_healthy(i);
                     return Ok(v);
@@ -802,12 +954,17 @@ impl RpcProvider {
         Err(last_err)
     }
 
-    async fn try_call_batch(&self, url: &str, body: &Value, n: usize) -> Result<Vec<Value>> {
+    async fn try_call_batch(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        body: &Value,
+        n: usize,
+    ) -> Result<Vec<Value>> {
         let w0 = Instant::now();
         let _gate = gate().await; // priority-aware Tor concurrency gate
         let _probe = ReqProbe::begin(format!("RPC  batch({n}) @{}", host_of(url)), w0.elapsed());
-        let resp = self
-            .http
+        let resp = client
             .post(url)
             .json(body)
             .send()
@@ -883,10 +1040,6 @@ impl RpcProvider {
         self.call("eth_gasPrice", json!([])).await
     }
 
-    pub async fn send_raw_transaction(&self, raw_hex: &str) -> Result<Value> {
-        self.call("eth_sendRawTransaction", json!([raw_hex])).await
-    }
-
     pub async fn block_number(&self) -> Result<Value> {
         self.call("eth_blockNumber", json!([])).await
     }
@@ -902,6 +1055,32 @@ impl RpcProvider {
 /// Force a SOCKS proxy URL to `socks5h://` so DNS is resolved through Tor. `socks5://` (which resolves
 /// hostnames locally, leaking them) and a bare `host:port` are both rewritten. Anything else is
 /// returned unchanged.
+/// The `host:port` of a SOCKS proxy URL, with any credentials stripped.
+fn socks_hostport(proxy: &str) -> String {
+    let norm = normalize_socks(proxy);
+    norm.strip_prefix("socks5h://")
+        .unwrap_or(&norm)
+        .rsplit('@')
+        .next()
+        .unwrap_or("127.0.0.1:9050")
+        .to_string()
+}
+
+/// An HTTP client whose traffic goes to Tor under `username`.
+///
+/// The username is the whole mechanism: with IsolateSOCKSAuth, Tor gives each distinct SOCKS
+/// username its own circuit and its own exit. The password is not checked and is not a secret.
+fn socks_client(hostport: &str, username: &str, timeout: Duration) -> Option<reqwest::Client> {
+    let proxy = reqwest::Proxy::all(&format!("socks5h://{username}:x@{hostport}")).ok()?;
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(USER_AGENT)
+        .no_proxy()
+        .proxy(proxy)
+        .build()
+        .ok()
+}
+
 fn normalize_socks(proxy: &str) -> String {
     let p = proxy.trim();
     if let Some(rest) = p.strip_prefix("socks5://") {
@@ -1025,6 +1204,118 @@ mod tests {
             previous = wait;
         }
         assert!(previous > PARK_BASE, "repeated refusals should back off");
+    }
+
+    fn tor_provider() -> RpcProvider {
+        RpcProvider::new(&ProviderConfig {
+            chain_id: 1,
+            endpoints: vec!["http://127.0.0.1:1".into()],
+            socks_proxy: Some("socks5h://127.0.0.1:9999".into()),
+            allow_clearnet: false,
+            timeout_secs: 5,
+        })
+        .expect("provider")
+    }
+
+    #[test]
+    fn a_lane_retires_its_circuit_and_lanes_do_not_share_one() {
+        // A wallet polls without pause, so its connection never idles out and the stream stays on the
+        // circuit it was born on. Left alone, one exit sees the entire session.
+        let p = tor_provider();
+
+        // Within its lifetime a lane keeps one circuit: rotating per request is what made the
+        // Cloudflare-fronted APIs fail.
+        let _ = p.lane("rpc", RPC_CIRCUIT_MS);
+        let epoch_now = p.lanes.lock().expect("lanes")["rpc"].epoch;
+        let _ = p.lane("rpc", RPC_CIRCUIT_MS);
+        assert_eq!(p.lanes.lock().expect("lanes")["rpc"].epoch, epoch_now);
+
+        // Past its lifetime it must be rebuilt - a new username, which is a new circuit and a new
+        // exit. Zero max age stands in for "the ten minutes are up".
+        let _ = p.lane("rpc", 0);
+        let rotated = p.lanes.lock().expect("lanes")["rpc"].epoch;
+        assert_eq!(rotated, epoch_now + 1, "an expired lane must build a new circuit");
+
+        // The wallet lane and the market lane must never be the same circuit, or the exit carrying
+        // the trades is also the one carrying the addresses.
+        let _ = p.lane("api", API_CIRCUIT_MS);
+        assert_ne!(p.username("rpc", rotated), p.username("api", 0));
+        assert_eq!(p.lanes.lock().expect("lanes").len(), 2);
+    }
+
+    #[test]
+    fn an_address_always_reads_over_the_same_isolated_circuit() {
+        let p = tor_provider();
+        let a = "0x1111111111111111111111111111111111111111";
+        let b = "0x2222222222222222222222222222222222222222";
+
+        // Page two of an address's history must not go out through a different exit than page one.
+        // Round-robin did exactly that, and the result was every exit seeing a piece of every
+        // address - the clustering the pool is supposed to prevent.
+        let first = stable_hash(a) % ISO_CIRCUITS as u64;
+        for _ in 0..25 {
+            assert_eq!(stable_hash(a) % ISO_CIRCUITS as u64, first);
+        }
+
+        // And the assignment has to survive a restart, or the same address would be read from a
+        // different exit each session until every exit had seen it.
+        assert_eq!(stable_hash(a), stable_hash(&a.to_string()));
+
+        // Separate addresses should generally land on separate circuits. With eight of them a
+        // collision is ordinary, so this checks the keys spread rather than that any two differ.
+        let spread = (0..64)
+            .map(|i| stable_hash(&format!("0x{i:040x}")) % ISO_CIRCUITS as u64)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(spread.len(), ISO_CIRCUITS, "keys should reach every circuit");
+
+        let _ = (p.iso_client_for(a), p.iso_client_for(b));
+        let lanes = p.lanes.lock().expect("lanes");
+        assert!(lanes.keys().all(|k| ISO_NAMES.contains(k)), "iso work belongs on iso lanes");
+    }
+
+    #[test]
+    fn the_isolated_pool_retires_its_circuits_too() {
+        // These were built once in the constructor and kept for the life of the connection, which is
+        // the same trap the wallet lane was in - and worse, because they carry the explorer read of
+        // every address the wallet owns.
+        let p = tor_provider();
+        let key = "0xabc";
+        let _ = p.iso_client_for(key);
+        let name = ISO_NAMES[(stable_hash(key) % ISO_CIRCUITS as u64) as usize];
+        let born = p.lanes.lock().expect("lanes")[name].epoch;
+
+        let _ = p.lane(name, 0); // stand in for "its fifteen minutes are up"
+        assert_eq!(
+            p.lanes.lock().expect("lanes")[name].epoch,
+            born + 1,
+            "an isolated circuit must be replaced once it has been used long enough"
+        );
+    }
+
+    #[test]
+    fn reconnecting_does_not_land_back_on_the_circuit_it_left() {
+        // Reconnecting, or leaving a chain and coming back, builds a new provider whose lanes start
+        // over at epoch zero. With fixed usernames that meant asking Tor for the same isolation group
+        // and being handed the same exit - so "New Tor circuit" changed nothing.
+        let first = tor_provider();
+        let second = tor_provider();
+        assert_ne!(first.nonce, second.nonce);
+        assert_ne!(first.username("rpc", 0), second.username("rpc", 0));
+    }
+
+    #[test]
+    fn every_broadcast_gets_a_circuit_of_its_own() {
+        let p = tor_provider();
+
+        // The counter behind the one-shot username has to move, or two sends in the same millisecond
+        // would share an exit with each other.
+        let before = BROADCAST_SEQ.load(Ordering::Relaxed);
+        let _ = p.one_shot_circuit();
+        let _ = p.one_shot_circuit();
+        assert_eq!(BROADCAST_SEQ.load(Ordering::Relaxed), before + 2);
+
+        // And a broadcast must not be handed the lane the balance queries are already using.
+        assert!(p.lanes.lock().expect("lanes").is_empty());
     }
 
     /// A one-shot HTTP server on loopback that answers every request with `body`, so the failover

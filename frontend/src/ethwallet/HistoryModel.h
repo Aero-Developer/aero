@@ -23,6 +23,7 @@ class HistoryModel : public QAbstractTableModel
 public:
     enum Column {
         Column_Date = 0,
+        Column_Account, // which of the wallet's accounts this went through, by its Receive label
         Column_Direction,
         Column_Amount,
         Column_Value, // USD value of the transfer
@@ -115,6 +116,11 @@ public slots:
         return false;
     }
 
+    // Accounts holding a swap that is still open. An off-chain order can only be asked about through
+    // the address that placed it, so polling the account that happens to be on screen would leave a
+    // swap made from any other one waiting forever.
+    QList<quint32> pendingSwapAccounts() const;
+
     // Jump to a page (0-based; clamped to a valid range). Only re-slices the already-filtered list.
     void setPage(int page);
 
@@ -139,6 +145,14 @@ public slots:
     // per-symbol prices (setPrices) to value each transfer.
     void setDustThreshold(double usd);
     void setPrices(const QHash<QString, double> &pricesBySymbol); // symbol (upper) -> USD
+    // What to call each account in the Account column, keyed by account index: the label the user
+    // typed on Receive, or "Account #N" where they have not named one. Pushed in from the window,
+    // which owns the labels; the model only has an index to go on.
+    void setAccountNames(const QHash<quint32, QString> &names);
+
+    // The name shown for a row's account, or empty for a row old enough not to record one.
+    QString accountName(const HistoryItem &h) const;
+
     // Per-transaction notes (Electrum-style), keyed by lower-case tx hash. When a row has a note it's
     // shown in the Counterparty column (the address moves to the tooltip).
     void setTxNotes(const QHash<QString, QString> &notes);
@@ -159,7 +173,16 @@ signals:
     void pageChanged(int page, int pageCount, int total);
 
 private:
-    static QString dedupKey(const HistoryItem &h); // stable per-row key for m_seen
+    static QString dedupKey(const HistoryItem &h); // stable per-row key for m_fetchedAt
+    // Whether a freshly fetched copy of a row we already hold says something new. A swap is fetched
+    // over and over precisely because its outcome changes, so "already seen" must not mean "ignore".
+    static bool supersedes(const HistoryItem &prev, const HistoryItem &next);
+    // Folds a coin and its wrapped token onto one name, so a swap of the chain's own coin recognises
+    // its settled copy (see the eth-flow note in appendBatch).
+    static QString assetKey(const QString &symbol);
+    static bool samePair(const HistoryItem &a, const HistoryItem &b);
+    void reindexFetched();                     // rebuild m_fetchedAt after a wholesale replacement
+    int fetchedIndex(const QString &key) const; // position in m_fetched, or -1
     bool isSpamToken(const HistoryItem &h) const;
     bool isVanityLookalike(const HistoryItem &h) const; // look-alike address-poisoning
     void rebuildPoisonRefs();                           // recompute m_poisonRefSigs/Addrs
@@ -176,7 +199,10 @@ private:
     QVector<HistoryItem> m_localSwaps; // optimistic pending swaps until they appear in m_fetched
     QVector<HistoryItem> m_localSends; // optimistic pending sends until they appear in m_fetched
     QVector<HistoryItem> m_allItems; // full unfiltered history (+ local sends)
-    QSet<QString> m_seen;              // dedup keys for the incremental appendBatch path
+    // Dedup key -> where that row lives in m_fetched. A set would only answer "have we got this
+    // one", which is the wrong question for a swap: the interesting fetch is the second one, the
+    // one that says the order finally filled.
+    QHash<QString, int> m_fetchedAt;
     QVector<HistoryItem> m_filtered;   // full filtered + sorted result (all pages)
     QVector<HistoryItem> m_items;    // the CURRENT PAGE slice of m_filtered (what the view renders)
     QSet<QString> m_knownTokens;
@@ -187,6 +213,7 @@ private:
     double m_dustUsd = 0.0;              // hide incoming worth less than this many USD (0 = off)
     QHash<QString, double> m_prices;     // symbol (upper) -> USD, for dust valuation
     QHash<QString, QString> m_txNotes;   // lower-case tx hash -> user note
+    QHash<quint32, QString> m_accountNames; // account index -> its Receive label
     QHash<QString, double> m_histUnitPrice; // "SYMBOL|YYYY-MM-DD" -> USD, historical valuation
     double m_fiatRate = 1.0;             // USD -> display fiat multiplier for the Value column
     QString m_fiatSymbol = QStringLiteral("$");

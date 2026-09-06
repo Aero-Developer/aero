@@ -91,13 +91,20 @@ pub struct RouterQuote {
 }
 
 /// Read a JSON value that may be a numeric string or a number as a plain decimal string.
+///
+/// Aggregators are inconsistent about quoting wei amounts, so both spellings have to work. The care
+/// here is over JSON numbers: serde stores anything past `u64` as `f64`, and 18-decimal amounts pass
+/// that at ~18.4 of a coin. Printing such a value gives either a rounded integer or scientific
+/// notation, and `U256::from_str` rejects the latter, which is how a real amount used to turn into
+/// zero. Returning nothing for a number that cannot be represented exactly lets the callers, which
+/// all now treat an unreadable amount as a reason to stop, do the right thing.
 fn json_num_str(v: &serde_json::Value) -> String {
     if let Some(s) = v.as_str() {
-        s.to_string()
-    } else if v.is_number() {
-        v.to_string()
-    } else {
-        String::new()
+        return s.to_string();
+    }
+    match v.as_u64() {
+        Some(n) => n.to_string(),
+        None => String::new(),
     }
 }
 
@@ -212,6 +219,12 @@ pub struct HistoryItem {
     pub buy_formatted: String, // swap: human amount received
     #[serde(default)]
     pub status: String, // swap: "pending" | "done" | "failed"
+    /// Swap: the order's own deadline (`validTo`, unix seconds); 0 when it has none or none is
+    /// known. An order resting past this is dead, which is the only way to tell "still working on
+    /// it" from "nobody will ever mention this order again" - CoW answers with the most recent 200
+    /// orders, and an older one simply stops being listed.
+    #[serde(default)]
+    pub expiry: u64,
     // Per-tx log index of a token transfer (Etherscan `logIndex`); used only to disambiguate two
     // legitimate identical transfers in the SAME tx during dedup. Internal to the core.
     #[serde(skip)]
@@ -2114,9 +2127,14 @@ impl Wallet {
             .await
     }
 
-    /// Approve `spender` to spend `token` from account `from_index`. `amount` is the decimal-wei cap;
-    /// "max" (or empty) approves an unlimited allowance. Used for both the CoW Vault Relayer and the
+    /// Approve `spender` to spend `token` from account `from_index`. `amount` is the decimal-wei cap
+    /// and "max" approves an unlimited allowance. Used for both the CoW Vault Relayer and the
     /// on-chain aggregator routers/proxies.
+    ///
+    /// An empty `amount` is an error, not a shorthand for unlimited. It used to be the latter, which
+    /// meant every path that produced an empty string by accident - a `parse_units` that failed on
+    /// too many decimal places returns one - quietly handed the spender the entire balance forever.
+    /// Granting unlimited spend is a decision worth making on purpose.
     pub async fn router_approve(
         &self,
         from_index: u32,
@@ -2126,8 +2144,15 @@ impl Wallet {
     ) -> Result<SendResult> {
         let spender_addr = parse_address(spender)?;
         let token_addr = parse_address(token)?;
-        let cap = if amount.is_empty() || amount.eq_ignore_ascii_case("max") {
+        let amount = amount.trim();
+        let cap = if amount.eq_ignore_ascii_case("max") {
             U256::MAX
+        } else if amount.is_empty() {
+            return Err(CoreError::Amount(
+                "no approval amount was given - refusing to approve an unlimited allowance by \
+                 default"
+                    .into(),
+            ));
         } else {
             U256::from_str(amount).map_err(|_| CoreError::Amount("bad approval amount".into()))?
         };
@@ -2215,10 +2240,11 @@ impl Wallet {
                 } else {
                     "0".to_string()
                 };
+                let value = checked_router_value(&value, sell_is_native, sell_amount_wei)?;
                 let buy_amount = d.get("amountOut").map(json_num_str).unwrap_or_default();
                 // On-chain slippage is enforced by Kyber's `slippageTolerance` (above); report the
                 // matching displayed minimum so the confirm dialog doesn't overstate the guarantee.
-                let min_buy_amount = apply_slippage_min(&buy_amount, slippage_bps);
+                let min_buy_amount = apply_slippage_min(&buy_amount, slippage_bps)?;
                 Ok(serde_json::json!({
                     "to": router, "data": data, "value": value, "spender": router,
                     "buy_amount": buy_amount, "min_buy_amount": min_buy_amount,
@@ -2259,9 +2285,10 @@ impl Wallet {
                 let to = tx.get("to").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let data = tx.get("data").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let value = tx.get("value").map(json_num_str).unwrap_or_else(|| "0".into());
+                let value = checked_router_value(&value, sell_is_native, sell_amount_wei)?;
                 // On-chain slippage is enforced by Odos's `slippageLimitPercent` (above); report the
                 // matching displayed minimum rather than the un-slipped expected output.
-                let min_buy_amount = apply_slippage_min(&buy_amount, slippage_bps);
+                let min_buy_amount = apply_slippage_min(&buy_amount, slippage_bps)?;
                 Ok(serde_json::json!({
                     "to": to.clone(), "data": data, "value": value, "spender": to,
                     "buy_amount": buy_amount, "min_buy_amount": min_buy_amount,
@@ -2285,11 +2312,10 @@ impl Wallet {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
-                let min_dest = {
-                    let d = U256::from_str(&dest_amount).unwrap_or(U256::ZERO);
-                    let bps = U256::from(10_000u64.saturating_sub(slippage_bps as u64));
-                    (d * bps / U256::from(10_000u64)).to_string()
-                };
+                // ParaSwap is the one router where this number is not merely displayed: it goes back
+                // as `destAmount` and becomes the on-chain floor. A zero here is a swap that will
+                // accept anything.
+                let min_dest = apply_slippage_min(&dest_amount, slippage_bps)?;
                 let tbody = serde_json::json!({
                     "srcToken": src, "destToken": dst, "srcAmount": sell_amount_wei,
                     "destAmount": min_dest, "priceRoute": price_route, "userAddress": from,
@@ -2305,6 +2331,7 @@ impl Wallet {
                 let to = t.get("to").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let data = t.get("data").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let value = t.get("value").map(json_num_str).unwrap_or_else(|| "0".into());
+                let value = checked_router_value(&value, sell_is_native, sell_amount_wei)?;
                 Ok(serde_json::json!({
                     "to": to, "data": data, "value": value, "spender": spender,
                     "buy_amount": dest_amount, "min_buy_amount": min_dest,
@@ -2332,12 +2359,33 @@ impl Wallet {
                 let to = d.get("to").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let data = d.get("data").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let value = d.get("value").map(json_num_str).unwrap_or_else(|| "0".into());
+                let value = checked_router_value(&value, sell_is_native, sell_amount_wei)?;
                 let buy_amount = d.get("outAmount").map(json_num_str).unwrap_or_default();
+                // Unlike the other routers, OpenOcean builds the floor into its own calldata, so the
+                // only honest "minimum received" is the one it reports. Falling back to `outAmount`
+                // when the field was missing used to show the expected output as if it were
+                // guaranteed, and there is no way to check a floor that was never sent.
                 let min_buy = d
                     .get("minOutAmount")
                     .map(json_num_str)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| buy_amount.clone());
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| {
+                        CoreError::rpc(
+                            "openocean did not say what minimum it will accept, so this swap has no \
+                             floor - not signing it"
+                                .to_string(),
+                        )
+                    })?;
+                // And it must be at least as strong as the slippage the user chose.
+                let asked = apply_slippage_min(&buy_amount, slippage_bps)?;
+                if U256::from_str(min_buy.trim()).unwrap_or(U256::ZERO)
+                    < U256::from_str(&asked).unwrap_or(U256::ZERO)
+                {
+                    return Err(CoreError::rpc(
+                        "openocean's swap allows more slippage than you asked for - not signing it"
+                            .to_string(),
+                    ));
+                }
                 Ok(serde_json::json!({
                     "to": to.clone(), "data": data, "value": value, "spender": to,
                     "buy_amount": buy_amount, "min_buy_amount": min_buy,
@@ -2383,13 +2431,20 @@ impl Wallet {
         // the traded amount by solvers. So we sell the FULL amount (quote.sellAmount + quote.feeAmount)
         // and set feeAmount to zero. (Signing/submitting the quote's fee verbatim => "Fee must be
         // zero".)
-        let quoted_sell = U256::from_str(&s("sellAmount")).unwrap_or(U256::ZERO);
-        let quoted_fee = U256::from_str(&s("feeAmount")).unwrap_or(U256::ZERO);
+        let quoted_sell = quote_amount(q, "sellAmount")?;
+        let quoted_fee = quote_amount(q, "feeAmount").unwrap_or(U256::ZERO);
         let sell_amount = quoted_sell.saturating_add(quoted_fee);
         // Apply slippage to the minimum buy - this is what makes the order fillable.
-        let quoted_buy = U256::from_str(&s("buyAmount")).unwrap_or(U256::ZERO);
-        let bps = U256::from(10_000u64.saturating_sub(slippage_bps.min(5_000) as u64));
-        let buy_amount = quoted_buy * bps / U256::from(10_000u64);
+        let quoted_buy = quote_amount(q, "buyAmount")?;
+        let buy_amount = U256::from_str(&apply_slippage_min(&quoted_buy.to_string(), slippage_bps)?)
+            .unwrap_or(U256::ZERO);
+        if sell_amount.is_zero() || buy_amount.is_zero() {
+            return Err(CoreError::rpc(
+                "the CoW quote priced this swap at zero, which would sign away the sell amount for \
+                 nothing - not signing it"
+                    .to_string(),
+            ));
+        }
         let fee_amount = U256::ZERO;
 
         let order = Order {
@@ -2472,13 +2527,21 @@ impl Wallet {
         let s = |k: &str| q.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
         // Same fee=0 rule as signed orders: sell the full amount, fee 0. The ETH sent (value) is the
         // full sell amount, unchanged from quote.sellAmount + quote.feeAmount.
-        let quoted_sell = U256::from_str(&s("sellAmount")).unwrap_or(U256::ZERO);
-        let quoted_fee = U256::from_str(&s("feeAmount")).unwrap_or(U256::ZERO);
+        let quoted_sell = quote_amount(q, "sellAmount")?;
+        let quoted_fee = quote_amount(q, "feeAmount").unwrap_or(U256::ZERO);
         let sell_amount = quoted_sell.saturating_add(quoted_fee);
         // Apply slippage to the minimum buy so the order can fill.
-        let quoted_buy = U256::from_str(&s("buyAmount")).unwrap_or(U256::ZERO);
-        let bps = U256::from(10_000u64.saturating_sub(slippage_bps.min(5_000) as u64));
-        let buy_amount = quoted_buy * bps / U256::from(10_000u64);
+        let quoted_buy = quote_amount(q, "buyAmount")?;
+        let buy_amount = U256::from_str(&apply_slippage_min(&quoted_buy.to_string(), slippage_bps)?)
+            .unwrap_or(U256::ZERO);
+        // This one also decides msg.value, so a zero here would send ETH for an order worth nothing.
+        if sell_amount.is_zero() || buy_amount.is_zero() {
+            return Err(CoreError::rpc(
+                "the CoW quote priced this swap at zero, which would send ETH for nothing - not \
+                 signing it"
+                    .to_string(),
+            ));
+        }
         let fee_amount = U256::ZERO;
         let quote_valid_to = q.get("validTo").and_then(|v| v.as_u64()).unwrap_or(0);
         let valid_to = quote_valid_to.max(now_unix().saturating_add(20 * 60)) as u32;
@@ -2500,8 +2563,34 @@ impl Wallet {
         let calldata = Bytes::from(IEthFlow::createOrderCall { order }.abi_encode());
         // msg.value = the full sell amount (fee is 0 in the order).
         let value = sell_amount;
-        self.build_sign_send(from_index, parse_address(eth_flow)?, value, calldata, None, None, None)
+        let eth_flow = self.verified_eth_flow(eth_flow).await?;
+        self.build_sign_send(from_index, eth_flow, value, calldata, None, None, None)
             .await
+    }
+
+    /// The eth-flow contract, once it is known to be a contract.
+    ///
+    /// This one call is the difference between a bug and a loss. `createOrder` is a call to a
+    /// contract, but on an address with no code a call is just a transfer, and the EVM will happily
+    /// accept the whole sell amount and report success. The user would see a mined transaction and
+    /// no order, and the ETH would be at an address nobody has the key to. Cheap insurance against
+    /// a wrong constant, a chain where CoW has not deployed, and a future chain added to the table
+    /// without checking.
+    async fn verified_eth_flow(&self, address: &str) -> Result<Address> {
+        let addr = parse_address(address)?;
+        let code = self
+            .provider()?
+            .call("eth_getCode", serde_json::json!([address, "latest"]))
+            .await?;
+        let code = code.as_str().unwrap_or("");
+        if code.is_empty() || code == "0x" || code == "0x0" {
+            return Err(CoreError::rpc(format!(
+                "no CoW eth-flow contract at {address} on this network - refusing to send ETH there. \
+                 Swap wrapped {} instead.",
+                chain_info(self.provider()?.chain_id()).native_symbol
+            )));
+        }
+        Ok(addr)
     }
 
     // ---------- Token approvals ----------
@@ -3100,6 +3189,17 @@ impl Wallet {
         let input_amount = U256::from_str(amount_wei)
             .map_err(|_| CoreError::Amount("bad bridge amount".into()))?;
         let max_deposit = U256::from_str(&gs("max_deposit")).unwrap_or(U256::ZERO);
+        // Across returns the route's floor as well as its ceiling, and a deposit under the floor is
+        // not rejected on chain - it is accepted and then left unfilled, because no relayer will
+        // touch it. The user waits out the fill deadline for a refund. This was never checked.
+        let min_deposit = U256::from_str(&gs("min_deposit")).unwrap_or(U256::ZERO);
+        if min_deposit > U256::ZERO && input_amount < min_deposit {
+            return Err(CoreError::Amount(
+                "that is below the smallest amount Across will move on this route, and a deposit \
+                 under it would sit unfilled until it is refunded"
+                    .to_string(),
+            ));
+        }
         if max_deposit > U256::ZERO && input_amount > max_deposit {
             return Err(CoreError::rpc(
                 "amount exceeds the Across route capacity for this pair".to_string(),
@@ -3480,7 +3580,17 @@ impl Wallet {
 
         let bases = crate::explorers::bases(provider.chain_id());
         if bases.is_empty() {
-            return Ok(Vec::new()); // no explorer for this chain, and none configured
+            // Returning an empty list here said "this account has never transacted", which on BNB
+            // Smart Chain - the one chain with no keyless explorer - was a lie told to every user
+            // with a full wallet. Worse, a router swap on such a chain leaves a pending row that
+            // nothing can ever settle, so it eventually gets marked failed despite having succeeded.
+            // Say what is actually true and point at the setting that fixes it.
+            return Err(CoreError::rpc(format!(
+                "no public explorer publishes {} history, so Aero cannot list transactions here. \
+                 Add an Etherscan-compatible API under Settings > Node > History API - one Etherscan \
+                 V2 key covers this chain and every other one.",
+                info.name
+            )));
         }
 
         let mut items: Vec<HistoryItem> = Vec::new();
@@ -3606,6 +3716,26 @@ impl Wallet {
         (short_addr_str(addr), 18)
     }
 
+    /// Symbol + decimals for a token, asking the token itself when the wallet does not already know.
+    ///
+    /// The tracked list is chain-agnostic and in practice holds Ethereum tokens, so on any other
+    /// chain [`token_meta_hint`] missed and fell back to 18 decimals. For a CoW trade in USDC that
+    /// is not a cosmetic slip: a fill of 1000 USDC is six decimals, and rendering it with eighteen
+    /// showed `0.000000000001` in History and priced it at nothing. Reading `decimals()` from the
+    /// contract costs one call per distinct token and is the only answer that is right on every
+    /// chain.
+    async fn token_meta_onchain(&self, addr: &str) -> (String, u8) {
+        // CoW's sentinel for "pay me in the native coin" is not a contract at all.
+        if addr.eq_ignore_ascii_case(COW_BUY_ETH) {
+            let info = chain_info(self.provider().map(|p| p.chain_id()).unwrap_or(1));
+            return (info.native_symbol.to_string(), 18);
+        }
+        match self.erc20_metadata(addr).await {
+            Ok((symbol, decimals)) if !symbol.is_empty() => (symbol, decimals),
+            _ => self.token_meta_hint(addr),
+        }
+    }
+
     /// CoW Protocol swaps for `index` (pending + historical, including months-old) from CoW's
     /// order-book API over Tor. Returns swap `HistoryItem`s with status. Empty on non-CoW chains.
     pub async fn cow_orders(&self, index: u32) -> Result<Vec<HistoryItem>> {
@@ -3622,6 +3752,25 @@ impl Wallet {
         let Some(arr) = v.as_array().cloned() else {
             return Err(CoreError::rpc(format!("cow orders: unexpected reply {v}")));
         };
+        // Resolve each distinct token once up front. An account's orders are usually a handful of
+        // pairs, so this is a few calls rather than one per order.
+        let mut meta: std::collections::HashMap<String, (String, u8)> = std::collections::HashMap::new();
+        for o in &arr {
+            for key in ["sellToken", "buyToken"] {
+                let Some(addr) = o.get(key).and_then(|x| x.as_str()) else { continue };
+                let k = addr.to_lowercase();
+                if meta.contains_key(&k) {
+                    continue;
+                }
+                meta.insert(k, self.token_meta_onchain(addr).await);
+            }
+        }
+        let look = |addr: &str| -> (String, u8) {
+            meta.get(&addr.to_lowercase())
+                .cloned()
+                .unwrap_or_else(|| self.token_meta_hint(addr))
+        };
+
         let mut out = Vec::with_capacity(arr.len());
         for o in arr {
             let g = |k: &str| o.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string();
@@ -3645,8 +3794,8 @@ impl Wallet {
             let buy_token = g("buyToken");
             let sell_raw = take("executedSellAmount", "sellAmount");
             let buy_raw = take("executedBuyAmount", "buyAmount");
-            let (sell_sym, sell_dec) = self.token_meta_hint(&sell_token);
-            let (buy_sym, buy_dec) = self.token_meta_hint(&buy_token);
+            let (sell_sym, sell_dec) = look(&sell_token);
+            let (buy_sym, buy_dec) = look(&buy_token);
             let sell_amt = U256::from_str(&sell_raw).unwrap_or(U256::ZERO);
             let buy_amt = U256::from_str(&buy_raw).unwrap_or(U256::ZERO);
             out.push(HistoryItem {
@@ -3665,6 +3814,7 @@ impl Wallet {
                 buy_symbol: buy_sym,
                 buy_formatted: format_units(buy_amt, buy_dec),
                 status,
+                expiry: o.get("validTo").and_then(|x| x.as_u64()).unwrap_or(0),
                 log_index: 0,
             });
         }
@@ -4076,10 +4226,11 @@ async fn fetch_all_pages(
         );
         let mut attempt = 0u32;
         loop {
-            // Isolated circuit per request: this is the bulk per-address explorer fan-out that would
-            // otherwise rate-limit against a single Tor exit (router/CoW/price APIs stay on the sticky
-            // circuit via plain http_get_json).
-            match provider.http_get_json_isolated(&url).await {
+            // Keyed on the address, so every page of this account's history leaves through the one
+            // exit and other accounts leave through others. This is the bulk fan-out that would
+            // otherwise rate-limit against a single Tor exit (router/CoW/price APIs stay on the
+            // sticky circuit via plain http_get_json).
+            match provider.http_get_json_isolated(&url, owner).await {
                 Ok(v) => {
                     if let Some(rows) = v.get("result").and_then(|r| r.as_array()) {
                         let n = rows.len();
@@ -4254,6 +4405,7 @@ fn group_swaps(items: Vec<HistoryItem>) -> Vec<HistoryItem> {
             buy_symbol: items[bi].symbol.clone(),
             buy_formatted: items[bi].formatted.clone(),
             status: if failed { "failed".into() } else { "done".into() },
+            expiry: 0, // a mined swap has already happened; there is nothing left to wait for
             log_index: 0,
         });
         for &i in &idxs {
@@ -4367,10 +4519,89 @@ fn is_safe_image_url(url: &str) -> bool {
 /// Minimum output after `slippage_bps` slippage, as a decimal-wei string: `amount * (10000-bps)/10000`
 /// (bps capped at 50%). Used to display an honest "minimum received" for routers whose calldata
 /// enforces slippage internally.
-fn apply_slippage_min(amount_wei: &str, slippage_bps: u32) -> String {
-    let a = U256::from_str(amount_wei.trim()).unwrap_or(U256::ZERO);
+///
+/// Errors on an unparsable amount rather than returning zero. A zero minimum is not a conservative
+/// default, it is the most dangerous value there is: an order or a swap with no floor can be filled
+/// at any price at all.
+fn apply_slippage_min(amount_wei: &str, slippage_bps: u32) -> Result<String> {
+    let trimmed = amount_wei.trim();
+    // `U256::from_str("")` is zero, not an error, so an amount that never arrived would otherwise
+    // slip straight through this function as a floor of nothing.
+    let a = if trimmed.is_empty() {
+        None
+    } else {
+        U256::from_str(trimmed).ok()
+    };
+    let a = a.ok_or_else(|| {
+        CoreError::rpc(format!(
+            "the router quoted an output this wallet cannot read ({amount_wei:?}), so it cannot \
+             work out a minimum to accept - not swapping"
+        ))
+    })?;
     let bps = U256::from(10_000u64.saturating_sub(slippage_bps.min(5_000) as u64));
-    (a * bps / U256::from(10_000u64)).to_string()
+    let min = a * bps / U256::from(10_000u64);
+    // Integer division floors, so a quote of a few wei rounds the floor to zero and the swap
+    // becomes unbounded. Keep at least one wei of protection whenever there is anything to protect.
+    let min = if min.is_zero() && !a.is_zero() { U256::from(1u64) } else { min };
+    Ok(min.to_string())
+}
+
+/// A wei amount an order depends on, read from a CoW quote.
+///
+/// Every one of these is load-bearing: `sellAmount` is what leaves the wallet and `buyAmount` sets
+/// the price floor. Reading a missing or unparsable field as zero produced a signed order that
+/// could be filled for nothing, so a field that cannot be read stops the swap.
+fn quote_amount(q: &serde_json::Value, key: &str) -> Result<U256> {
+    let raw = q.get(key).map(json_num_str).unwrap_or_default();
+    let trimmed = raw.trim();
+    // An empty string parses as zero, so absence has to be caught before the parse rather than by it.
+    let parsed = if trimmed.is_empty() { None } else { U256::from_str(trimmed).ok() };
+    parsed.ok_or_else(|| {
+        CoreError::rpc(format!(
+            "the CoW quote's {key} is missing or unreadable, so the order cannot be priced - not \
+             signing it"
+        ))
+    })
+}
+
+/// The `value` to attach to a router swap, checked against what the user is actually selling.
+///
+/// The aggregator APIs hand back a whole transaction, and the wallet signs it. That means the
+/// `value` field is a number an outside server chooses and the user's ETH obeys. Two rules make
+/// that safe: selling an ERC-20 never needs ETH attached, and selling the native coin needs exactly
+/// the amount being sold. Anything else is either a broken quote or an attempt to walk off with the
+/// balance, and neither is worth signing.
+fn checked_router_value(
+    quoted: &str,
+    sell_is_native: bool,
+    sell_amount_wei: &str,
+) -> Result<String> {
+    let quoted = quoted.trim();
+    if quoted.is_empty() && sell_is_native {
+        return Err(CoreError::rpc(
+            "the router did not say how much of the coin to send with this swap - not signing it"
+                .to_string(),
+        ));
+    }
+    let v = U256::from_str(if quoted.is_empty() { "0" } else { quoted })
+        .map_err(|_| CoreError::rpc(format!("the router quoted an unreadable value {quoted:?}")))?;
+    if !sell_is_native {
+        if !v.is_zero() {
+            return Err(CoreError::rpc(format!(
+                "the router asked to attach {v} wei to a token swap, which never needs it - not \
+                 signing this quote"
+            )));
+        }
+        return Ok("0".to_string());
+    }
+    let expected = U256::from_str(sell_amount_wei.trim()).unwrap_or(U256::ZERO);
+    if v != expected {
+        return Err(CoreError::rpc(format!(
+            "the router asked to send {v} wei but the swap is for {expected} wei - not signing this \
+             quote"
+        )));
+    }
+    Ok(v.to_string())
 }
 
 fn parse_hex_u256(v: &serde_json::Value) -> Result<U256> {
@@ -4562,9 +4793,14 @@ fn hl_order_result(reply: &serde_json::Value) -> serde_json::Value {
             "state": "resting",
             "oid": s["resting"].get("oid").and_then(|x| x.as_u64()).unwrap_or(0),
         }),
-        // An IOC order that crossed nothing is cancelled outright rather than rejected, which is
-        // not an error but is also not a trade.
-        _ => serde_json::json!({ "state": "none" }),
+        // An IOC order that crossed nothing is cancelled outright rather than rejected, which is not
+        // an error but is also not a trade.
+        Some(s) if s.as_str() == Some("success") => serde_json::json!({ "state": "none" }),
+        // The exchange accepted the order but described the outcome in a shape this build does not
+        // recognise. Reporting "nothing filled" here is a guess, and the wrong guess invites the
+        // user to place the order again on top of one that may well be live. Say so instead.
+        Some(s) => serde_json::json!({ "state": "unknown", "detail": s.to_string() }),
+        None => serde_json::json!({ "state": "unknown", "detail": "" }),
     }
 }
 
@@ -4687,6 +4923,93 @@ mod tests {
             word_to_address(word).unwrap().to_checksum(None),
             "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
         );
+    }
+
+    /// A router hands back a whole transaction and the wallet signs it, so `value` is a number an
+    /// outside server picks and the user's coin obeys. These are the two rules that make that safe.
+    #[test]
+    fn a_router_cannot_attach_coin_to_a_token_swap() {
+        // Selling a token never needs coin attached, whatever the quote says.
+        assert!(checked_router_value("0", false, "1000000").is_ok());
+        assert!(checked_router_value("", false, "1000000").is_ok());
+        let err = checked_router_value("5000000000000000000", false, "1000000").unwrap_err();
+        assert!(format!("{err}").contains("never needs it"), "{err}");
+
+        // Selling the coin needs exactly the amount being sold - no more, no less.
+        assert_eq!(
+            checked_router_value("1000000000000000000", true, "1000000000000000000").unwrap(),
+            "1000000000000000000"
+        );
+        assert!(checked_router_value("2000000000000000000", true, "1000000000000000000").is_err());
+        assert!(checked_router_value("500000000000000000", true, "1000000000000000000").is_err());
+        // An amount the quote never gave us is not an amount of zero.
+        assert!(checked_router_value("", true, "1000000000000000000").is_err());
+    }
+
+    /// A minimum of zero means "fill me at any price", so it must never be what an unreadable or
+    /// tiny quote decays into.
+    #[test]
+    fn a_swap_never_ends_up_without_a_price_floor() {
+        assert_eq!(apply_slippage_min("1000000", 50).unwrap(), "995000");
+        // Rounding down must not erase the floor entirely on a dust-sized quote.
+        assert_eq!(apply_slippage_min("1", 50).unwrap(), "1");
+        assert_eq!(apply_slippage_min("0", 50).unwrap(), "0");
+        // Slippage is capped at 50% however it is asked for.
+        assert_eq!(apply_slippage_min("1000000", 9_999).unwrap(), "500000");
+        // And anything unreadable stops the swap instead of becoming zero.
+        assert!(apply_slippage_min("", 50).is_err());
+        assert!(apply_slippage_min("1.7e19", 50).is_err());
+        assert!(apply_slippage_min("not a number", 50).is_err());
+    }
+
+    /// The amounts an order is priced from have to come back exactly, including the ones past the
+    /// range a JSON float can hold.
+    #[test]
+    fn quote_amounts_are_read_exactly_or_not_at_all() {
+        let q = serde_json::json!({
+            "sellAmount": "1000000000000000000",
+            "buyAmount": 177656413u64,
+            "big": 18446744073709551615u64,
+        });
+        assert_eq!(quote_amount(&q, "sellAmount").unwrap().to_string(), "1000000000000000000");
+        assert_eq!(quote_amount(&q, "buyAmount").unwrap().to_string(), "177656413");
+        assert_eq!(quote_amount(&q, "big").unwrap().to_string(), "18446744073709551615");
+        assert!(quote_amount(&q, "missing").is_err());
+
+        // A number too large for JSON to hold exactly is not silently rounded into an amount.
+        let lossy: serde_json::Value = serde_json::from_str(r#"{"v": 1e19}"#).unwrap();
+        assert!(quote_amount(&lossy, "v").is_err());
+    }
+
+    /// An order the exchange described in an unfamiliar way must not read as "nothing happened",
+    /// because that is an invitation to place it a second time on top of a live one.
+    #[test]
+    fn an_unrecognised_order_reply_is_not_reported_as_a_clean_miss() {
+        let filled = serde_json::json!({
+            "response": { "data": { "statuses": [
+                { "filled": { "totalSz": "1.5", "avgPx": "375.82", "oid": 42 } }
+            ]}}
+        });
+        assert_eq!(hl_order_result(&filled)["state"], "filled");
+        assert_eq!(hl_order_result(&filled)["size"], "1.5");
+
+        let resting = serde_json::json!({
+            "response": { "data": { "statuses": [ { "resting": { "oid": 7 } } ]}}
+        });
+        assert_eq!(hl_order_result(&resting)["state"], "resting");
+
+        // The documented no-fill answer still reads as a clean miss.
+        let missed = serde_json::json!({
+            "response": { "data": { "statuses": [ "success" ]}}
+        });
+        assert_eq!(hl_order_result(&missed)["state"], "none");
+
+        // Anything else is explicitly unknown rather than assumed harmless.
+        let odd = serde_json::json!({
+            "response": { "data": { "statuses": [ { "somethingNew": { "oid": 9 } } ]}}
+        });
+        assert_eq!(hl_order_result(&odd)["state"], "unknown");
+        assert_eq!(hl_order_result(&serde_json::json!({}))["state"], "unknown");
     }
 
     #[test]

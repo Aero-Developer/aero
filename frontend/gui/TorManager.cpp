@@ -101,7 +101,15 @@ void TorManager::launchBundled() {
     // We only get here when no Aero Tor is already listening on our port, so any leftover lock file
     // belongs to a previous Tor that crashed or was killed. Tor refuses to start (exits code 1 -
     // "Another process has locked the data directory") if a stale lock remains, so clear it.
-    QFile::remove(QDir(dataDir).filePath(QStringLiteral("lock")));
+    //
+    // Only when one is actually there. Deleting a file unconditionally on every single launch is a
+    // behaviour antivirus heuristics score as indicator removal, and Aero - unsigned, spawning a
+    // network daemon - has no reputation to spend on looking careless. The clean-shutdown case leaves
+    // no lock to remove anyway, so the check costs nothing and the deletion becomes what it always
+    // meant: crash recovery.
+    const QString lockPath = QDir(dataDir).filePath(QStringLiteral("lock"));
+    if (QFileInfo::exists(lockPath))
+        QFile::remove(lockPath);
 
     QStringList args;
     // IsolateSOCKSAuth (Tor default, made explicit): each distinct SOCKS username gets its OWN circuit

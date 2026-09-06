@@ -47,6 +47,90 @@ fn main() {
         return;
     }
 
+    // `aero verify-update <manifest> <signature>` - check a release signature the way the shipping
+    // app will, against the same pinned key, before it is ever published.
+    //
+    // This exists so a release is not published and then discovered to be unverifiable. It runs the
+    // real code path with the real key, so agreement here means agreement in the wallet.
+    if std::env::args().nth(1).as_deref() == Some("verify-update") {
+        let manifest = std::env::args().nth(2);
+        let signature = std::env::args().nth(3);
+        let (Some(manifest), Some(signature)) = (manifest, signature) else {
+            println!("usage: aero verify-update <aero-update.json> <aero-update.json.asc>");
+            return;
+        };
+        println!(
+            "Aero accepts updates signed only by\n  {}\n",
+            aero_core::pgp::release_fingerprint_display()
+        );
+        let (Ok(data), Ok(sig)) = (
+            std::fs::read(&manifest),
+            std::fs::read_to_string(&signature),
+        ) else {
+            println!("could not read {manifest} and/or {signature}");
+            return;
+        };
+        match aero_core::pgp::verify_detached(&data, &sig) {
+            Ok(when) => {
+                println!("SIGNATURE OK - {manifest} was signed by the Aero release key.");
+                println!("signed at unix time {when}");
+                match serde_json::from_slice::<aero_core::update::Manifest>(&data) {
+                    Ok(m) => {
+                        println!("\nThis manifest offers:");
+                        println!("  version {}", m.version);
+                        println!("  file    {}", m.file);
+                        println!("  sha256  {}", m.sha256);
+                        println!("  size    {} bytes", m.size);
+
+                        // A good signature over a stale hash is the easy mistake here: sign the
+                        // manifest, then rebuild the zip for one more fix and forget to re-sign. The
+                        // signature still verifies, and every install then fails on the hash - after
+                        // publishing. So check the archive sitting next to the manifest too.
+                        let archive = std::path::Path::new(&manifest)
+                            .parent()
+                            .unwrap_or(std::path::Path::new("."))
+                            .join(&m.file);
+                        match std::fs::read(&archive) {
+                            Ok(bytes) => {
+                                use sha2::Digest;
+                                let got = hex::encode(sha2::Sha256::digest(&bytes));
+                                if got == m.sha256.to_lowercase() && bytes.len() as u64 == m.size {
+                                    println!(
+                                        "\nARCHIVE OK - {} matches the signed hash and size.",
+                                        archive.display()
+                                    );
+                                    println!("Upload the zip, the manifest and the signature, and mark the release latest.");
+                                } else {
+                                    println!(
+                                        "\nARCHIVE MISMATCH - {} is not the file this manifest was signed for.",
+                                        archive.display()
+                                    );
+                                    println!("  on disk: {got}, {} bytes", bytes.len());
+                                    println!("  signed:  {}, {} bytes", m.sha256, m.size);
+                                    println!(
+                                        "\nAero would download it and refuse it. Re-run ci/release.ps1 and re-sign the manifest."
+                                    );
+                                }
+                            }
+                            Err(_) => println!(
+                                "\n{} is not here to check - hash it wherever it is:\n  certutil -hashfile <the zip> SHA256",
+                                archive.display()
+                            ),
+                        }
+                    }
+                    Err(e) => println!(
+                        "\nWARNING: the signature is good but the manifest does not parse: {e}"
+                    ),
+                }
+            }
+            Err(e) => {
+                println!("SIGNATURE REJECTED - {e}");
+                println!("\nAero would refuse this update. Do not publish it.");
+            }
+        }
+        return;
+    }
+
     // Headless THP diagnostic: `aero thp-probe` opens a plugged-in 2025+ Trezor (Trezor-Host
     // Protocol), allocates a channel, and prints the device model + supported pairing methods. This
     // is the first hardware-testable milestone of THP support (no crypto/pairing yet).

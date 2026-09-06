@@ -164,7 +164,16 @@ private:
     // XMR1 has left - at that point the order is the only record the user has of where it went.
     QString m_redeemOrderId;
     QString m_redeemSessionId;
+    QString m_redeemDestination;
     QTimer *m_redeemPoll = nullptr;
+
+    // A redemption outlives the window it was started from: the XMR1 has already gone to Wagyu and
+    // only the order id and session id can ask what became of it. Keeping them in memory alone meant
+    // closing Aero threw away the only handle the user had.
+    void rememberRedemption();
+    void forgetRedemption();
+    void restoreRedemption();
+    void startRedeemPoll();
 };
 
 #endif // AERO_XMR_TRADE_TAB_H

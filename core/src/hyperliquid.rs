@@ -189,15 +189,19 @@ pub async fn book(provider: &RpcProvider, coin: &str) -> Result<Book> {
     let Some(levels) = v.get("levels").and_then(|l| l.as_array()).cloned() else {
         return Err(CoreError::rpc(format!("hyperliquid book: unexpected reply {v}")));
     };
-    let side = |i: usize| -> Vec<Level> {
-        levels
+    // The same reasoning applies one level down: a side that fails to parse is not a side with
+    // nothing on it. Letting it fall back to an empty vector reintroduced exactly the problem the
+    // check above avoids, on one half of the book instead of both.
+    let side = |i: usize| -> Result<Vec<Level>> {
+        let raw = levels
             .get(i)
-            .and_then(|s| serde_json::from_value(s.clone()).ok())
-            .unwrap_or_default()
+            .ok_or_else(|| CoreError::rpc("hyperliquid book: a side is missing".to_string()))?;
+        serde_json::from_value(raw.clone())
+            .map_err(|e| CoreError::rpc(format!("hyperliquid book: unreadable side: {e}")))
     };
     Ok(Book {
-        bids: side(0),
-        asks: side(1),
+        bids: side(0)?,
+        asks: side(1)?,
         time: v.get("time").and_then(|t| t.as_u64()).unwrap_or(0),
     })
 }
@@ -786,16 +790,46 @@ fn digest(domain: B256, struct_hash: B256) -> B256 {
 
 /// Nonces are millisecond timestamps, and the exchange rejects one it has seen or one too far from
 /// its own clock.
+///
+/// A bare clock reading is not enough on its own. Two actions signed inside the same millisecond
+/// get the same nonce and the exchange refuses the second, which in practice means a cancel and a
+/// replace sent together, or a second order placed quickly, fails for a reason that looks like
+/// nothing the user did. A clock that steps backwards over NTP causes the same thing for longer.
+/// So the value only ever moves forward: take the clock when it is ahead, otherwise step one past
+/// whatever was last handed out.
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let clock = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let mut prev = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = clock.max(prev + 1);
+        match LAST.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(seen) => prev = seen,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hyperliquid remembers recent nonces and refuses a repeat, so two actions signed in the same
+    /// millisecond used to lose one of them - a cancel-and-replace, or a second order placed
+    /// quickly, failing for a reason the user had no way to connect to anything they did.
+    #[test]
+    fn nonces_never_repeat_or_go_backwards() {
+        let mut prev = now_ms();
+        for _ in 0..10_000 {
+            let n = now_ms();
+            assert!(n > prev, "nonce {n} did not advance past {prev}");
+            prev = n;
+        }
+    }
 
     /// A market fixture. Only the ordering fields matter to these tests; the transfer fields are
     /// filled with XMR1's real values so nothing here depends on placeholders.

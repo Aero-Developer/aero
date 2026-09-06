@@ -79,6 +79,17 @@ every network here and needs no new build.
 - **Networking** is Tor-only. The Rust core refuses a remote RPC endpoint unless a SOCKS proxy is
   set (localhost/your-own-node is exempt), so a misconfiguration cannot leak your IP. Endpoints are
   rotated so no single server sees all of your queries.
+- **Circuits** are separated by what they reveal and retired on a timer. Wallet traffic, market and
+  exchange traffic, block-explorer history and NFT images each leave through different Tor exits,
+  and each broadcast goes out over a circuit built for that one transaction and then abandoned, so
+  the node handed your transaction is not the one that just asked after your balances. History is
+  read per address over that address's own circuit, so no single exit collects the list of addresses
+  belonging to one wallet.
+- **Aero does not tell servers it is Aero.** Requests carry Tor Browser's user agent, identical on
+  every platform, so the traffic blends into the network's largest crowd instead of naming the
+  wallet, its version and its operating system to every endpoint it touches.
+- **Links to block explorers** open in your normal browser, which is not Tor. Aero says so before
+  opening one and offers to copy the link instead, for pasting into Tor Browser.
 - **Pricing** uses the on-chain Chainlink feed on mainnet (trustless) and CoinGecko over Tor
   elsewhere. **History** uses keyless Blockscout APIs over Tor.
 - **No telemetry, no accounts, no update pings.** For zero metadata leakage, point Aero at your

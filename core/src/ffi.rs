@@ -1830,6 +1830,163 @@ pub extern "C" fn aero_wallet_fetch_image(w: *mut Wallet, url: *const c_char) ->
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// Signed updates (see update.rs)
+// -------------------------------------------------------------------------------------------------
+//
+// Four steps, kept separate so the UI can put a decision between any two of them. The one that
+// matters is between check and download: nothing is fetched, written or installed until the user has
+// seen what the signed manifest says and agreed to it.
+
+/// The fingerprint of the key that must sign an update, for display. Caller frees.
+#[no_mangle]
+pub extern "C" fn aero_update_key_fingerprint() -> *mut c_char {
+    to_cstr(&crate::pgp::release_fingerprint_display())
+}
+
+/// Look for a newer signed release. `current` is this build's version, `socks` the Tor proxy (may be
+/// NULL to go direct). Returns the update status as JSON, or NULL with [`aero_last_error`] set.
+///
+/// An error here always means "could not establish that an update is genuine", never "no update".
+/// A NULL return must not be shown to the user as "you are up to date".
+#[no_mangle]
+pub extern "C" fn aero_update_check(current: *const c_char, socks: *const c_char) -> *mut c_char {
+    clear_error();
+    let Some(current) = from_cstr(current) else {
+        set_error("null version");
+        return ptr::null_mut();
+    };
+    let socks = from_cstr(socks);
+    match RUNTIME.block_on(crate::update::check(&current, socks.as_deref())) {
+        Ok(status) => match serde_json::to_string(&status) {
+            Ok(json) => to_cstr(&json),
+            Err(e) => {
+                set_error(e.to_string());
+                ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Download the archive described by a status JSON from [`aero_update_check`] and check it against
+/// the hash the signed manifest gave. Returns the archive path, or NULL on failure.
+///
+/// The status must be the one this core produced; it is re-parsed rather than trusted as a handle,
+/// and the download is rejected unless its length and hash match what it says.
+#[no_mangle]
+pub extern "C" fn aero_update_download(
+    status_json: *const c_char,
+    app_dir: *const c_char,
+    socks: *const c_char,
+) -> *mut c_char {
+    clear_error();
+    let (Some(status_json), Some(app_dir)) = (from_cstr(status_json), from_cstr(app_dir)) else {
+        set_error("null argument");
+        return ptr::null_mut();
+    };
+    let status: crate::update::UpdateStatus = match serde_json::from_str(&status_json) {
+        Ok(s) => s,
+        Err(e) => {
+            set_error(format!("bad update status: {e}"));
+            return ptr::null_mut();
+        }
+    };
+    let socks = from_cstr(socks);
+    match RUNTIME.block_on(crate::update::download(
+        &status,
+        std::path::Path::new(&app_dir),
+        socks.as_deref(),
+    )) {
+        Ok(path) => to_cstr(&path.to_string_lossy()),
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Bytes downloaded so far, and the total expected. Lock-free; poll from the UI thread.
+#[no_mangle]
+pub extern "C" fn aero_update_downloaded() -> u64 {
+    crate::update::DOWNLOADED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[no_mangle]
+pub extern "C" fn aero_update_download_total() -> u64 {
+    crate::update::DOWNLOAD_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Abandon a download in flight. Safe to call at any time, from any thread.
+///
+/// [`aero_update_download`] then fails with a message [`aero_update_was_cancelled`] recognises, so a
+/// pressed Cancel button is not reported back to the user as a fault.
+#[no_mangle]
+pub extern "C" fn aero_update_cancel() {
+    crate::update::cancel();
+}
+
+/// Whether a message from [`aero_last_error`] describes a cancelled download rather than a failure.
+#[no_mangle]
+pub extern "C" fn aero_update_was_cancelled(message: *const c_char) -> c_int {
+    let Some(m) = from_cstr(message) else { return 0 };
+    c_int::from(crate::update::was_cancelled(&m))
+}
+
+/// Unpack a downloaded archive into the staging folder. Returns 0 on success, -1 on failure.
+///
+/// Nothing in the application folder is changed by this: staging exists so that a bad archive is
+/// discovered while it is still off to one side.
+#[no_mangle]
+pub extern "C" fn aero_update_stage(archive: *const c_char, app_dir: *const c_char) -> c_int {
+    clear_error();
+    let (Some(archive), Some(app_dir)) = (from_cstr(archive), from_cstr(app_dir)) else {
+        set_error("null argument");
+        return -1;
+    };
+    match crate::update::stage(
+        std::path::Path::new(&archive),
+        std::path::Path::new(&app_dir),
+    ) {
+        Ok(_) => 0,
+        Err(e) => {
+            set_error(e.to_string());
+            -1
+        }
+    }
+}
+
+/// Install the staged update. Returns the number of files replaced, or -1 on failure.
+///
+/// On failure nothing has changed: the install undoes itself rather than leaving a folder that is
+/// half one version and half another.
+#[no_mangle]
+pub extern "C" fn aero_update_apply(app_dir: *const c_char) -> c_int {
+    clear_error();
+    let Some(app_dir) = from_cstr(app_dir) else {
+        set_error("null app dir");
+        return -1;
+    };
+    match crate::update::apply(std::path::Path::new(&app_dir)) {
+        Ok(n) => n as c_int,
+        Err(e) => {
+            set_error(e.to_string());
+            -1
+        }
+    }
+}
+
+/// Delete what the previous update displaced. Call once at startup; does nothing if there is none.
+#[no_mangle]
+pub extern "C" fn aero_update_sweep(app_dir: *const c_char) {
+    if let Some(app_dir) = from_cstr(app_dir) {
+        crate::update::sweep(std::path::Path::new(&app_dir));
+    }
+}
+
 // ---------------- utilities ----------------
 
 /// Convert a human decimal string to base units (returns decimal string). Caller frees.

@@ -156,8 +156,15 @@ pub async fn create_withdrawal(provider: &RpcProvider, monero_address: &str) -> 
     }
     // Paying out to the wrong address is the one unrecoverable mistake here, so confirm Wagyu
     // recorded the destination we asked for instead of assuming.
-    if let Some(dest) = v.get("destination").and_then(|x| x.as_str()) {
-        if dest != address {
+    //
+    // The request field is `toAddress` and the reply has been seen to echo it under either name, so
+    // check whichever one came back. Looking for a single spelling meant a reply that used the other
+    // skipped the check entirely and the XMR1 went out unchecked.
+    let echoed = ["destination", "toAddress", "to_address", "destinationAddress"]
+        .iter()
+        .find_map(|k| v.get(*k).and_then(|x| x.as_str()));
+    if let Some(dest) = echoed {
+        if dest.trim() != address {
             return Err(CoreError::rpc(
                 "Wagyu recorded a different payout address than the one given - not proceeding"
                     .to_string(),
@@ -181,11 +188,56 @@ pub async fn order_status(
         .await
 }
 
-/// Reject anything that is not plausibly a Monero address before it reaches Wagyu.
+/// Monero's Base58 alphabet. Not Bitcoin's: same 58 characters, but Monero encodes in fixed-size
+/// blocks rather than as one big number.
+const B58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+/// How many characters a block of 0..=8 bytes encodes to. A full 8-byte block is 11 characters; the
+/// trailing partial block uses the shorter entries, and any other length is not valid Monero Base58.
+const BLOCK_CHARS: [usize; 9] = [0, 2, 3, 5, 6, 7, 9, 10, 11];
+
+/// Decode one Monero Base58 block onto `out`.
+fn decode_block(chunk: &[u8], out: &mut Vec<u8>) -> Option<()> {
+    let bytes = BLOCK_CHARS.iter().position(|&n| n == chunk.len())?;
+    let mut num: u64 = 0;
+    for c in chunk {
+        let digit = B58.iter().position(|a| a == c)? as u64;
+        num = num.checked_mul(58)?.checked_add(digit)?;
+    }
+    // A block that overflows the byte count it claims is not a block this encoder could produce.
+    if bytes < 8 && num >= 1u64 << (8 * bytes) {
+        return None;
+    }
+    out.extend_from_slice(&num.to_be_bytes()[8 - bytes..]);
+    Some(())
+}
+
+/// Decode a whole Monero Base58 string, or `None` if it is not one.
+fn base58_decode(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len() * 8 / 11 + 1);
+    let full = b.len() / 11;
+    for i in 0..full {
+        decode_block(&b[i * 11..(i + 1) * 11], &mut out)?;
+    }
+    if b.len() % 11 != 0 {
+        decode_block(&b[full * 11..], &mut out)?;
+    }
+    Some(out)
+}
+
+/// Reject anything that is not a valid Monero mainnet address before it reaches Wagyu.
 ///
-/// A payout address cannot be corrected once an order is created, and Monero has no recovery path,
-/// so the cheap structural checks are worth doing locally: right prefix, right length, and the
-/// Base58 alphabet Monero uses (which excludes `0`, `I`, `O` and `l` to avoid look-alikes).
+/// This is the last check standing between a mistyped address and an irreversible payout, so it
+/// verifies the address rather than merely eyeballing it: decode the Base58, check the network byte
+/// says mainnet, and check the four-byte checksum Monero appends for exactly this purpose. The
+/// checksum is what catches the realistic mistake, a character or two wrong in the middle of an
+/// otherwise well-formed address, which every structural test in the world will happily wave
+/// through.
+///
+/// Monero's checksum is the first four bytes of Keccak-256 over everything preceding it. That is the
+/// original Keccak, the same one Ethereum uses, so `keccak256` here is the right function and not a
+/// near-miss for SHA-3.
 fn validate_monero_address(address: &str) -> Result<()> {
     // Standard addresses start with 4, subaddresses with 8; integrated addresses are longer.
     let plausible_prefix = address.starts_with('4') || address.starts_with('8');
@@ -197,13 +249,39 @@ fn validate_monero_address(address: &str) -> Result<()> {
                 .to_string(),
         ));
     }
-    const ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    if let Some(bad) = address.chars().find(|c| !ALPHABET.contains(*c)) {
+    if let Some(bad) = address.bytes().find(|c| !B58.contains(c)) {
         return Err(CoreError::Amount(format!(
-            "that Monero address contains '{bad}', which cannot appear in one"
+            "that Monero address contains '{}', which cannot appear in one",
+            bad as char
         )));
     }
-    Ok(())
+    let raw = base58_decode(address).ok_or_else(|| {
+        CoreError::Amount("that Monero address is not valid - check it and paste it again".to_string())
+    })?;
+    // network byte + spend key + view key + checksum, plus a payment id when integrated.
+    if raw.len() < 5 {
+        return Err(CoreError::Amount(
+            "that Monero address is too short to be one".to_string(),
+        ));
+    }
+    let (body, checksum) = raw.split_at(raw.len() - 4);
+    if alloy::primitives::keccak256(body)[..4] != *checksum {
+        return Err(CoreError::Amount(
+            "that Monero address fails its own checksum, so at least one character is wrong. \
+             Paste it again rather than retyping it - Monero payouts cannot be reversed."
+                .to_string(),
+        ));
+    }
+    // 18 standard, 19 integrated, 42 subaddress - all mainnet. Testnet and stagenet addresses look
+    // identical to a human and would send the payout somewhere it can never be spent.
+    match body.first() {
+        Some(18) | Some(19) | Some(42) => Ok(()),
+        _ => Err(CoreError::Amount(
+            "that is not a Monero mainnet address - it looks like a testnet or stagenet one, and \
+             a payout to it would be unspendable"
+                .to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -237,5 +315,39 @@ mod tests {
         assert!(validate_monero_address(&bad).is_err());
         // Truncated by a bad copy-paste.
         assert!(validate_monero_address("888tNkZrPN6JsEgekjMnABU4TBzc2Dt29EPAvkRxbANs").is_err());
+    }
+
+    /// The mistake that actually costs someone their Monero: an address of exactly the right shape,
+    /// in the right alphabet, with one character wrong. Nothing but the checksum catches this.
+    #[test]
+    fn a_single_wrong_character_is_caught() {
+        const GOOD: &str =
+            "888tNkZrPN6JsEgekjMnABU4TBzc2Dt29EPAvkRxbANsAnjyPbb3iQ1YBRk1UXcdRsiKc9dhwMVgN5S9cQUiyoogDavup3H";
+        assert!(validate_monero_address(GOOD).is_ok());
+
+        // Change one character at a time, right through the address, and require every single one
+        // to be refused.
+        for i in 1..GOOD.len() {
+            let mut typo = GOOD.to_string();
+            let orig = GOOD.as_bytes()[i];
+            let swap = if orig == b'A' { b'B' } else { b'A' };
+            typo.replace_range(i..i + 1, &(swap as char).to_string());
+            assert!(
+                validate_monero_address(&typo).is_err(),
+                "a typo at position {i} was accepted: {typo}"
+            );
+        }
+    }
+
+    /// Two characters transposed - the other classic transcription error.
+    #[test]
+    fn transposed_characters_are_caught() {
+        const GOOD: &str =
+            "888tNkZrPN6JsEgekjMnABU4TBzc2Dt29EPAvkRxbANsAnjyPbb3iQ1YBRk1UXcdRsiKc9dhwMVgN5S9cQUiyoogDavup3H";
+        let b = GOOD.as_bytes();
+        let mut swapped = b.to_vec();
+        swapped.swap(40, 41);
+        assert_ne!(swapped, b.to_vec(), "pick a pair that actually differs");
+        assert!(validate_monero_address(std::str::from_utf8(&swapped).unwrap()).is_err());
     }
 }

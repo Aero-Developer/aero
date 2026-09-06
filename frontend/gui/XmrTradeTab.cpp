@@ -233,6 +233,10 @@ void XmrTradeTab::setWallet(Wallet *wallet, quint32 account, const QString &addr
     connect(m_wallet, &Wallet::xmrRedeemed, this, &XmrTradeTab::onRedeemed);
     connect(m_wallet, &Wallet::xmrRedeemStatusReady, this, &XmrTradeTab::onRedeemStatus);
 
+    // A redemption from a previous run of Aero is still out there if it never reached a final state.
+    if (m_redeemOrderId.isEmpty())
+        restoreRedemption();
+
     if (isVisible())
         startPolling();
 }
@@ -1441,9 +1445,18 @@ void XmrTradeTab::onOrderPlaced(const QString &json, const QString &error) {
     } else if (state == QLatin1String("resting")) {
         m_status->setText(tr("Order resting on the book."));
         m_size->clear();
-    } else {
+    } else if (state == QLatin1String("none")) {
         // An IOC that crossed nothing is cancelled rather than rejected - no error, but no trade.
         m_status->setText(tr("Nothing filled at that price, so the order was cancelled."));
+    } else {
+        // The exchange took the order but answered in a shape this build does not recognise. Saying
+        // "nothing filled" would invite a second order on top of one that may be live, so point the
+        // user at the lists below, which are about to refresh with the truth.
+        m_status->setText(
+            QStringLiteral("<span style='color:%1'>%2</span>")
+                .arg(QString::fromLatin1(kDown),
+                     tr("The exchange accepted the order but did not say what happened to it. "
+                        "Check Open orders and Fills below before placing it again.")));
     }
     refresh(true);
     // And once more shortly after. The exchange acknowledges an order before it necessarily shows up
@@ -1727,13 +1740,23 @@ void XmrTradeTab::onRedeemed(const QJsonObject &order, const QString &error) {
 
     m_redeemOrderId = order.value(QStringLiteral("order_id")).toString();
     m_redeemSessionId = order.value(QStringLiteral("session_id")).toString();
+    m_redeemDestination = order.value(QStringLiteral("destination")).toString();
+    // Write it down before anything else can go wrong. The XMR1 has left by now.
+    rememberRedemption();
     m_status->setText(tr("Redemption %1 sent. About %2 XMR is on its way, and redemptions usually "
                          "settle in under two minutes.")
                           .arg(m_redeemOrderId)
                           .arg(order.value(QStringLiteral("expected")).toDouble(), 0, 'f', 8));
 
-    // Keep asking after the money has left, since from here the order id is the only handle the
-    // user has on it. Runs regardless of which tab is showing, unlike the book poll.
+    startRedeemPoll();
+    refresh(true);
+}
+
+// Keep asking after the money has left, since from here the order id is the only handle the user has
+// on it. Runs regardless of which tab is showing, unlike the book poll.
+void XmrTradeTab::startRedeemPoll() {
+    if (m_redeemOrderId.isEmpty())
+        return;
     if (!m_redeemPoll) {
         m_redeemPoll = new QTimer(this);
         m_redeemPoll->setInterval(10000);
@@ -1743,7 +1766,44 @@ void XmrTradeTab::onRedeemed(const QJsonObject &order, const QString &error) {
         });
     }
     m_redeemPoll->start();
-    refresh(true);
+    if (m_wallet)
+        m_wallet->xmrRedeemStatus(m_redeemOrderId, m_redeemSessionId);
+}
+
+void XmrTradeTab::rememberRedemption() {
+    QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+    s.setValue(QStringLiteral("xmr/redeem/orderId"), m_redeemOrderId);
+    s.setValue(QStringLiteral("xmr/redeem/sessionId"), m_redeemSessionId);
+    s.setValue(QStringLiteral("xmr/redeem/destination"), m_redeemDestination);
+    s.setValue(QStringLiteral("xmr/redeem/startedAt"),
+               QDateTime::currentDateTime().toString(Qt::ISODate));
+}
+
+void XmrTradeTab::forgetRedemption() {
+    QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+    s.remove(QStringLiteral("xmr/redeem"));
+}
+
+// Pick a redemption back up after a restart, so a user who closed Aero (or crashed) while Monero was
+// in flight still has the order id, the session id, and a live status rather than nothing at all.
+void XmrTradeTab::restoreRedemption() {
+    QSettings s(QStringLiteral("Aero"), QStringLiteral("Aero"));
+    const QString id = s.value(QStringLiteral("xmr/redeem/orderId")).toString();
+    if (id.isEmpty())
+        return;
+    // Wagyu's orders do not stay queryable forever; stop carrying one around after a day.
+    const QDateTime started =
+        QDateTime::fromString(s.value(QStringLiteral("xmr/redeem/startedAt")).toString(),
+                              Qt::ISODate);
+    if (started.isValid() && started.daysTo(QDateTime::currentDateTime()) >= 1) {
+        forgetRedemption();
+        return;
+    }
+    m_redeemOrderId = id;
+    m_redeemSessionId = s.value(QStringLiteral("xmr/redeem/sessionId")).toString();
+    m_redeemDestination = s.value(QStringLiteral("xmr/redeem/destination")).toString();
+    m_status->setText(tr("Picking up redemption %1 from your last session…").arg(m_redeemOrderId));
+    startRedeemPoll();
 }
 
 void XmrTradeTab::onRedeemStatus(const QJsonObject &status, const QString &error) {
@@ -1761,15 +1821,20 @@ void XmrTradeTab::onRedeemStatus(const QJsonObject &status, const QString &error
                                        .arg(m_redeemOrderId)));
         m_redeemOrderId.clear();
         m_redeemSessionId.clear();
+        m_redeemDestination.clear();
+        forgetRedemption();
         return;
     }
     if (state == QLatin1String("failed") || state == QLatin1String("expired")) {
         m_redeemPoll->stop();
+        // Deliberately kept on disk: the XMR1 has already been sent, so these two ids are what any
+        // conversation with Wagyu about recovering it will need, and they must survive a restart.
         m_status->setText(
             QStringLiteral("<span style='color:%1'>%2</span>")
                 .arg(QString::fromLatin1(kDown),
-                     tr("Redemption %1 %2. Contact Wagyu quoting that order id.")
-                         .arg(m_redeemOrderId, state)));
+                     tr("Redemption %1 %2. Contact Wagyu quoting that order id and session id %3. "
+                        "Aero has saved both and will still have them if you close it.")
+                         .arg(m_redeemOrderId, state, m_redeemSessionId)));
         return;
     }
     m_status->setText(tr("Redemption %1: %2…").arg(m_redeemOrderId, state));

@@ -1,19 +1,22 @@
 // Windows resources for aero_gui.exe: icon, application manifest, and a full version-info block.
+// Generated from appicon.rc.in by CMake so the version here is always the version that was built -
+// a binary claiming a version no release ever had is a file no reputation lookup can place.
+//
 // A legitimate app always carries publisher/version metadata and a manifest; their ABSENCE is one of
 // the signals machine-learning AV heuristics (e.g. Microsoft Defender "Trojan:Win32/Bearfoos.A!ml")
-// use to false-positive an unsigned binary. Adding them — plus code-signing the release — is what
+// use to false-positive an unsigned binary. Adding them - plus code-signing the release - is what
 // removes those heuristic flags.
 #include <windows.h>
 
-IDI_ICON1 ICON "assets/images/appicons/appicon.ico"
+IDI_ICON1 ICON "@AERO_RC_DIR@/assets/images/appicons/appicon.ico"
 
-// Application manifest: run as the invoking user (never request elevation — a common malware trait),
+// Application manifest: run as the invoking user (never request elevation - a common malware trait),
 // and declare Windows 10/11 support.
-1 RT_MANIFEST "aero.manifest"
+1 RT_MANIFEST "@AERO_RC_DIR@/aero.manifest"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION @AERO_VERSION_MAJOR@,@AERO_VERSION_MINOR@,@AERO_VERSION_PATCH@,0
+ PRODUCTVERSION @AERO_VERSION_MAJOR@,@AERO_VERSION_MINOR@,@AERO_VERSION_PATCH@,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS VOS_NT_WINDOWS32
@@ -26,12 +29,13 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Aero Wallet"
             VALUE "FileDescription", "Aero - private Ethereum wallet (Tor-routed)"
-            VALUE "FileVersion", "1.0.0.0"
+            VALUE "FileVersion", "@AERO_VERSION@.0"
             VALUE "InternalName", "aero_gui"
             VALUE "LegalCopyright", "Aero Wallet - BSD-3-Clause. Open source."
             VALUE "OriginalFilename", "aero_gui.exe"
             VALUE "ProductName", "Aero Wallet"
-            VALUE "ProductVersion", "1.0.0.0"
+            VALUE "ProductVersion", "@AERO_VERSION@.0"
+            VALUE "Comments", "Open source: https://github.com/@AERO_REPO@"
         END
     END
     BLOCK "VarFileInfo"
