@@ -507,6 +507,7 @@ void Wallet::connectProvider(quint64 chainId, const QStringList &endpoints, cons
 
 void Wallet::fetchAvailable(quint32 index, const QString &token) {
     QtConcurrent::run(&m_netPool, [this, index, token]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
         BalanceInfo b;
         char *j = token.isEmpty()
@@ -523,6 +524,7 @@ void Wallet::fetchAvailable(quint32 index, const QString &token) {
 void Wallet::refreshAllBalances(quint32 numAccounts, const QString &extraTokensJson) {
     if (numAccounts == 0) numAccounts = 1;
     QtConcurrent::run(&m_netPool, [this, numAccounts, extraTokensJson]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QString json;
         {
             QReadLocker lock(&m_coreLock);
@@ -565,6 +567,7 @@ void Wallet::refreshAllBalances(quint32 numAccounts, const QString &extraTokensJ
 void Wallet::refresh(quint32 accountIndex) {
     // Network I/O runs off the UI thread; results are marshalled back via queued signals.
     QtConcurrent::run(&m_netPool, [this, accountIndex]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
         BalanceInfo eth;
         QVector<BalanceInfo> tokenBalances;
@@ -592,6 +595,7 @@ void Wallet::refresh(quint32 accountIndex) {
 
 void Wallet::refreshAccountBalance(quint32 accountIndex) {
     QtConcurrent::run(&m_netPool, [this, accountIndex]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
         BalanceInfo eth;
         char *ethJson = aero_wallet_eth_balance(m_core, accountIndex);
@@ -605,6 +609,7 @@ void Wallet::refreshAccountBalance(quint32 accountIndex) {
 
 void Wallet::refreshEthUsdPrice() {
     QtConcurrent::run(&m_netPool, [this]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
         char *j = aero_wallet_eth_usd_price(m_core);
         double price = 0.0;
@@ -620,6 +625,7 @@ void Wallet::refreshEthUsdPrice() {
 
 void Wallet::refreshMarketPrices() {
     QtConcurrent::run(&m_netPool, [this]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
         double xmrUsd = 0, xmrChg = 0, ethUsd = 0, ethChg = 0;
         char *j = aero_wallet_market_prices(m_core);
@@ -638,6 +644,7 @@ void Wallet::refreshMarketPrices() {
 
 void Wallet::refreshBlockNumber() {
     QtConcurrent::run(&m_netPool, [this]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
         const quint64 n = aero_wallet_block_number(m_core);
         QMetaObject::invokeMethod(this, [this, n]() { emit blockNumberUpdated(n); },
@@ -647,6 +654,7 @@ void Wallet::refreshBlockNumber() {
 
 void Wallet::txReceipt(const QString &txHash) {
     QtConcurrent::run(&m_netPool, [this, txHash]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         bool mined = false, success = false;
         {
             QReadLocker lock(&m_coreLock);
@@ -932,6 +940,7 @@ void Wallet::scanFundedMulti(const QString &configsJson, quint32 gapLimit) {
 
 void Wallet::checkTokenLiquidity(const QString &tokenAddress) {
     QtConcurrent::run(&m_netPool, [this, tokenAddress]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
         double usd = 0.0;
         char *j = aero_wallet_token_liquidity_usd(m_core, tokenAddress.toUtf8().constData());
@@ -948,6 +957,7 @@ void Wallet::checkTokenLiquidity(const QString &tokenAddress) {
 
 void Wallet::refreshNfts(quint32 accountIndex) {
     QtConcurrent::run(&m_netPool, [this, accountIndex]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
         QVector<NftCollection> out;
         char *j = aero_wallet_account_nfts(m_core, accountIndex);
@@ -973,6 +983,7 @@ void Wallet::refreshNfts(quint32 accountIndex) {
 
 void Wallet::fetchImage(const QString &url) {
     QtConcurrent::run(&m_netPool, [this, url]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
         QByteArray data;
         char *j = aero_wallet_fetch_image(m_core, url.toUtf8().constData());
@@ -985,6 +996,7 @@ void Wallet::fetchImage(const QString &url) {
 
 void Wallet::resolveTokenMeta(const QString &address) {
     QtConcurrent::run(&m_netPool, [this, address]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
         QString symbol;
         quint8 decimals = 18;
@@ -1002,6 +1014,7 @@ void Wallet::resolveTokenMeta(const QString &address) {
 
 void Wallet::refreshFiatRate(const QString &currency) {
     QtConcurrent::run(&m_netPool, [this, currency]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
         double rate = 1.0;
         char *j = aero_wallet_fiat_per_usd(m_core, currency.toUtf8().constData());
@@ -1613,6 +1626,7 @@ void Wallet::acrossAssets() {
 
 void Wallet::hlOverview(quint32 index) {
     QtConcurrent::run(&m_netPool, [this, index]() {
+        yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
         char *res = aero_wallet_hl_overview(m_core, index);
         QString json, err;
