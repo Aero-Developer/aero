@@ -789,7 +789,8 @@ char *aero_wallet_hl_place_order(AeroWallet *w,
                                  bool is_buy,
                                  double price,
                                  double size,
-                                 bool market_order);
+                                 bool market_order,
+                                 bool post_only);
 
 /**
  * Cancel a resting XMR1 order by its exchange order id. Caller frees the string.

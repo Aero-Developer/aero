@@ -737,6 +737,15 @@ void AeroMainWindow::setupTabs() {
                 });
     }
 
+    // "Payment received" notifications are driven off History, not raw balance increases: History has
+    // already run the spam filter, so a dust, zero-value or look-alike poisoning transfer that it
+    // hides can never reach a notification. Fired only for genuinely new arrivals (see noteIncoming).
+    connect(m_historyModel, &HistoryModel::incomingPayment, this,
+            [this](quint32 account, const QString &formatted, const QString &symbol) {
+                notify(tr("Payment received"),
+                       tr("+%1 %2 to %3").arg(grouped(formatted), symbol, accountName(account)));
+            });
+
     // History account filter: "All accounts" or a single account, placed at the left of the
     // search bar (Feather shows a similar account filter above the history view).
     m_historyCombo = new SearchableComboBox(histUi.frame_search); // searchable for many-account wallets
@@ -6058,15 +6067,11 @@ void AeroMainWindow::onAvailableBalance(quint32 index, const QString &token,
             m_balancesChanged = true;
             m_dirtyHistory.insert(index);
         }
-        // Notify on an incoming token payment - but ONLY for verified/tracked tokens. Random airdropped
-        // spam tokens (the bulk of unsolicited transfers) aren't in the trusted set, so they no longer
-        // pop a "Payment received" notification.
-        if (oldBal >= 0.0 && newBal > oldBal + 1e-9 && !m_balancesFromCache &&
-            verifiedTokenAddresses().contains(token.toLower()))
-            notify(tr("Payment received"),
-                   tr("+%1 %2 to Account #%3")
-                       .arg(grouped(QString::number(newBal - oldBal, 'f', 6)), symbol)
-                       .arg(index));
+        // No "Payment received" notification here: it now hangs off HistoryModel::incomingPayment,
+        // which fires only for transfers the spam filter kept. Driving it from a raw balance increase
+        // could not see the sender, so a look-alike poisoning transfer of a verified token would slip
+        // past even the dust check. The balance change still marks history dirty (above), so the row
+        // is fetched, classified, and - if genuine - announced from there.
         if (index == m_account) {
             showCachedBalance(m_account); // token totals changed -> update the status balance too
             updateReceive();              // refresh the token breakdown for the shown address
@@ -6383,25 +6388,10 @@ void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, c
     // refetch just this account. If it matches, we keep the cached history with zero requests.
     if (m_histStatus.contains(index) && qAbs(newBal - m_histStatus.value(index)) > 1e-9)
         m_dirtyHistory.insert(index);
-    // A balance increase means an incoming payment (our own sends decrease it) - but not when the
-    // baseline was just loaded from the stale on-disk cache, and not right after we sent from this
-    // account (the optimistic drop reverts upward until the tx mines - that's not a real payment).
-    const bool recentlySentHere =
-        index == m_lastSendFrom && (QDateTime::currentMSecsSinceEpoch() - m_lastSendMs) < 120000;
-    // Suppress dust: address-poisoning attacks send ~0 ETH (they show as "0.0000") to plant a
-    // lookalike address in your history. Only notify when the received amount clears the same dust
-    // threshold the History filter uses (default $0.005). When no native price is known yet, fall
-    // back to a tiny ETH floor so a genuine dust attack still can't pop a notification.
-    const double received = newBal - oldBal;
-    const double dustUsd = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
-                               .value(QStringLiteral("history/dustUsd"), 0.005).toDouble();
-    const bool aboveDust = (m_nativeUsd > 0.0) ? (received * m_nativeUsd >= dustUsd)
-                                               : (received >= 1e-5);
-    if (oldBal >= 0.0 && received > 1e-12 && !m_balancesFromCache && !recentlySentHere && aboveDust)
-        notify(tr("Payment received"),
-               tr("+%1 ETH to Account #%2")
-                   .arg(grouped(QString::number(received, 'f', 6)))
-                   .arg(index));
+    // No "Payment received" notification from the balance delta any more - it is driven by
+    // HistoryModel::incomingPayment, which only fires for a transfer the spam filter kept (so dust
+    // and look-alike poisoning can't announce themselves). The delta above still marks the account
+    // dirty, so the incoming transfer is fetched and, if genuine, announced from History.
     const QString display = tr("%1 %2").arg(formatBalance(formatted), symbol);
     m_accountBalances.insert(index, display);
     if (m_addressModel)
@@ -8729,7 +8719,7 @@ void AeroMainWindow::onTransactionCreated(const PendingEthTx &tx) {
 }
 
 // Watch a just-broadcast tx's receipt and confirm the moment it mines. Polls every 2.5s (a small
-// receipt request each) and stops on confirmation or after ~2.5 min. Much faster + more precise than
+// receipt request each) and stops on confirmation or after ~5 min. Much faster + more precise than
 // fixed timers, and it only runs while a send is unconfirmed.
 void AeroMainWindow::startReceiptWatch(const QString &txHash) {
     if (!m_wallet || txHash.isEmpty())
@@ -8740,9 +8730,9 @@ void AeroMainWindow::startReceiptWatch(const QString &txHash) {
         m_receiptTimer = new QTimer(this);
         m_receiptTimer->setInterval(2500);
         connect(m_receiptTimer, &QTimer::timeout, this, [this]() {
-            if (!m_wallet || m_pendingReceiptHash.isEmpty() || ++m_receiptPolls > 60) {
+            if (!m_wallet || m_pendingReceiptHash.isEmpty() || ++m_receiptPolls > 120) {
                 m_receiptTimer->stop();
-                // Gave up (~2.5 min without a receipt): clear the pending-send state so the pre-mine
+                // Gave up (~5 min without a receipt): clear the pending-send state so the pre-mine
                 // balance clamp goes inert and can't suppress future balance updates for this
                 // account/token forever.
                 m_pendingReceiptHash.clear();
@@ -8770,6 +8760,16 @@ void AeroMainWindow::onTxReceiptReady(const QString &txHash, bool mined, bool su
     if (m_receiptTimer)
         m_receiptTimer->stop();
     updatePollCadence(); // send confirmed - allow the poll to relax again if we're idle
+    // Settle the optimistic pending row on the receipt itself, so it stops saying "pending" within
+    // seconds of mining instead of waiting for the explorer to index the transaction (which can lag
+    // several minutes). The forced history refetch below still replaces it with the authoritative
+    // mined row once that lands.
+    if (m_historyModel)
+        m_historyModel->confirmLocalSend(txHash, !success);
+    // A router (on-chain) swap is optimistically pending too, and it is atomic: the receipt is the
+    // whole truth, so settle it here rather than waiting for the explorer to index both legs.
+    if (m_historyModel)
+        m_historyModel->confirmLocalSwap(txHash, !success);
     // Mined: pull the exact post-mine balance now, and refresh the sender's history so the row flips
     // from pending to confirmed (or failed) immediately.
     refreshAllBalances();

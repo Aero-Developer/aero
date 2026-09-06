@@ -1658,10 +1658,12 @@ void Wallet::hlApproveAgent(quint32 index) {
     });
 }
 
-void Wallet::hlPlaceOrder(quint32 index, bool isBuy, double price, double size, bool marketOrder) {
-    QtConcurrent::run(&m_tradePool, [this, index, isBuy, price, size, marketOrder]() {
+void Wallet::hlPlaceOrder(quint32 index, bool isBuy, double price, double size, bool marketOrder,
+                          bool postOnly) {
+    QtConcurrent::run(&m_tradePool, [this, index, isBuy, price, size, marketOrder, postOnly]() {
         QReadLocker lock(&m_coreLock);
-        char *res = aero_wallet_hl_place_order(m_core, index, isBuy, price, size, marketOrder);
+        char *res =
+            aero_wallet_hl_place_order(m_core, index, isBuy, price, size, marketOrder, postOnly);
         QString json, err;
         if (res)
             json = takeString(res);

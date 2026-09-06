@@ -394,7 +394,8 @@ public:
     // Authorise it (one signature with the account key); emits hlAgentApproved(err).
     void hlApproveAgent(quint32 index);
     // Place an order; emits hlOrderPlaced(json,err) with {state,size,price,oid}.
-    void hlPlaceOrder(quint32 index, bool isBuy, double price, double size, bool marketOrder);
+    void hlPlaceOrder(quint32 index, bool isBuy, double price, double size, bool marketOrder,
+                      bool postOnly);
     // Cancel a resting order; emits hlOrderCancelled(err).
     void hlCancelOrder(quint32 index, quint64 oid);
     // Move USDC from Arbitrum onto the exchange; emits hlDeposited(txHash,err).

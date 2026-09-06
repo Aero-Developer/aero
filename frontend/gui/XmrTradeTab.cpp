@@ -3,6 +3,8 @@
 
 #include "ethwallet/Wallet.h"
 
+#include <QApplication>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QDoubleValidator>
 #include <QFontDatabase>
@@ -19,7 +21,6 @@
 #include <QLinearGradient>
 #include <QMessageBox>
 #include <QPushButton>
-#include <QApplication>
 #include <QResizeEvent>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -520,6 +521,18 @@ void XmrTradeTab::buildUi() {
     sizeRow->addWidget(m_maxBtn);
     form->addRow(tr("Amount"), sizeRow);
 
+    // Post-only turns a resting limit from GTC into ALO: it adds liquidity or is rejected, so it
+    // never crosses the book and never pays the taker fee. It has no meaning on a market order, so
+    // it is shown only for limit orders and passed through only then.
+    m_postOnly = new QCheckBox(tr("Post-only (maker)"), ticket);
+    m_postOnly->setCursor(Qt::PointingHandCursor);
+    m_postOnly->setToolTip(tr("Only add liquidity. The order rests on the book and is rejected if it "
+                              "would trade immediately, so it always pays the maker fee rather than "
+                              "the taker fee."));
+    m_postOnly->setStyleSheet(
+        QStringLiteral("color:%1; font-size:11px;").arg(QString::fromLatin1(kMuted)));
+    form->addRow(QString(), m_postOnly);
+
     t->addLayout(form);
 
     m_total = new QLabel(ticket);
@@ -718,6 +731,7 @@ void XmrTradeTab::buildUi() {
         const bool market = i == 1;
         m_price->setEnabled(!market);
         m_price->setPlaceholderText(market ? tr("at the market") : tr("USDC per XMR1"));
+        m_postOnly->setVisible(!market); // add-liquidity-only is meaningless on a market order
         updateTotals();
     });
 }
@@ -814,6 +828,25 @@ double XmrTradeTab::marketCap(bool isBuy, double size) const {
     const Walk w = walk(side, size);
     const double reach = w.worst > 0.0 ? w.worst : best;
     return isBuy ? reach * (1.0 + kMarketSlippage) : reach * (1.0 - kMarketSlippage);
+}
+
+double XmrTradeTab::wirePrice(double price, bool isBuy) const {
+    // Mirrors core/src/hyperliquid.rs::format_price, but rounds in the user's favour instead of to
+    // nearest: a buy limit is floored so it never rests above the price typed, and a sell limit is
+    // ceiled so it never rests below it. Because this lands on the exact tick the exchange accepts,
+    // the core's round-to-nearest is then a no-op, so the string it sends matches this value.
+    if (price <= 0.0)
+        return 0.0;
+    const int magnitude = static_cast<int>(std::floor(std::log10(price)));
+    const int sigDecimals = std::max(0, 4 - magnitude); // at most five significant figures
+    const int decimals = std::min(sigDecimals, m_pxDecimals);
+    const double factor = std::pow(10.0, decimals);
+    const double scaled = price * factor;
+    // A price already on the tick must stay put: the epsilon keeps binary error (164.57 held as
+    // 164.5699999) from being floored a whole tick down, or ceiled one up.
+    const double eps = 1e-9 * std::max(1.0, std::abs(scaled));
+    const double stepped = isBuy ? std::floor(scaled + eps) : std::ceil(scaled - eps);
+    return stepped / factor;
 }
 
 void XmrTradeTab::onAgentReady(bool ready, const QString &error) {
@@ -1344,7 +1377,7 @@ void XmrTradeTab::updateTotals() {
     // exactly the orders where it matters most. A limit order that is already through the book is
     // walked the same way, but only across the levels it is willing to pay for.
     const QVector<Level> &side = isBuy ? m_rawAsks : m_rawBids;
-    const double limit = m_price->text().toDouble();
+    const double limit = market ? 0.0 : wirePrice(m_price->text().toDouble(), isBuy);
     const bool crossing = !market && crosses(isBuy, limit);
     const Walk w = market      ? walk(side, size)
                    : crossing  ? walk(levelsWithin(side, limit, isBuy), size)
@@ -1434,12 +1467,17 @@ void XmrTradeTab::placeOrder() {
     }
     m_size->setText(trimNum(size, m_szDecimals));
 
-    const double price = market ? marketCap(isBuy, size) : m_price->text().toDouble();
+    const double price = market ? marketCap(isBuy, size) : wirePrice(m_price->text().toDouble(), isBuy);
     if (price <= 0.0) {
         m_status->setText(market ? tr("The book is empty, so there is nothing to trade against.")
                                  : tr("Enter a price."));
         return;
     }
+    // Show the exact price the order will carry. The field accepts more precision than the exchange
+    // does, so a typed 164.567 rests at 164.56 on a buy; writing it back keeps the ticket, the
+    // confirmation below, and the order itself all saying the same number.
+    if (!market)
+        m_price->setText(trimNum(price, m_pxDecimals));
 
     // A market order is nothing but a price read off the book, so it is only as good as the book it
     // was read from. If the last poll failed or is still out, every figure in the confirmation below
@@ -1461,6 +1499,22 @@ void XmrTradeTab::placeOrder() {
     // stated in the confirmation.
     const QVector<Level> &side = isBuy ? m_rawAsks : m_rawBids;
     const bool crossing = !market && crosses(isBuy, price);
+    const bool postOnly = !market && m_postOnly->isChecked();
+
+    // A post-only order is rejected by the exchange the moment it would cross, so catch it here where
+    // it can be explained rather than sending it to bounce. The price is already through the book, so
+    // the fix is a price that rests: at or below the ask for a buy, at or above the bid for a sell.
+    if (postOnly && crossing) {
+        const double touch = isBuy ? m_bestAsk : m_bestBid;
+        m_status->setText(
+            isBuy ? tr("Post-only won't cross the book. Set the price at or below the best ask "
+                       "(%1 USDC) so it rests, or clear post-only to take the offer.")
+                        .arg(money(touch, 2))
+                  : tr("Post-only won't cross the book. Set the price at or above the best bid "
+                       "(%1 USDC) so it rests, or clear post-only to hit the bid.")
+                        .arg(money(touch, 2)));
+        return;
+    }
     const Walk w = market      ? walk(side, size)
                    : crossing  ? walk(levelsWithin(side, price, isBuy), size)
                                : Walk{};
@@ -1527,6 +1581,13 @@ void XmrTradeTab::placeOrder() {
                         money(price, 2), money(worstCase, 2));
     }
 
+    // Post-only is only reachable here on an order that rests (the crossing case returned earlier),
+    // so the note explains the one way it differs from a plain limit: it is dropped rather than
+    // filled if the market moves onto it before it lands.
+    if (postOnly)
+        body += tr("\n\nPost-only: if the market moves so this would trade on arrival, it is "
+                   "rejected rather than filled, so it only ever pays the maker fee.");
+
     // A limit price far through the book is a mistyped one far more often than it is a deliberate
     // sweep, and on a book this thin it is not an order that can be cancelled - it is a trade that
     // has already taken every level up to it. So that case gets a warning, not a question, and it
@@ -1558,7 +1619,7 @@ void XmrTradeTab::placeOrder() {
 
     setBusy(true);
     m_status->setText(tr("Sending the order…"));
-    m_wallet->hlPlaceOrder(m_account, isBuy, price, size, market);
+    m_wallet->hlPlaceOrder(m_account, isBuy, price, size, market, postOnly);
 }
 
 void XmrTradeTab::onOrderPlaced(const QString &json, const QString &error) {

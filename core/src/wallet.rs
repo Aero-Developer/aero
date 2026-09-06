@@ -2945,10 +2945,19 @@ impl Wallet {
         price: f64,
         size: f64,
         market_order: bool,
+        post_only: bool,
     ) -> Result<serde_json::Value> {
         let provider = self.provider()?;
         let market = hyperliquid::find_market(provider, hyperliquid::XMR1).await?;
-        let tif = if market_order { hyperliquid::Tif::Ioc } else { hyperliquid::Tif::Gtc };
+        // Market orders take immediately (IOC); a post-only limit adds liquidity or is rejected (ALO);
+        // an ordinary limit rests (GTC). Post-only has no meaning on a market order, so IOC wins.
+        let tif = if market_order {
+            hyperliquid::Tif::Ioc
+        } else if post_only {
+            hyperliquid::Tif::Alo
+        } else {
+            hyperliquid::Tif::Gtc
+        };
         let unsigned = hyperliquid::order_action(&market, is_buy, price, size, tif)?;
         let agent = self.hl_agent_signer(index, 0)?;
         let body = self.hl_sign(&agent, &unsigned)?;
@@ -3744,8 +3753,20 @@ impl Wallet {
         // truncated to the most recent 100.
         for r in txlist {
             let s = |k: &str| r.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let from = s("from").to_lowercase();
             let to = s("to").to_lowercase();
-            let dir = if to == owner { "in" } else { "out" };
+            // Direction from who actually moved the coin. `to == owner` is a receive (self-sends,
+            // where from == to == owner, stay "in" so a zero-value cancel is still filtered as
+            // poisoning downstream); otherwise a send requires the owner to be the sender. If the
+            // owner is neither party the row is a spoofed/log-only entry some explorers attribute to
+            // the address - dropped, so it can't surface as a bogus "Sent 0 ETH" poisoning row.
+            let dir = if to == owner {
+                "in"
+            } else if from == owner {
+                "out"
+            } else {
+                continue;
+            };
             let value = U256::from_str(&s("value")).unwrap_or(U256::ZERO);
             let gas_price = u128::from_str(&s("gasPrice")).unwrap_or(0);
             let gas_used = u128::from_str(&s("gasUsed")).unwrap_or(0);
@@ -3768,8 +3789,20 @@ impl Wallet {
         // ERC20 token transfers - ALL pages.
         for r in tokentx {
             let s = |k: &str| r.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let from = s("from").to_lowercase();
             let to = s("to").to_lowercase();
-            let dir = if to == owner { "in" } else { "out" };
+            // Same rule as the native list: attribute the transfer only when the owner is really the
+            // sender or recipient. A fake `Transfer(from=owner, ...)` still classifies as "out" and is
+            // caught as poisoning downstream (zero-value token, any direction); a `Transfer` where the
+            // owner is neither party - which some explorers return for operators/approvals - is dropped
+            // so it can't render as a spoofed "Sent" row.
+            let dir = if to == owner {
+                "in"
+            } else if from == owner {
+                "out"
+            } else {
+                continue;
+            };
             let decimals: u8 = s("tokenDecimal").parse().unwrap_or(18);
             let value = U256::from_str(&s("value")).unwrap_or(U256::ZERO);
             items.push(HistoryItem {

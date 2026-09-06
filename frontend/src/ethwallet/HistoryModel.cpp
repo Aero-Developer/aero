@@ -607,9 +607,37 @@ QVariant HistoryModel::headerData(int section, Qt::Orientation orientation, int 
 }
 
 void HistoryModel::onHistoryRefreshed(const QVector<HistoryItem> &items) {
+    noteIncoming(items);
     m_fetched = items;
     reindexFetched(); // the old positions describe a list that no longer exists
     rebuildAll();
+}
+
+// See the header: announce only genuinely new, non-hidden incoming transfers, and never the backlog.
+void HistoryModel::noteIncoming(const QVector<HistoryItem> &items) {
+    // Collect the accounts seeing their first delivery here, so an account's whole existing history
+    // seeds silently even though the loop below runs row by row.
+    QSet<quint32> firstTime;
+    for (const HistoryItem &h : items)
+        if (h.account != HistoryItem::unknownAccount && !m_notifyInitialized.contains(h.account))
+            firstTime.insert(h.account);
+    for (const HistoryItem &h : items) {
+        if (h.direction != QLatin1String("in") || h.kind == QLatin1String("swap"))
+            continue; // only unsolicited incoming transfers; a swap's buy leg isn't a "payment"
+        if (isHiddenSpam(h))
+            continue; // the whole point: never announce what History hides
+        const QString key = dedupKey(h);
+        const bool known = m_seenIncoming.contains(key);
+        m_seenIncoming.insert(key);
+        if (known)
+            continue;
+        // Silent while this account's backlog is being seeded (startup / its first fetch); announce
+        // only arrivals that land after the account is known. An unknown-account row can't be named,
+        // so it's seeded but never announced.
+        if (m_notifyInitialized.contains(h.account) && !firstTime.contains(h.account))
+            emit incomingPayment(h.account, h.formatted, h.symbol);
+    }
+    m_notifyInitialized.unite(firstTime);
 }
 
 // Where an already-held copy of `key` lives in m_fetched, or -1. Bounds-checked so a stale index
@@ -733,6 +761,7 @@ void HistoryModel::beginFullRefresh() {
 // Append one account's rows (deduped) to the full set, then schedule a debounced filter/sort/slice.
 // Only the current 500-row page is ever materialised, so a huge multi-account history stays smooth.
 void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
+    noteIncoming(items);
     QVector<HistoryItem> add;
     add.reserve(items.size());
     bool updated = false; // a row we already held has changed (an order filled, a tx mined)
@@ -977,4 +1006,43 @@ void HistoryModel::addLocalSend(const QString &txHash, const QString &to,
     // once the real mined row is fetched.
     m_localSends.append(h);
     rebuildAll();
+}
+
+void HistoryModel::confirmLocalSend(const QString &txHash, bool failed) {
+    if (txHash.isEmpty())
+        return;
+    const QString hx = txHash.toLower();
+    bool changed = false;
+    for (HistoryItem &h : m_localSends) {
+        if (h.txHash.toLower() != hx || h.status != QLatin1String("pending"))
+            continue;
+        // The row already carries a "now" timestamp from addLocalSend, so clearing "pending" is
+        // enough for the Date column to switch from "pending" to a real date - no block number
+        // needed. The confirmed explorer row (with the true block/fee) still supersedes this later.
+        h.status = failed ? QStringLiteral("failed") : QStringLiteral("done");
+        h.failed = failed;
+        changed = true;
+        break;
+    }
+    if (changed)
+        rebuildAll();
+}
+
+void HistoryModel::confirmLocalSwap(const QString &txHash, bool failed) {
+    if (txHash.isEmpty())
+        return;
+    const QString hx = txHash.toLower();
+    bool changed = false;
+    for (HistoryItem &h : m_localSwaps) {
+        if (h.txHash.toLower() != hx || h.status != QLatin1String("pending"))
+            continue;
+        // Mirror how appendBatch settles a swap on its mined row: the transaction is on chain and the
+        // receipt says whether it worked, which is enough to stop the countdown to "failed".
+        h.status = failed ? QStringLiteral("failed") : QStringLiteral("done");
+        h.failed = failed;
+        changed = true;
+        break;
+    }
+    if (changed)
+        rebuildAll();
 }

@@ -14,6 +14,7 @@
 #include <QWidget>
 
 class Wallet;
+class QCheckBox;
 class QComboBox;
 class QLabel;
 class QLineEdit;
@@ -118,6 +119,11 @@ private:
     // enough through the book to fill that size, plus an allowance for movement.
     double marketCap(bool isBuy, double size) const;
     double available(bool isBuy) const;
+    // The exact price a limit order will carry on the wire: clamped to the exchange's tick (at most
+    // five significant figures, capped at m_pxDecimals places) and rounded in the user's favour -
+    // down for a buy so it never pays more than typed, up for a sell so it never receives less. Kept
+    // in lockstep with core/src/hyperliquid.rs::format_price so the ticket shows what is sent.
+    double wirePrice(double price, bool isBuy) const;
 
     Wallet *m_wallet = nullptr;
     quint32 m_account = 0;
@@ -173,6 +179,7 @@ private:
     QComboBox *m_type = nullptr;
     QLineEdit *m_price = nullptr;
     QLineEdit *m_size = nullptr;
+    QCheckBox *m_postOnly = nullptr;
     QLabel *m_total = nullptr;
     QLabel *m_tradingAs = nullptr;
     QPushButton *m_maxBtn = nullptr;

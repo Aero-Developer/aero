@@ -96,6 +96,18 @@ public slots:
     void addLocalSend(const QString &txHash, const QString &to, const QString &amountFormatted,
                       const QString &symbol, const QString &token = QString());
 
+    // Settle an optimistic local send the moment its receipt arrives, instead of waiting for the
+    // explorer to index the mined row (which can lag minutes). Flips the matching pending row off
+    // "pending" so the Date column stops saying "pending" and a revert shows as "Failed"; the row is
+    // still reconciled away when the real fetched copy lands. No-op if no local send matches.
+    void confirmLocalSend(const QString &txHash, bool failed);
+
+    // Same, for an optimistic on-chain (router) swap: settle it the moment its receipt arrives rather
+    // than waiting for the explorer to index both legs. The row already holds both symbols, so this
+    // just flips "pending" to "done"/"failed"; the fetched swap row still reconciles it away. No-op if
+    // no local swap matches (e.g. a CoW order, which settles via its own poll, not a tx receipt).
+    void confirmLocalSwap(const QString &txHash, bool failed);
+
     // Flip any local optimistic swap still "pending" past `maxAgeSecs` to "failed", so a row can't
     // display "pending" forever if the CoW API never returns the order (unreachable / not indexed).
     void expireStalePendingSwaps(qint64 maxAgeSecs);
@@ -172,6 +184,12 @@ signals:
     // page+1). `total` is the post-filter row count across all pages.
     void pageChanged(int page, int pageCount, int total);
 
+    // A genuinely new incoming transfer that the spam filter did NOT hide. Notifications hang off
+    // this instead of raw balance increases, so nothing that History hides (dust, zero-value or
+    // look-alike poisoning) can ever pop a "Payment received" toast. Not fired while an account's
+    // existing history is first being seeded (startup / first fetch), only for later arrivals.
+    void incomingPayment(quint32 account, const QString &formatted, const QString &symbol);
+
 private:
     static QString dedupKey(const HistoryItem &h); // stable per-row key for m_fetchedAt
     // Whether a freshly fetched copy of a row we already hold says something new. A swap is fetched
@@ -187,6 +205,9 @@ private:
     bool isVanityLookalike(const HistoryItem &h) const; // look-alike address-poisoning
     void rebuildPoisonRefs();                           // recompute m_poisonRefSigs/Addrs
     bool isHiddenSpam(const HistoryItem &h) const; // rows removed when m_hideSpam is on
+    // Emit incomingPayment() for any new, non-hidden incoming transfer in `items`, seeding (silently)
+    // each account's backlog on its first delivery so startup/first-fetch never bursts notifications.
+    void noteIncoming(const QVector<HistoryItem> &items);
     bool matchesSearch(const HistoryItem &h) const;
     bool lessThan(const HistoryItem &a, const HistoryItem &b) const; // by current sort column
     void rebuildVisible();      // filter m_allItems -> m_filtered, sort, then re-slice the page
@@ -209,6 +230,8 @@ private:
     QSet<QString> m_ownAddresses;   // wallet's own addresses (lower-case) - poisoning targets
     QSet<QString> m_poisonRefAddrs; // legit addresses (own + real counterparties), lower-case
     QSet<QString> m_poisonRefSigs;  // first4+last4 hex signatures of the above (look-alike index)
+    QSet<QString> m_seenIncoming;      // dedup keys of incoming transfers already accounted for
+    QSet<quint32> m_notifyInitialized; // accounts whose backlog has been seeded (so it stays silent)
     bool m_hideSpam = true;
     double m_dustUsd = 0.0;              // hide incoming worth less than this many USD (0 = off)
     QHash<QString, double> m_prices;     // symbol (upper) -> USD, for dust valuation

@@ -1511,9 +1511,10 @@ pub extern "C" fn aero_wallet_hl_place_order(
     price: f64,
     size: f64,
     market_order: bool,
+    post_only: bool,
 ) -> *mut c_char {
     block_json(w, |w| {
-        RUNTIME.block_on(w.hl_place_order(index, is_buy, price, size, market_order))
+        RUNTIME.block_on(w.hl_place_order(index, is_buy, price, size, market_order, post_only))
     })
 }
 

@@ -249,6 +249,63 @@ int main(int argc, char **argv) {
               "but it is not attributed to an account it never named");
     }
 
+    // A just-broadcast send shows as pending, and settles the moment its receipt arrives - without
+    // waiting for the explorer to index the mined row (which can lag minutes). This is the "stuck on
+    // pending after it confirmed" bug.
+    {
+        HistoryModel m;
+        m.beginFullRefresh();
+        m.addLocalSend("0xsend1", "0x000000000000000000000000000000000000dEaD", "1", "ETH");
+        settle();
+        auto dateOf = [&m](const QString &id) {
+            for (int r = 0; r < m.rowCount(); ++r)
+                if (m.itemAt(r).txHash.compare(id, Qt::CaseInsensitive) == 0)
+                    return m.data(m.index(r, HistoryModel::Column_Date), Qt::DisplayRole).toString();
+            return QStringLiteral("<no such row>");
+        };
+        auto dirOf = [&m](const QString &id) {
+            for (int r = 0; r < m.rowCount(); ++r)
+                if (m.itemAt(r).txHash.compare(id, Qt::CaseInsensitive) == 0)
+                    return m.data(m.index(r, HistoryModel::Column_Direction), Qt::DisplayRole)
+                        .toString();
+            return QStringLiteral("<no such row>");
+        };
+        check(dateOf("0xsend1") == "pending", "a just-sent transfer reads as pending");
+        m.confirmLocalSend("0xsend1", /*failed*/ false);
+        settle();
+        check(dateOf("0xsend1") != "pending", "and stops saying pending the moment its receipt lands");
+        check(dirOf("0xsend1") == "Sent", "a confirmed send reads as Sent, not Failed");
+    }
+
+    // The same, for a reverted send: the receipt says it failed, so the row must say so too.
+    {
+        HistoryModel m;
+        m.beginFullRefresh();
+        m.addLocalSend("0xsend2", "0x000000000000000000000000000000000000dEaD", "1", "ETH");
+        m.confirmLocalSend("0xsend2", /*failed*/ true);
+        settle();
+        auto dirOf = [&m](const QString &id) {
+            for (int r = 0; r < m.rowCount(); ++r)
+                if (m.itemAt(r).txHash.compare(id, Qt::CaseInsensitive) == 0)
+                    return m.data(m.index(r, HistoryModel::Column_Direction), Qt::DisplayRole)
+                        .toString();
+            return QStringLiteral("<no such row>");
+        };
+        check(dirOf("0xsend2") == "Failed", "a reverted send reads as Failed");
+    }
+
+    // A router swap settles on its own receipt too, not only when the explorer returns the mined row.
+    {
+        HistoryModel m;
+        m.beginFullRefresh();
+        m.addLocalSwap(swapRow("0xswapr", "pending", "USDC", "DAI", now - 30));
+        settle();
+        check(statusOf(m, "0xswapr") == "pending", "a just-sent router swap reads as pending");
+        m.confirmLocalSwap("0xswapr", /*failed*/ false);
+        settle();
+        check(statusOf(m, "0xswapr") == "done", "and settles to done on its receipt");
+    }
+
     std::printf("\n%s\n", failures == 0 ? "all good" : "SOMETHING IS WRONG");
     return failures == 0 ? 0 : 1;
 }
