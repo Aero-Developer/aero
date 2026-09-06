@@ -275,10 +275,13 @@ char *aero_wallet_hw_list_devices(const char *kind);
 
 /**
  * Create a watch-only hardware wallet by deriving `num_accounts` addresses from the connected
- * device. `passphrase` is the host-entered BIP39 passphrase (Trezor); NULL/"" = none.
+ * device. `passphrase` is the host-entered BIP39 passphrase (Trezor); NULL/"" = none. When
+ * `passphrase_on_device` is true the passphrase is entered on the Trezor (Safe 5/7) and
+ * `passphrase` is ignored.
  */
 AeroWallet *aero_wallet_create_hardware(const char *kind,
                                         const char *passphrase,
+                                        bool passphrase_on_device,
                                         uint32_t num_accounts);
 
 /**

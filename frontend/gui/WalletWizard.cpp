@@ -693,18 +693,34 @@ HardwarePage::HardwarePage(WalletWizard *w) : m_w(w) {
     m_passphrase->setEchoMode(QLineEdit::Password);
     m_passphrase->setPlaceholderText(tr("Passphrase"));
     m_passphrase->setVisible(false);
+    // Trezor Safe 5/7 (THP) can take the passphrase on its own screen. This is the reliable method
+    // on those models - host-typed passphrases can be silently ignored - so it's the default when a
+    // passphrase is used. Ticking it hides the host field and the user types on the Trezor instead.
+    m_passOnDevice = new QCheckBox(tr("Enter passphrase on the Trezor device (recommended)"), this);
+    m_passOnDevice->setChecked(true);
+    m_passOnDevice->setVisible(false);
     auto *passNote = new QLabel(
-        tr("On a Trezor the passphrase is entered here. On a Ledger it is entered on the device, "
-           "so this field is ignored."),
+        tr("On a Trezor you can enter the passphrase on the device (recommended) or here. On a "
+           "Ledger it is always entered on the device, so these fields are ignored."),
         this);
     passNote->setWordWrap(true);
     passNote->setStyleSheet(QStringLiteral("color: gray;"));
     passNote->setVisible(false);
-    connect(m_usePass, &QCheckBox::toggled, this, [this, passNote](bool on) {
-        m_passphrase->setVisible(on);
-        passNote->setVisible(on);
-        if (!on) m_passphrase->clear();
-    });
+    auto syncPassFields = [this]() {
+        const bool use = m_usePass->isChecked();
+        const bool onDevice = m_passOnDevice->isChecked();
+        // Only prompt for a host-typed passphrase when the user opted out of device entry.
+        m_passphrase->setVisible(use && !onDevice);
+        if (!use || onDevice) m_passphrase->clear();
+    };
+    connect(m_usePass, &QCheckBox::toggled, this,
+            [this, passNote, syncPassFields](bool on) {
+                m_passOnDevice->setVisible(on);
+                passNote->setVisible(on);
+                syncPassFields();
+            });
+    connect(m_passOnDevice, &QCheckBox::toggled, this,
+            [syncPassFields](bool) { syncPassFields(); });
 
     m_error = new QLabel(this);
     m_error->setStyleSheet(QStringLiteral("color: red;"));
@@ -717,6 +733,7 @@ HardwarePage::HardwarePage(WalletWizard *w) : m_w(w) {
     layout->addWidget(refresh);
     layout->addWidget(m_status);
     layout->addWidget(m_usePass);
+    layout->addWidget(m_passOnDevice);
     layout->addWidget(m_passphrase);
     layout->addWidget(passNote);
     layout->addWidget(m_error);
@@ -779,14 +796,17 @@ void HardwarePage::refreshDevices() {
 bool HardwarePage::validatePage() {
     m_error->hide();
     const QString kind = detectedKind();
-    const QString passphrase =
-        (m_usePass && m_usePass->isChecked() && kind == QLatin1String("trezor"))
-            ? m_passphrase->text()
-            : QString();
+    const bool trezor = kind == QLatin1String("trezor");
+    const bool usePass = m_usePass && m_usePass->isChecked() && trezor;
+    // Device-side entry is only meaningful for a Trezor using a passphrase; on a Ledger the passphrase
+    // is always on-device already, and without a passphrase there's nothing to enter.
+    const bool passOnDevice = usePass && m_passOnDevice && m_passOnDevice->isChecked();
+    const QString passphrase = (usePass && !passOnDevice) ? m_passphrase->text() : QString();
 
     QApplication::setOverrideCursor(Qt::WaitCursor);
     // Derive the first few accounts from the device (watch-only; keys never leave it).
-    Wallet *wallet = WalletManager::instance()->createHardwareWallet(kind, passphrase, 5);
+    Wallet *wallet =
+        WalletManager::instance()->createHardwareWallet(kind, passphrase, passOnDevice, 5);
     QApplication::restoreOverrideCursor();
     if (!wallet) {
         m_error->setText(tr("Couldn't connect: %1").arg(WalletManager::instance()->errorString()));
@@ -1018,8 +1038,9 @@ bool OpenPage::validatePage() {
         bool ok = false;
         const QString passphrase = QInputDialog::getText(
             this, tr("Hardware wallet"),
-            tr("Connect and unlock your device. If your seed uses a passphrase (Trezor), enter it "
-               "here; otherwise leave blank:"),
+            tr("Connect and unlock your device. If this wallet uses a passphrase entered on the "
+               "Trezor, leave this blank and enter it on the device when prompted. Only type it "
+               "here if you created the wallet with host passphrase entry:"),
             QLineEdit::Password, QString(), &ok);
         if (!ok) return false;
         QApplication::setOverrideCursor(Qt::WaitCursor);

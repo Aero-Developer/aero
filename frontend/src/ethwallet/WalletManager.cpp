@@ -104,9 +104,10 @@ QStringList WalletManager::listHwDevices(const QString &kind) {
 }
 
 Wallet *WalletManager::createHardwareWallet(const QString &kind, const QString &passphrase,
-                                            quint32 numAccounts) {
+                                            bool passphraseOnDevice, quint32 numAccounts) {
     AeroWallet *core = aero_wallet_create_hardware(
-        kind.toUtf8().constData(), passphrase.toUtf8().constData(), numAccounts);
+        kind.toUtf8().constData(), passphrase.toUtf8().constData(), passphraseOnDevice,
+        numAccounts);
     if (!core) {
         m_errorString = takeError();
         return nullptr;

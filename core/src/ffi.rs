@@ -298,11 +298,14 @@ pub extern "C" fn aero_wallet_hw_list_devices(kind: *const c_char) -> *mut c_cha
 }
 
 /// Create a watch-only hardware wallet by deriving `num_accounts` addresses from the connected
-/// device. `passphrase` is the host-entered BIP39 passphrase (Trezor); NULL/"" = none.
+/// device. `passphrase` is the host-entered BIP39 passphrase (Trezor); NULL/"" = none. When
+/// `passphrase_on_device` is non-zero the passphrase is entered on the Trezor (Safe 5/7 over THP)
+/// and `passphrase` is ignored.
 #[no_mangle]
 pub extern "C" fn aero_wallet_create_hardware(
     kind: *const c_char,
     passphrase: *const c_char,
+    passphrase_on_device: bool,
     num_accounts: u32,
 ) -> *mut Wallet {
     clear_error();
@@ -318,7 +321,12 @@ pub extern "C" fn aero_wallet_create_hardware(
             return ptr::null_mut();
         }
     };
-    match RUNTIME.block_on(Wallet::create_hardware(hwkind, &pass, num_accounts.max(1))) {
+    match RUNTIME.block_on(Wallet::create_hardware(
+        hwkind,
+        &pass,
+        passphrase_on_device,
+        num_accounts.max(1),
+    )) {
         Ok(w) => Box::into_raw(Box::new(w)),
         Err(e) => {
             set_error(e.to_string());

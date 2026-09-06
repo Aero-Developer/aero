@@ -55,6 +55,12 @@ pub struct HwDescriptor {
     pub kind: String,
     /// Cached public addresses, index-aligned with `account_order` (all `Hd` entries).
     pub addresses: Vec<String>,
+    /// Whether the BIP39 passphrase (hidden wallet) is entered on the Trezor itself rather than
+    /// sent from the host. Stored so reopening the wallet re-derives with the same method without
+    /// asking. `#[serde(default)]` keeps older wallet files (which predate the field) loading as
+    /// host-entry, which is what they were.
+    #[serde(default)]
+    pub passphrase_on_device: bool,
 }
 
 /// One account slot, giving each unified account index a *stable* identity. Without this, deriving

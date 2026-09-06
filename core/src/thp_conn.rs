@@ -74,9 +74,15 @@ pub fn disconnect() {
 }
 
 /// Derive `count` Ethereum addresses starting at `start`, for the wallet selected by `passphrase`.
-pub fn get_addresses(passphrase: &str, start: u32, count: u32) -> Result<Vec<String>, String> {
+/// `on_device` asks the Trezor to take the passphrase on its own screen instead of over the wire.
+pub fn get_addresses(
+    passphrase: &str,
+    on_device: bool,
+    start: u32,
+    count: u32,
+) -> Result<Vec<String>, String> {
     with_connection(|conn| {
-        let session = conn.session_for(passphrase)?;
+        let session = conn.session_for(passphrase, on_device)?;
         let mut out = Vec::with_capacity(count as usize);
         // saturating, so that a nonsensical range asks the device for nothing rather than wrapping
         // round to index 0 and handing back addresses the caller will file under the wrong account.
@@ -91,6 +97,7 @@ pub fn get_addresses(passphrase: &str, start: u32, count: u32) -> Result<Vec<Str
 #[allow(clippy::too_many_arguments)]
 pub fn sign_eip1559(
     passphrase: &str,
+    on_device: bool,
     index: u32,
     nonce: u64,
     gas_limit: u64,
@@ -102,7 +109,7 @@ pub fn sign_eip1559(
     chain_id: u64,
 ) -> Result<(u64, [u8; 32], [u8; 32]), String> {
     with_connection(|conn| {
-        let session = conn.session_for(passphrase)?;
+        let session = conn.session_for(passphrase, on_device)?;
         let tx = Eip1559Tx {
             nonce,
             max_fee_per_gas: max_fee,
@@ -121,6 +128,7 @@ pub fn sign_eip1559(
 #[allow(clippy::too_many_arguments)]
 pub fn sign_legacy(
     passphrase: &str,
+    on_device: bool,
     index: u32,
     nonce: u64,
     gas_limit: u64,
@@ -131,7 +139,7 @@ pub fn sign_legacy(
     chain_id: u64,
 ) -> Result<(u64, [u8; 32], [u8; 32]), String> {
     with_connection(|conn| {
-        let session = conn.session_for(passphrase)?;
+        let session = conn.session_for(passphrase, on_device)?;
         let tx = thp::LegacyTx { nonce, gas_price, gas_limit, to, value, data, chain_id };
         conn.channel.ethereum_sign_legacy(&mut conn.crypto, session, &path_for(index), &tx)
     })
@@ -149,19 +157,31 @@ pub fn device_present() -> bool {
 struct Connection {
     channel: Channel,
     crypto: EncryptedChannel,
-    /// Sessions already opened on this connection, keyed by passphrase. A session is a passphrase
-    /// wallet, so reusing them avoids re-deriving the seed on every call.
-    sessions: HashMap<String, u8>,
+    /// Sessions already opened on this connection, keyed by (passphrase, on_device). A session is a
+    /// passphrase wallet, so reusing them avoids re-deriving the seed on every call. The entry method
+    /// is part of the key because a host-entered and a device-entered session are distinct requests
+    /// to the device even for the "same" passphrase.
+    sessions: HashMap<(String, bool), u8>,
 }
 
 impl Connection {
-    fn session_for(&mut self, passphrase: &str) -> Result<u8, String> {
-        if let Some(&id) = self.sessions.get(passphrase) {
+    fn session_for(&mut self, passphrase: &str, on_device: bool) -> Result<u8, String> {
+        let key = (passphrase.to_string(), on_device);
+        if let Some(&id) = self.sessions.get(&key) {
             return Ok(id);
         }
-        let arg = if passphrase.is_empty() { None } else { Some(passphrase) };
-        let id = self.channel.create_session(&mut self.crypto, arg, false)?;
-        self.sessions.insert(passphrase.to_string(), id);
+        // On-device entry: the host sends no passphrase string at all (field 1 omitted) and the
+        // Trezor prompts for it on its own screen. Host entry: send the string; empty means the
+        // standard wallet.
+        let arg = if on_device {
+            None
+        } else if passphrase.is_empty() {
+            None
+        } else {
+            Some(passphrase)
+        };
+        let id = self.channel.create_session(&mut self.crypto, arg, on_device)?;
+        self.sessions.insert(key, id);
         Ok(id)
     }
 

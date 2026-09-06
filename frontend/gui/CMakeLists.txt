@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.18)
 # The version here is the one stamped into the .exe. Keep it equal to the release tag being cut:
 # a binary whose declared version matches a published, hashed release is one an antivirus reputation
 # service can actually look up, and one a user can report a bug against.
-project(aero_gui VERSION 0.1.36 LANGUAGES CXX C) # C is for the vendored quirc QR decoder
+project(aero_gui VERSION 0.1.37 LANGUAGES CXX C) # C is for the vendored quirc QR decoder
 
 # Compile the Windows resource (.rc) that gives the executable its icon.
 if(WIN32)

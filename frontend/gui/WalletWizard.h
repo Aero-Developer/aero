@@ -166,6 +166,7 @@ private:
     QLabel *m_status = nullptr;
     QCheckBox *m_usePass = nullptr;
     QLineEdit *m_passphrase = nullptr;
+    QCheckBox *m_passOnDevice = nullptr; // Trezor Safe 5/7: type the passphrase on the device
     QLabel *m_error = nullptr;
     QString m_found; // "ledger", "trezor", "both", or empty
 };

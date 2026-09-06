@@ -38,7 +38,8 @@ public:
     QStringList listHwDevices(const QString &kind);
     // Create a watch-only wallet from a connected device (keys stay on the device). `passphrase` is
     // the host-entered BIP39 passphrase for Trezor (ignored by Ledger, which enters it on-device).
-    Wallet *createHardwareWallet(const QString &kind, const QString &passphrase, quint32 numAccounts);
+    Wallet *createHardwareWallet(const QString &kind, const QString &passphrase,
+                                 bool passphraseOnDevice, quint32 numAccounts);
     // Open a hardware wallet file; requires the device (+ Trezor passphrase). Fails if absent.
     Wallet *openHardwareWallet(const QString &path, const QString &password, const QString &passphrase);
     // Inspect a file without a device: 1 = hardware, 0 = software, -1 = can't decrypt (bad password).

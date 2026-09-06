@@ -151,10 +151,12 @@ pub async fn list_devices(kind: HwKind) -> Vec<String> {
 // Address derivation
 // -------------------------------------------------------------------------------------------------
 
-/// Derive `count` addresses starting at `start`, connecting to the device once.
+/// Derive `count` addresses starting at `start`, connecting to the device once. `on_device` asks a
+/// THP Trezor (Safe 5/7) to take the BIP39 passphrase on its own screen instead of over the wire.
 pub async fn get_addresses(
     kind: HwKind,
     passphrase: &str,
+    on_device: bool,
     start: u32,
     count: u32,
 ) -> Result<Vec<String>> {
@@ -184,7 +186,7 @@ pub async fn get_addresses(
                     }
                     Ok(out)
                 },
-                || crate::thp_conn::get_addresses(passphrase, start, count),
+                || crate::thp_conn::get_addresses(passphrase, on_device, start, count),
             )?;
             raw.into_iter()
                 .map(|s| {
@@ -198,8 +200,13 @@ pub async fn get_addresses(
 }
 
 /// Derive a single address at `index`.
-pub async fn get_address(kind: HwKind, passphrase: &str, index: u32) -> Result<String> {
-    let mut v = get_addresses(kind, passphrase, index, 1).await?;
+pub async fn get_address(
+    kind: HwKind,
+    passphrase: &str,
+    on_device: bool,
+    index: u32,
+) -> Result<String> {
+    let mut v = get_addresses(kind, passphrase, on_device, index, 1).await?;
     v.pop().ok_or_else(|| CoreError::rpc("no address returned"))
 }
 
@@ -232,6 +239,7 @@ pub async fn ledger_sign_tx(
 #[allow(clippy::too_many_arguments)]
 pub async fn trezor_sign_tx(
     passphrase: &str,
+    on_device: bool,
     index: u32,
     legacy: bool,
     nonce: u64,
@@ -272,12 +280,12 @@ pub async fn trezor_sign_tx(
         || {
             let (v, r, s) = if legacy {
                 crate::thp_conn::sign_legacy(
-                    passphrase, index, nonce, gas_limit, gas_price, &to_str, value_u128, data,
-                    chain_id,
+                    passphrase, on_device, index, nonce, gas_limit, gas_price, &to_str, value_u128,
+                    data, chain_id,
                 )?
             } else {
                 crate::thp_conn::sign_eip1559(
-                    passphrase, index, nonce, gas_limit, max_fee, max_priority, &to_str,
+                    passphrase, on_device, index, nonce, gas_limit, max_fee, max_priority, &to_str,
                     value_u128, data, chain_id,
                 )?
             };

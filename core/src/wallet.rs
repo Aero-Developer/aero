@@ -257,7 +257,8 @@ enum KeySource {
 
 struct HwContext {
     kind: HwKind,
-    passphrase: String, // host-entered (Trezor); empty/ignored for Ledger
+    passphrase: String, // host-entered (Trezor); empty/ignored for Ledger, and empty when on_device
+    on_device: bool,    // Trezor (THP): take the BIP39 passphrase on the device instead of the host
 }
 
 /// Short-TTL caches for pure, read-only network lookups that several UI triggers hit repeatedly
@@ -328,10 +329,44 @@ impl Wallet {
 
     /// Create a watch-only hardware wallet: connect the device, derive `num_accounts` addresses at
     /// `m/44'/60'/0'/0/x`, and build a wallet whose keys stay on the device. `passphrase` is the
-    /// host-entered BIP39 passphrase (Trezor); ignored by Ledger (device-side only).
-    pub async fn create_hardware(kind: HwKind, passphrase: &str, num_accounts: u32) -> Result<Self> {
+    /// host-entered BIP39 passphrase (Trezor); ignored by Ledger (device-side only). When
+    /// `passphrase_on_device` is set (Trezor Safe 5/7 over THP), the passphrase is typed on the
+    /// device and `passphrase` must be empty.
+    pub async fn create_hardware(
+        kind: HwKind,
+        passphrase: &str,
+        passphrase_on_device: bool,
+        num_accounts: u32,
+    ) -> Result<Self> {
         let n = num_accounts.max(1);
-        let addresses = hardware::get_addresses(kind, passphrase, 0, n).await?;
+        let addresses =
+            hardware::get_addresses(kind, passphrase, passphrase_on_device, 0, n).await?;
+
+        // A passphrase (hidden) wallet whose first address equals the standard (no-passphrase)
+        // wallet means the passphrase never took effect - e.g. the device ignored a host-typed
+        // passphrase, or an empty one was entered on the device. Saving that would create a wallet
+        // that silently *is* the standard wallet yet claims a passphrase, and would later fail to
+        // reopen. Catch it here with a clear message instead. Deriving the standard address is a
+        // second, quick device round-trip; if it fails (device unplugged mid-flow) we skip the
+        // check rather than block a create that already produced addresses.
+        let passphrase_wallet = passphrase_on_device || !passphrase.is_empty();
+        if passphrase_wallet {
+            if let Ok(standard) = hardware::get_address(kind, "", false, 0).await {
+                if addresses
+                    .first()
+                    .map(|a| a.eq_ignore_ascii_case(&standard))
+                    .unwrap_or(false)
+                {
+                    return Err(CoreError::rpc(
+                        "the passphrase did not take effect - your Trezor returned the standard \
+                         wallet. Make sure passphrase protection is enabled on the device and, if \
+                         entering it on the Trezor, that you typed a non-empty passphrase."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
         let account_order = (0..n).map(AccountEntry::Hd).collect();
         let secrets = WalletSecrets {
             mnemonic: String::new(),
@@ -340,13 +375,21 @@ impl Wallet {
             account_order,
             tokens: Vec::new(),
             imported_keys: Vec::new(),
-            hardware: Some(HwDescriptor { kind: kind.as_str().to_string(), addresses }),
+            hardware: Some(HwDescriptor {
+                kind: kind.as_str().to_string(),
+                addresses,
+                passphrase_on_device,
+            }),
             watch_addresses: Vec::new(),
             metadata: String::new(),
         };
         Ok(Self {
             secrets,
-            keys: KeySource::Hardware(HwContext { kind, passphrase: passphrase.to_string() }),
+            keys: KeySource::Hardware(HwContext {
+                kind,
+                passphrase: if passphrase_on_device { String::new() } else { passphrase.to_string() },
+                on_device: passphrase_on_device,
+            }),
             provider: None,
             provider_cfg: ProviderConfig::default(),
             caches: NetCaches::default(),
@@ -367,8 +410,14 @@ impl Wallet {
 
         if let Some(hw) = secrets.hardware.clone() {
             let kind = HwKind::parse(&hw.kind)?;
+            // A wallet created with device-side passphrase entry re-derives the same way: the host
+            // passphrase argument is ignored and the Trezor prompts for it on its own screen. This
+            // is stored per-wallet so reopening never asks the user which method to use.
+            let on_device = hw.passphrase_on_device;
+            let host_pass = if on_device { "" } else { passphrase };
             // Require the device now and verify it derives the same first address.
-            let derived = crate::ffi::block_on(hardware::get_address(kind, passphrase, 0))?;
+            let derived =
+                crate::ffi::block_on(hardware::get_address(kind, host_pass, on_device, 0))?;
             // An empty stored address list must NOT skip verification (that would open the wallet
             // against any connected device/passphrase) - treat it as a mismatch.
             let expected = hw.addresses.first().cloned().unwrap_or_default();
@@ -379,7 +428,11 @@ impl Wallet {
             }
             return Ok(Self {
                 secrets,
-                keys: KeySource::Hardware(HwContext { kind, passphrase: passphrase.to_string() }),
+                keys: KeySource::Hardware(HwContext {
+                    kind,
+                    passphrase: host_pass.to_string(),
+                    on_device,
+                }),
                 provider: None,
                 provider_cfg: ProviderConfig::default(),
                 caches: NetCaches::default(),
@@ -482,7 +535,7 @@ impl Wallet {
     pub fn has_passphrase(&self) -> bool {
         match &self.keys {
             KeySource::Software(seed) => seed.has_passphrase(),
-            KeySource::Hardware(ctx) => !ctx.passphrase.is_empty(),
+            KeySource::Hardware(ctx) => !ctx.passphrase.is_empty() || ctx.on_device,
             KeySource::WatchOnly => false,
         }
     }
@@ -634,7 +687,8 @@ impl Wallet {
             }
         };
         let next_hd = self.secrets.account_count;
-        let addr = hardware::get_address(ctx.kind, &ctx.passphrase, next_hd).await?;
+        let addr =
+            hardware::get_address(ctx.kind, &ctx.passphrase, ctx.on_device, next_hd).await?;
         self.secrets.account_count += 1;
         self.secrets.account_order.push(AccountEntry::Hd(next_hd));
         if let Some(hw) = self.secrets.hardware.as_mut() {
@@ -4107,7 +4161,7 @@ impl Wallet {
                     HwKind::Ledger => hardware::ledger_sign_tx(hd, chain_id, &*tx).await,
                     HwKind::Trezor => {
                         hardware::trezor_sign_tx(
-                            &ctx.passphrase, hd, legacy, nonce, gas_limit,
+                            &ctx.passphrase, ctx.on_device, hd, legacy, nonce, gas_limit,
                             max_fee_per_gas, /* gas_price (legacy) */
                             max_fee_per_gas, /* max_fee (eip1559) */
                             max_priority_fee_per_gas, to, value, data, chain_id,
