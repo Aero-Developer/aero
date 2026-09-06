@@ -42,6 +42,23 @@ fetches anyway - and it is the only one of these that is easy to miss, because i
 folder that does ship. The script refuses to package if any of them survive, and the updater refuses
 to install an archive containing them, so this is checked twice.
 
+## The build has to start before it can ship
+
+Before it writes the zip, `ci/release.ps1` runs the packaged `aero_gui.exe` on a throwaway copy of the
+staging folder and waits for it to load Qt and `aero_core`. If it does not get there, the release is
+refused.
+
+0.1.29 exists because 0.1.28 did not have this. That release was built, staged, zipped, hashed,
+signed and published without anyone once double-clicking it, and it could not start on any machine:
+the linker had stamped the PE as demanding Win32 subsystem 10.0, and Windows refuses any ordinary
+application asking for more than 6.2 with `0xc000007b`, before mapping a single DLL. Nothing in the
+process noticed, because every check that release ran was a check on bytes - and the bytes were
+exactly what was wrong. So the script now checks the subsystem version outright, and then runs the
+program, which is the only check that could not have been passed by a binary that does not work.
+
+The smoke test runs against a copy because a first launch writes `config/` and starts Tor, and none
+of that may end up in the archive.
+
 `cargo build --locked` fails if `Cargo.lock` would change, which is what makes the Rust half
 reproducible. Record the toolchain versions in the release notes:
 

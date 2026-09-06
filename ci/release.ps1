@@ -104,6 +104,52 @@ foreach ($name in ($excluded + $excludedNested)) {
     if (Test-Path $p) { throw "refusing to package: $name survived into $staging" }
 }
 
+# Start the thing we are about to publish, and refuse to publish it if it will not start.
+#
+# 0.1.28 was built, staged, zipped, hashed, signed and released without anyone once double-clicking
+# it, and it could not run on any machine: the linker had stamped the PE as demanding Win32 subsystem
+# 6.3, above the 6.2 ceiling the loader allows an ordinary application, so Windows rejected the image
+# with 0xc000007b before mapping a single DLL. Every check that release ran was a check on bytes, and
+# bytes were exactly what was wrong. So this one runs the program.
+#
+# It runs against a throwaway copy, because a first launch writes config and starts Tor, and none of
+# that may end up in the archive.
+$peCeiling = [Version]"6.2"
+$exe = Join-Path $staging "aero_gui.exe"
+$bytes = [IO.File]::ReadAllBytes($exe)
+$optional = [BitConverter]::ToInt32($bytes, 0x3C) + 24
+$subsystem = [Version]::new([BitConverter]::ToUInt16($bytes, $optional + 48), [BitConverter]::ToUInt16($bytes, $optional + 50))
+if ($subsystem -gt $peCeiling) {
+    throw ("refusing to package: aero_gui.exe declares Win32 subsystem $subsystem, above the $peCeiling " +
+           "the loader accepts. Windows will refuse it with 0xc000007b. See the linker options in " +
+           "frontend/gui/CMakeLists.txt.")
+}
+
+$smoke = Join-Path ([IO.Path]::GetTempPath()) "aero-smoke-$Version"
+if (Test-Path $smoke) { Remove-Item $smoke -Recurse -Force }
+Copy-Item -LiteralPath $staging -Destination $smoke -Recurse -Force
+Write-Host "Smoke test: starting $Version to prove it runs..."
+$proc = Start-Process (Join-Path $smoke "aero_gui.exe") -WorkingDirectory $smoke -PassThru
+$loaded = @()
+for ($i = 0; $i -lt 60; $i++) {
+    Start-Sleep -Milliseconds 500
+    if ($proc.HasExited) { break }
+    $proc.Refresh()
+    try { $loaded = @($proc.Modules | ForEach-Object { $_.ModuleName }) } catch { $loaded = @() }
+    if ($loaded -contains "Qt6Widgets.dll" -and $loaded -contains "aero_core.dll") { break }
+}
+$startedClean = -not $proc.HasExited -and $loaded -contains "Qt6Widgets.dll" -and $loaded -contains "aero_core.dll"
+$exitCode = if ($proc.HasExited) { $proc.ExitCode } else { 0 }
+if (-not $proc.HasExited) { & taskkill /T /F /PID $proc.Id 2>&1 | Out-Null }
+Remove-Item $smoke -Recurse -Force -ErrorAction SilentlyContinue
+if (-not $startedClean) {
+    # A rejected image does not exit: it sits on a modal error box, having loaded nothing but ntdll.
+    $why = if ($exitCode -ne 0) { "exited immediately with 0x{0:X8}" -f $exitCode }
+           else { "started but never got as far as loading Qt and aero_core (loaded: $($loaded.Count) modules)" }
+    throw "refusing to package: aero_gui.exe $why. The build is not runnable; do not release it."
+}
+Write-Host "Smoke test passed: reached Qt with $($loaded.Count) modules loaded."
+
 $zip = "dist/Aero-$Version-Windows-x64-portable.zip"
 if (Test-Path $zip) { Remove-Item $zip }
 Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $zip

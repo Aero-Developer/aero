@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.18)
 # The version here is the one stamped into the .exe. Keep it equal to the release tag being cut:
 # a binary whose declared version matches a published, hashed release is one an antivirus reputation
 # service can actually look up, and one a user can report a bug against.
-project(aero_gui VERSION 0.1.28 LANGUAGES CXX C) # C is for the vendored quirc QR decoder
+project(aero_gui VERSION 0.1.29 LANGUAGES CXX C) # C is for the vendored quirc QR decoder
 
 # Compile the Windows resource (.rc) that gives the executable its icon.
 if(WIN32)
@@ -131,10 +131,17 @@ endif()
 # which no legitimate 2026 application does, and leaves the exploit-mitigation bits to chance.
 # Declaring Windows 10 and asking for the mitigations by name costs nothing and removes two of the
 # cheap signals that push an unsigned binary over a machine-learning threshold.
+#
+# The subsystem version is NOT the OS version and must not be raised to match it. It is the version
+# of the Win32 subsystem the image demands, and the loader refuses outright - 0xc000007b, before a
+# single DLL is mapped - any ordinary application that asks for more than 6.2. Windows' own binaries
+# carry 10.0 because components of Windows are exempt; ours are not, and 0.1.28 shipped an
+# executable that no machine on earth could start. 6.2 is the ceiling, and is what MSVC emits for
+# exactly this reason. Anything above it is not "newer", it is unloadable.
 if(WIN32 AND (MINGW OR CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
     target_link_options(aero_gui PRIVATE
         -Wl,--major-os-version,10 -Wl,--minor-os-version,0
-        -Wl,--major-subsystem-version,10 -Wl,--minor-subsystem-version,0
+        -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,2
         -Wl,--dynamicbase        # ASLR
         -Wl,--nxcompat           # DEP
         -Wl,--high-entropy-va    # 64-bit ASLR
