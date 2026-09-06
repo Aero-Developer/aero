@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BSD-3-Clause
+﻿// SPDX-License-Identifier: BSD-3-Clause
 #include "AeroMainWindow.h"
 #include "Updater.h"
 #include "XmrTradeTab.h"
@@ -853,6 +853,9 @@ void AeroMainWindow::setupTabs() {
     // Right-hand buttons: "Create new address" (stock) and the repurposed "Import private key".
     recvUi.btn_generateSubaddress->setText(tr("Create new address"));
     recvUi.btn_createPaymentRequest->setText(tr("Import private key"));
+    recvUi.btn_createPaymentRequest->setToolTip(
+        tr("Import an external private key as an account in this wallet, so you can move the funds "
+           "sitting on it into one of your seed addresses."));
     connect(recvUi.btn_generateSubaddress, &QPushButton::clicked, this,
             &AeroMainWindow::onCreateAddress);
     connect(recvUi.btn_createPaymentRequest, &QPushButton::clicked, this,
@@ -916,6 +919,13 @@ void AeroMainWindow::setupTabs() {
                         m_wallet->scanFundedMulti(allChainsScanConfig(), 40); // silent, cross-chain
                     }
                 });
+        // The "Import private key" button lives under the QR, which is easy to miss - offer the same
+        // action here too, where someone looking for wallet options will actually find it. This is
+        // the path for pulling funds off a bare private key: import it, then send them to a seed
+        // address.
+        menu->addSeparator();
+        connect(menu->addAction(tr("Import private key…")), &QAction::triggered, this,
+                &AeroMainWindow::onImportKey);
         recvUi.toolBtn_options->setMenu(menu);
         recvUi.toolBtn_options->setPopupMode(QToolButton::InstantPopup);
     }
@@ -1144,6 +1154,9 @@ void AeroMainWindow::setupTabs() {
     // redemption, and rebuilding it on every wallet change would drop both.
     m_xmrTab = new XmrTradeTab();
     m_xmrTab->hide();
+    // Deposits and withdrawals in the tab only work on Arbitrum One; when it asks, switch there.
+    connect(m_xmrTab, &XmrTradeTab::switchToArbitrumRequested, this,
+            [this]() { if (m_chainId != 42161) switchChain(42161); });
     setupMenu();
 
     // Notes tab: a per-wallet scratch pad, stored encrypted inside the wallet (loaded in
@@ -1471,8 +1484,19 @@ void AeroMainWindow::setupSwapTab() {
             const double reserveEth = 250000.0 * maxFeeWei / 1e18 * 1.1;
             avail = qMax(0.0, avail - reserveEth);
         }
-        if (avail > 0.0)
-            m_swapAmount->setText(QString::number(avail, 'f', 8));
+        if (avail > 0.0) {
+            // Fill to the SELL token's own precision, not a blanket eight places. parse_units rejects
+            // an amount with more decimals than the token has ("too many decimal places"), and the
+            // swap reports that rejection as "no routes found" - which is exactly why Max on a
+            // 6-decimal token like USDT (e.g. 1675.31670600) found nothing while a trimmed 1675 did.
+            // Cap the places so an 18-decimal token isn't asked for more precision than a double
+            // carries, and floor rather than round so Max never lands a hair above the real balance.
+            const int sellDec = m_swapSellAddr.isEmpty() ? 18 : static_cast<int>(m_swapSellDecimals);
+            const int places = qMin(sellDec, 8);
+            const double scale = std::pow(10.0, places);
+            const double shown = std::floor(avail * scale) / scale;
+            m_swapAmount->setText(QString::number(shown, 'f', places));
+        }
     });
     payRow->addWidget(m_swapSellButton);
     payRow->addWidget(m_swapAmount);
@@ -5251,6 +5275,7 @@ void AeroMainWindow::onProviderConnected(int mode, const QString &message) {
         // history fan-out (which can queue one task per account and would otherwise starve them -
         // delaying balances/prices behind the whole history load).
         refreshAllBalances();               // batched: native + tokens for every account
+        fetchCuratedForCurrentAccount();    // + this account's curated tokens (USDC etc.) on big wallets
         m_wallet->refreshEthUsdPrice();     // native/USD (Chainlink or fallback)
         m_wallet->refreshMarketPrices();    // XMR + native market prices for Home
         m_wallet->refreshFees();            // gas suggestion
@@ -5265,6 +5290,10 @@ void AeroMainWindow::onProviderConnected(int mode, const QString &message) {
             refreshHistoryView();           // clear + fetch viewed + funded accounts (targeted)
         } else {
             ensureAccountHistory(m_account, /*force*/ true);
+            // A named or token-only account may have no cached history yet (older builds only ever
+            // fetched funded accounts), so pull those once here too - it is deduped against the
+            // cache, so accounts already loaded cost nothing.
+            ensureFundedAndLabeledHistory();
             refreshDirtyHistory();
         }
         // First time we can reach the chain: if we've never scanned this wallet for funded
@@ -5426,6 +5455,11 @@ void AeroMainWindow::loadLabels() {
         for (int i = 0; i < m_fromCombo->count(); ++i)
             m_fromCombo->setItemText(i, accountLabel(static_cast<quint32>(i)));
     }
+    // setLabel() above only emits dataChanged for rows currently visible in the Receive list, so the
+    // dataChanged handler's pushAccountNames() misses any labelled-but-hidden account (funded filter
+    // on, or addresses not warmed yet). Push the names to the History Account column directly so
+    // labels show on open without needing a filter/sort to force a rebuild.
+    pushAccountNames();
 }
 
 void AeroMainWindow::copySensitive(const QString &text) {
@@ -6078,6 +6112,14 @@ QString AeroMainWindow::accountName(quint32 index) const {
         if (!custom.isEmpty())
             return custom;
     }
+    // An imported key is not the seed's account #index - showing it as "Account #index" makes it look
+    // like one of the derived accounts, when it shares nothing with them. Name it by its own imported
+    // ordinal so it reads as what it is. A user-set label (above) still wins.
+    if (m_wallet) {
+        const int imp = m_wallet->accountImportedOrdinal(index);
+        if (imp >= 0)
+            return tr("Imported #%1").arg(imp + 1);
+    }
     return tr("Account #%1").arg(index);
 }
 
@@ -6087,10 +6129,17 @@ void AeroMainWindow::pushAccountNames() {
     if (!m_historyModel || !m_wallet)
         return;
     QHash<quint32, QString> names;
+    QHash<quint32, QString> importedNames;
     const quint32 n = m_wallet->numAccounts();
-    for (quint32 i = 0; i < n; ++i)
+    for (quint32 i = 0; i < n; ++i) {
         names.insert(i, accountName(i));
+        const int imp = m_wallet->accountImportedOrdinal(i);
+        if (imp >= 0)
+            importedNames.insert(i, tr("Imported #%1").arg(imp + 1));
+    }
     m_historyModel->setAccountNames(names);
+    if (m_addressModel)
+        m_addressModel->setImportedNames(importedNames);
 }
 
 QString AeroMainWindow::accountLabelWith(quint32 index, const QString &balanceStr) const {
@@ -6141,6 +6190,9 @@ void AeroMainWindow::rebuildAccountCombos() {
         if (m_addressModel)
             m_addressModel->refresh();
         m_wallet->warmAddresses(n);
+        // The Account column's names don't need warmed addresses (just labels + index), so push them
+        // now rather than leaving the History view showing "Account #n" until warming completes.
+        pushAccountNames();
         return;
     }
     // Send's "From" selector lists every address. The full address goes into Qt::UserRole so the
@@ -6225,9 +6277,27 @@ void AeroMainWindow::refreshHistoryView() {
         m_historyModel->beginFullRefresh(); // clear + reset dedup once
     m_histFetched.clear();
     m_dirtyHistory.clear();
-    ensureAccountHistory(m_account); // the account on screen, first
-    for (quint32 i : m_fundedAccounts)
-        ensureAccountHistory(i); // the rest of the wallet's activity (funded accounts only)
+    ensureAccountHistory(m_account);        // the account on screen, first
+    ensureFundedAndLabeledHistory();        // then every funded OR labelled account
+}
+
+// Load history for every funded account and every account the user has given a label. Funded
+// accounts carry the balance-bearing activity, but an account that only ever held a token (no native
+// balance) - or one the user named and cares about - is not in the funded set, and fetching only
+// funded left its rows, and its Account label, missing from the All-accounts view. Labels are
+// user-curated and few, so this stays targeted rather than fanning out across every derived (mostly
+// empty) HD account. Deduped by m_histFetched, so accounts already loaded (incl. from cache) are not
+// refetched, making this a one-time cost per account and free in steady state.
+void AeroMainWindow::ensureFundedAndLabeledHistory() {
+    if (!m_wallet)
+        return;
+    QSet<quint32> want = m_fundedAccounts;
+    const quint32 n = m_wallet->numAccounts();
+    for (quint32 i = 0; i < n; ++i)
+        if (m_addressModel && !m_addressModel->labelAt(i).isEmpty())
+            want.insert(i);
+    for (quint32 i : want)
+        ensureAccountHistory(i);
 }
 
 // Fetch one account's history on demand (lazy). Marks it fetched up front so overlapping triggers
@@ -6472,7 +6542,21 @@ void AeroMainWindow::updateReceive() {
     // can't judge their value).
     const double dustUsd = QSettings(QStringLiteral("Aero"), QStringLiteral("Aero"))
                                .value(QStringLiteral("history/dustUsd"), 0.005).toDouble();
-    for (const TokenInfo &t : m_wallet->tokens()) {
+    // Tracked tokens plus the curated tokens for THIS chain, deduped by address. Tracked tokens are
+    // stored as their Ethereum-mainnet contracts, so on an L2 like Arbitrum they read as zero and
+    // fall away below; the curated per-chain list is what carries native USDC (0xaf88…) and the rest,
+    // which the balance refresh already fetches. Without this, Arbitrum USDC is fetched but never
+    // shown here, which is exactly "my USDC won't appear in Receive".
+    QVector<TokenInfo> shown = m_wallet->tokens();
+    QSet<QString> seen;
+    for (const TokenInfo &t : shown)
+        seen.insert(t.address.toLower());
+    for (const TokenInfo &t : curatedTopTokens(m_chainId))
+        if (!seen.contains(t.address.toLower())) {
+            shown.append(t);
+            seen.insert(t.address.toLower());
+        }
+    for (const TokenInfo &t : shown) {
         const double bal =
             m_tokenRawByKey.value(QStringLiteral("%1|%2").arg(m_account).arg(t.address.toLower()), 0.0);
         if (bal <= 0.0)
@@ -6491,6 +6575,18 @@ void AeroMainWindow::updateReceive() {
     m_recvBalanceLabel->setText(html);
 }
 
+void AeroMainWindow::fetchCuratedForCurrentAccount() {
+    if (!m_wallet)
+        return;
+    // Small wallets already read the curated tokens in the batched refresh (see refreshAllBalances),
+    // so only large wallets - where the batch skips them to stay under the RPC budget - need this.
+    // Scoped to the one selected account, so it is a handful of reads, not curated×accounts.
+    if (m_wallet->numAccounts() <= 8)
+        return;
+    for (const TokenInfo &t : curatedTopTokens(m_chainId))
+        m_wallet->fetchAvailable(m_account, t.address);
+}
+
 void AeroMainWindow::onAccountChanged(int index) {
     if (index < 0 || !m_wallet) return;
     m_account = static_cast<quint32>(index);
@@ -6499,6 +6595,7 @@ void AeroMainWindow::onAccountChanged(int index) {
         .setValue(selectedAccountKey(m_wallet->walletPath()), m_account);
     showCachedBalance(m_account); // instant bottom-left balance from cache (Feather-style)
     updateReceive();
+    fetchCuratedForCurrentAccount(); // top up this account's curated tokens (e.g. USDC) on big wallets
     // History follows the selected account ONLY when a single-account filter is already active. If the
     // user is on "All accounts" (m_historyFilter < 0) we leave it - so "All" is never silently
     // overridden just by clicking around the Receive list (previously it snapped on every tab open).
@@ -6530,10 +6627,22 @@ void AeroMainWindow::showCachedBalance(quint32 index) {
     QString status = tr("Balance: %1").arg(m_accountBalances.value(index));
     double totalUsd = m_ethRawByAccount.value(index, 0.0) * unitPriceUsd(m_nativeSymbol);
     if (m_wallet) {
-        for (const TokenInfo &t : m_wallet->tokens())
-            totalUsd += m_tokenRawByKey.value(
-                            QStringLiteral("%1|%2").arg(index).arg(t.address.toLower()), 0.0) *
+        // Tracked tokens plus this chain's curated tokens, deduped - so an L2 asset like Arbitrum
+        // USDC (held under its per-chain address, not the mainnet one the tracked list stores)
+        // counts towards the balance shown here, matching the Receive breakdown and Home total.
+        QSet<QString> counted;
+        auto add = [&](const TokenInfo &t) {
+            const QString addr = t.address.toLower();
+            if (counted.contains(addr))
+                return;
+            counted.insert(addr);
+            totalUsd += m_tokenRawByKey.value(QStringLiteral("%1|%2").arg(index).arg(addr), 0.0) *
                         unitPriceUsd(t.symbol);
+        };
+        for (const TokenInfo &t : m_wallet->tokens())
+            add(t);
+        for (const TokenInfo &t : curatedTopTokens(m_chainId))
+            add(t);
     }
     if (totalUsd > 0)
         status += tr("   \u2248 %1").arg(fiatStr(totalUsd));
@@ -6679,8 +6788,6 @@ void AeroMainWindow::onImportKey() {
     selectAddressRow(idx);
     updateReceive();
     onRefresh();
-    QMessageBox::information(this, tr("Imported"),
-                            tr("Imported address #%1:\n%2").arg(idx).arg(m_wallet->address(idx)));
 }
 
 void AeroMainWindow::onAddressContextMenu(const QPoint &pos) {

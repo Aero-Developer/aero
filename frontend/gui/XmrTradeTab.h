@@ -36,6 +36,12 @@ public:
     // would attribute them to the wrong one.
     void setWallet(Wallet *wallet, quint32 account, const QString &address);
 
+signals:
+    // The deposit and withdrawal paths only work while the wallet is on Arbitrum One (the one chain
+    // the bridge accepts). When the user asks to deposit from another chain, the tab asks the main
+    // window to switch rather than failing with an error it cannot act on.
+    void switchToArbitrumRequested();
+
 protected:
     // Polling follows visibility. The exchange is only worth asking while someone is looking, and
     // over Tor an idle five-second poll is a real cost for nothing.
@@ -52,6 +58,7 @@ private slots:
     void onOrderPlaced(const QString &json, const QString &error);
     void onOrderCancelled(const QString &error);
     void onWithdrawn(const QString &error);
+    void onClassTransferred(const QString &error);
     void onDeposited(const QString &txHash, const QString &error);
     void onRedeemed(const QJsonObject &order, const QString &error);
     void onRedeemStatus(const QJsonObject &status, const QString &error);
@@ -93,12 +100,16 @@ private:
     void cancelSelected();
     void deposit();
     void withdraw();
+    void moveToSpot();
     void redeem();
     void fillBook(const QJsonObject &data);
     void fillOrders(const QJsonObject &data);
     void fillFills(const QJsonObject &data);
     void updateLiquidity();
     void updateTotals();
+    void updatePerpNote();     // show/hide the "USDC in perp, move to spot" row from m_usdcPerp
+    void updateWalletUsdc();   // show the on-chain USDC on Arbitrum that a deposit would move
+    void maybeSweepDeposit();  // after a deposit credits into perp, move it into spot automatically
     double groupStep() const; // price increment the book is bucketed into for display
     void setBusy(bool busy);
     // The price a market order should be capped at: through the book by `slippage`, so it fills but
@@ -126,6 +137,18 @@ private:
     QJsonObject m_lastOverview; // last snapshot, so regrouping needs no round trip
     double m_xmr1 = 0.0;
     double m_usdc = 0.0;
+    // USDC that has landed in the perp wallet (e.g. a fresh bridge deposit) but is not yet in spot,
+    // so it cannot buy XMR1 until it is moved across. Shown separately, with a one-click move.
+    double m_usdcPerp = 0.0;
+    // On-chain USDC in this wallet on Arbitrum One - what a deposit would move onto the exchange.
+    // Only known while the wallet is on Arbitrum; `m_onArbitrum` says whether that is the case.
+    double m_usdcArb = 0.0;
+    bool m_onArbitrum = false;
+    // A deposit was just sent and its credit is being waited for, so the first time perp USDC rises
+    // it can be swept into spot automatically. Cleared once swept or once the wait times out.
+    bool m_awaitingDepositCredit = false;
+    double m_perpBeforeDeposit = 0.0;
+    QDateTime m_depositCreditDeadline;
     int m_szDecimals = 2;
     int m_pxDecimals = 6;
 
@@ -143,6 +166,9 @@ private:
     QSplitter *m_hSplit = nullptr; // book and costs beside the order form
     QTreeWidget *m_liquidity = nullptr;
     QLabel *m_balances = nullptr;
+    QLabel *m_walletUsdc = nullptr;   // on-chain USDC on Arbitrum - what is available to deposit
+    QLabel *m_perpNote = nullptr;     // "N USDC just arrived - move it to spot to trade"
+    QPushButton *m_toSpotBtn = nullptr;
     QComboBox *m_side = nullptr;
     QComboBox *m_type = nullptr;
     QLineEdit *m_price = nullptr;

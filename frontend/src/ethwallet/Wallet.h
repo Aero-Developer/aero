@@ -134,6 +134,9 @@ public:
 
     // ##### Hardware wallets #####
     bool isHardware() const;      // keys live on a Ledger/Trezor
+    // The 0-based imported-key ordinal for `index`, or -1 when the account is seed-derived. Lets the
+    // UI name imported accounts ("Imported #n") distinctly from HD ("Account #n") accounts.
+    int accountImportedOrdinal(quint32 index) const;
     QString hwKind() const;       // "ledger" | "trezor" | "" (software)
     // Derive+append one more account from the device (blocks on the device); index or 0xFFFFFFFF.
     quint32 addHardwareAccount();
@@ -398,6 +401,9 @@ public:
     void hlDeposit(quint32 index, const QString &amountUsdc);
     // Withdraw USDC back to Arbitrum; emits hlWithdrawn(err).
     void hlWithdraw(quint32 index, const QString &amountUsdc);
+    // Move USDC between the perp and spot wallets on the exchange; emits hlClassTransferred(err).
+    // toPerp false is perp -> spot, which makes a fresh deposit spendable on the XMR1 book.
+    void hlClassTransfer(quint32 index, const QString &amountUsdc, bool toPerp);
 
     // What redeeming XMR1 for real Monero would cost; emits xmrRedeemQuoted(quote,err).
     void xmrRedeemQuote(quint32 index, const QString &amountXmr1);
@@ -514,6 +520,7 @@ signals:
     void hlOrderCancelled(const QString &error);
     void hlDeposited(const QString &txHash, const QString &error);
     void hlWithdrawn(const QString &error);
+    void hlClassTransferred(const QString &error);
     void xmrRedeemQuoted(const QJsonObject &quote, const QString &error);
     void xmrRedeemed(const QJsonObject &order, const QString &error);
     void xmrRedeemStatusReady(const QJsonObject &status, const QString &error);
@@ -522,6 +529,10 @@ private:
     QString takeLastError() const;
     // Append CoW Protocol swap rows for `accountIndex` to `items` (deduped). Call with m_coreLock held.
     void mergeCowOrders(quint32 accountIndex, QVector<HistoryItem> &items);
+    // Writer preference: block briefly if an account mutation (add/import/scan-commit) is pending, so a
+    // long read task about to take the core read lock yields the wallet to it first. A no-op unless a
+    // writer is currently holding m_writeGate. Call BEFORE taking a QReadLocker in a long network task.
+    void yieldToWriter() { QMutexLocker g(&m_writeGate); }
 
     AeroWallet *m_core = nullptr;
     Status m_status = Status_Ok;
@@ -537,6 +548,14 @@ private:
     // concurrent reads (shared) are allowed and safe; every mutation takes it exclusively (write).
     // Recursive so a read op that calls another read op (e.g. refresh() -> tokens()) won't deadlock.
     mutable QReadWriteLock m_coreLock{QReadWriteLock::Recursive};
+
+    // Writer-preference gate over m_coreLock. QReadWriteLock favours neither side, so a steady stream
+    // of long read locks (a history fan-out over Tor, or the funded scan) can starve a waiting writer
+    // for minutes - which is why "create a new address" (a write) could hang behind a big scan. A
+    // pending mutation grabs this gate first; long read tasks pass THROUGH it (lock+unlock) before
+    // taking their read lock, so once a writer is waiting, no new long read starts and the writer gets
+    // in after the current one drains. Used via coreReadGate()/coreWriteGate() below.
+    QMutex m_writeGate;
 
     // Dedicated pool for network (Tor) tasks. All refresh/fetch methods run here instead of the
     // global QThreadPool, so (a) they never contend with Qt's own worker threads, and (b) the bound

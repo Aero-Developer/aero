@@ -302,6 +302,12 @@ int aero_wallet_file_is_hardware(const char *path,
 int aero_wallet_is_hardware(AeroWallet *w);
 
 /**
+ * The 0-based imported-key ordinal for the account at `index`, or -1 when it is seed-derived (or the
+ * index is out of range). Lets the UI label imported accounts distinctly from HD accounts.
+ */
+int aero_wallet_account_imported_ordinal(AeroWallet *w, uint32_t index);
+
+/**
  * Create an address-only watch wallet from a JSON array of 0x addresses (e.g. `["0x..","0x.."]`).
  * No keys are stored; balances/history work but signing/sending is refused.
  */
@@ -809,6 +815,16 @@ char *aero_wallet_hl_withdraw(AeroWallet *w,
                               const char *amount_usdc);
 
 /**
+ * Move USDC between the perp (margin) and spot wallets on the exchange. `to_perp` true is spot to
+ * perp; false is perp to spot, which makes a fresh bridge deposit spendable on the XMR1 book.
+ * Signed by the account key. Caller frees the string.
+ */
+char *aero_wallet_hl_class_transfer(AeroWallet *w,
+                                    uint32_t index,
+                                    const char *amount_usdc,
+                                    bool to_perp);
+
+/**
  * What redeeming `amount_xmr1` of XMR1 for real Monero would cost: fee, minimum, and net payout.
  * Caller frees the string.
  */
@@ -914,6 +930,23 @@ char *aero_wallet_scan_funded(AeroWallet *w,
 char *aero_wallet_scan_funded_multi(AeroWallet *w,
                                     const char *configs_json,
                                     uint32_t gap_limit);
+
+/**
+ * Read-only funded-address discovery for ONE chain. `config_json` is a single
+ * `{"chain_id":<u64>,"endpoints":["..."],"socks":"..."}` object. Returns a JSON array of
+ * `[scheme, index, path]` triples for aero_wallet_register_scanned to commit. Takes a shared borrow,
+ * so the caller can hold a read lock and release it between chains (keeping add-account responsive).
+ */
+char *aero_wallet_scan_chain_paths(AeroWallet *w,
+                                   const char *config_json,
+                                   uint32_t gap_limit);
+
+/**
+ * Commit funded paths from aero_wallet_scan_chain_paths (JSON array of `[scheme, index, path]`).
+ * Mutates the wallet but does no network I/O. Returns the registered unified indices as a JSON array.
+ */
+char *aero_wallet_register_scanned(AeroWallet *w,
+                                   const char *found_json);
 
 /**
  * Live progress of an in-flight funded scan: number of addresses checked so far. Lock-free; safe to

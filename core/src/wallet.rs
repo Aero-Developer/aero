@@ -513,6 +513,16 @@ impl Wallet {
         Ok(self.account_count() - 1)
     }
 
+    /// The 0-based imported-key ordinal for the account at unified `index`, or `None` when it is
+    /// seed-derived. Lets the UI name imported accounts distinctly ("Imported #n") instead of showing
+    /// them with the same "Account #n" numbering as HD accounts, which they are not.
+    pub fn account_imported_ordinal(&self, index: u32) -> Option<u32> {
+        match self.secrets.account_order.get(index as usize) {
+            Some(AccountEntry::Imported(j)) => Some(*j as u32),
+            _ => None,
+        }
+    }
+
     /// Route a unified account index to a local signing key (software wallets only). Uses the stable
     /// per-account order so an index always resolves to the same key. Errors for hardware wallets.
     fn local_signer(&self, index: u32) -> Result<PrivateKeySigner> {
@@ -1330,6 +1340,36 @@ impl Wallet {
         indices.sort_unstable();
         indices.dedup();
         Ok(indices)
+    }
+
+    /// Read-only funded-address discovery for ONE chain (no mutation). The C++ layer calls this per
+    /// chain under a SHARED (read) lock and releases the lock between chains, so a concurrent
+    /// `add_account` (which needs the exclusive lock) never has to wait for the whole multi-chain scan
+    /// - only for the current chain - instead of being blocked for the scan's full duration. The
+    /// resulting paths are handed back to `register_scanned` under a brief exclusive lock.
+    pub async fn scan_one_chain_paths(
+        &self,
+        config: ProviderConfig,
+        gap_limit: u32,
+    ) -> Result<Vec<(usize, u32, String)>> {
+        if matches!(self.keys, KeySource::Hardware(_) | KeySource::WatchOnly) {
+            return Ok(Vec::new());
+        }
+        if config.endpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let provider = RpcProvider::new(&config)?;
+        Ok(self.scan_chain_paths(&provider, gap_limit).await)
+    }
+
+    /// Register funded paths discovered by `scan_one_chain_paths` (the mutating half of the scan). Held
+    /// under the exclusive lock, but only for this quick in-memory bookkeeping - never across network
+    /// I/O - so it can't stall other account operations.
+    pub fn register_scanned(&mut self, found: &[(usize, u32, String)]) -> Vec<u32> {
+        let mut indices = self.register_found(found);
+        indices.sort_unstable();
+        indices.dedup();
+        indices
     }
 
     /// ETH/USD price read on-chain from the Chainlink mainnet aggregator via `eth_call`
@@ -2755,9 +2795,10 @@ impl Wallet {
         let market = hyperliquid::find_market(provider, hyperliquid::XMR1).await?;
         let user = self.address(index)?;
 
-        let (book, balances, orders, fills) = futures::join!(
+        let (book, balances, perp, orders, fills) = futures::join!(
             hyperliquid::book(provider, &market.coin),
             hyperliquid::balances(provider, &user),
+            hyperliquid::perp_usdc(provider, &user),
             hyperliquid::open_orders(provider, &user),
             hyperliquid::fills(provider, &user),
         );
@@ -2768,6 +2809,9 @@ impl Wallet {
         // too busy to say otherwise.
         let book = book?;
         let balances = balances?;
+        // The perp wallet is where a deposit first lands, so a failed read here would leave a
+        // just-deposited balance invisible - the exact confusion this field exists to clear up.
+        let perp = perp?;
 
         // Only this market's orders and fills: the account may have traded other things.
         let orders: Vec<_> = orders?.into_iter().filter(|o| o.coin == market.coin).collect();
@@ -2785,6 +2829,30 @@ impl Wallet {
             }
         };
 
+        // On-chain USDC in this wallet, so the deposit screen can say what there is to deposit. Only
+        // meaningful on Arbitrum One - the one chain the bridge accepts - so on any other chain there
+        // is nothing to deposit from here and `usdc_arb` is left empty. Best-effort: one extra
+        // `balanceOf` that must never fail the trading screen, so a hiccup degrades to empty rather
+        // than blanking the book, the balances and the orders alongside it. USDC on Arbitrum is
+        // six-decimal (its contract, not a guess), so this reads the balance directly.
+        let on_arbitrum = provider.chain_id() == hyperliquid::ARBITRUM_CHAIN_ID;
+        let usdc_arb = if on_arbitrum {
+            let call = format!(
+                "0x{}",
+                hex::encode(erc20::encode_balance_of(parse_address(&user)?))
+            );
+            match provider.eth_call(hyperliquid::USDC_ARBITRUM, &call).await {
+                Ok(ret) => hex_bytes(&ret)
+                    .ok()
+                    .and_then(|b| erc20::decode_u256(&b))
+                    .map(|bal| format_units(bal, 6))
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
         Ok(serde_json::json!({
             "market": market.coin,
             "sz_decimals": market.sz_decimals,
@@ -2795,6 +2863,14 @@ impl Wallet {
             "mid": book.mid(),
             "xmr1": held(hyperliquid::XMR1),
             "usdc": held("USDC"),
+            // USDC that a bridge deposit has credited but that is still in the perp wallet, so the
+            // trading screen can show it and offer to move it into spot rather than appear stuck at
+            // zero while the money is one wallet over.
+            "usdc_perp": format!("{perp}"),
+            // Whether the wallet is on Arbitrum One, and if so its on-chain USDC balance - what the
+            // deposit screen offers to move onto the exchange. Empty when not on Arbitrum.
+            "on_arbitrum": on_arbitrum,
+            "usdc_arb": usdc_arb,
             "open_orders": orders,
             "fills": fills,
         }))
@@ -2926,23 +3002,83 @@ impl Wallet {
         .await
     }
 
+    /// Move USDC between the perp (margin) and spot wallets on the exchange.
+    ///
+    /// The two are separate ledgers under one address, and this is the only thing that moves value
+    /// across. `to_perp` is `false` for perp -> spot, which is what makes a fresh bridge deposit
+    /// spendable on the XMR1 book, and `true` for the reverse. Signed by the account key; the trading
+    /// agent is deliberately not allowed to move money.
+    pub async fn hl_class_transfer(
+        &self,
+        index: u32,
+        amount_usdc: &str,
+        to_perp: bool,
+    ) -> Result<serde_json::Value> {
+        let amount = amount_usdc.trim();
+        if amount.parse::<f64>().unwrap_or(0.0) <= 0.0 {
+            return Err(CoreError::Amount("enter how much USDC to move".to_string()));
+        }
+        let unsigned = hyperliquid::class_transfer_action(amount, to_perp);
+        let account = self.local_signer(index)?;
+        let body = self.hl_sign(&account, &unsigned)?;
+        hyperliquid::submit(self.provider()?, &body).await
+    }
+
     /// Withdraw USDC from the exchange back to Arbitrum.
     ///
     /// Signed by the account key, not the agent - an agent deliberately cannot do this. The funds
     /// arrive at the same address on Arbitrum, minus the exchange's flat fee.
+    ///
+    /// A withdrawal is paid out of the perp wallet, but selling XMR1 leaves the proceeds in spot. So
+    /// if the perp wallet is short, the shortfall is gathered from spot first: without it, someone
+    /// who just sold XMR1 would be told they have no USDC to withdraw while it sits one wallet over.
     pub async fn hl_withdraw(&self, index: u32, amount_usdc: &str) -> Result<serde_json::Value> {
-        let amount = amount_usdc.trim().parse::<f64>().unwrap_or(0.0);
-        if amount <= hyperliquid::WITHDRAW_FEE_USDC {
+        let provider = self.provider()?;
+        let want = amount_usdc.trim().parse::<f64>().unwrap_or(0.0);
+        if want <= hyperliquid::WITHDRAW_FEE_USDC {
             return Err(CoreError::Amount(format!(
                 "the exchange takes a {} USDC fee, so a withdrawal has to be larger than that",
                 hyperliquid::WITHDRAW_FEE_USDC
             )));
         }
-        let destination = parse_address(&self.address(index)?)?;
-        let unsigned = hyperliquid::withdraw_action(destination, amount_usdc.trim());
+        let user = self.address(index)?;
         let account = self.local_signer(index)?;
+
+        let perp = hyperliquid::perp_usdc(provider, &user).await?;
+        if perp + 1e-6 < want {
+            let spot = self.hl_spot_balance(index, "USDC").await?;
+            if perp + spot + 1e-6 < want {
+                return Err(CoreError::Amount(format!(
+                    "that is more USDC than this account holds on the exchange ({:.2} available)",
+                    perp + spot
+                )));
+            }
+            // Move only the shortfall, rounded up to USDC's six places so the perp wallet lands at
+            // or just above the target instead of a hair below it, and never more than spot holds.
+            let need = (((want - perp) * 1e6).ceil() / 1e6).min(spot);
+            let move_amount = hyperliquid::format_size(need, 6);
+            let unsigned = hyperliquid::class_transfer_action(&move_amount, true);
+            let body = self.hl_sign(&account, &unsigned)?;
+            hyperliquid::submit(provider, &body).await?;
+        }
+
+        // Re-read the perp wallet after any move: a class transfer settles at once, and withdrawing
+        // more than it now holds is rejected. Withdraw the smaller of what was asked and what is
+        // there, so rounding dust from the move can never turn into a rejection.
+        let available = hyperliquid::perp_usdc(provider, &user).await?;
+        let amount = want.min(available);
+        if amount <= hyperliquid::WITHDRAW_FEE_USDC {
+            return Err(CoreError::Amount(
+                "the USDC could not be gathered into the withdrawable balance - try again in a \
+                 moment"
+                    .to_string(),
+            ));
+        }
+        let destination = parse_address(&user)?;
+        let unsigned =
+            hyperliquid::withdraw_action(destination, &hyperliquid::format_size(amount, 6));
         let body = self.hl_sign(&account, &unsigned)?;
-        hyperliquid::submit(self.provider()?, &body).await
+        hyperliquid::submit(provider, &body).await
     }
 
     /// What redeeming XMR1 for real Monero would cost right now.

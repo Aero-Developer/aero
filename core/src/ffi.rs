@@ -386,6 +386,19 @@ pub extern "C" fn aero_wallet_is_hardware(w: *mut Wallet) -> c_int {
     }
 }
 
+/// The 0-based imported-key ordinal for the account at `index`, or -1 when it is seed-derived (or the
+/// index is out of range). Lets the UI label imported accounts distinctly from HD accounts.
+#[no_mangle]
+pub extern "C" fn aero_wallet_account_imported_ordinal(w: *mut Wallet, index: u32) -> c_int {
+    match unsafe { w.as_ref() } {
+        Some(w) => w
+            .account_imported_ordinal(index)
+            .map(|j| j as c_int)
+            .unwrap_or(-1),
+        None => -1,
+    }
+}
+
 /// Create an address-only watch wallet from a JSON array of 0x addresses (e.g. `["0x..","0x.."]`).
 /// No keys are stored; balances/history work but signing/sending is refused.
 #[no_mangle]
@@ -1540,6 +1553,23 @@ pub extern "C" fn aero_wallet_hl_withdraw(
     block_json(w, |w| RUNTIME.block_on(w.hl_withdraw(index, &amount)))
 }
 
+/// Move USDC between the perp (margin) and spot wallets on the exchange. `to_perp` true is spot to
+/// perp; false is perp to spot, which makes a fresh bridge deposit spendable on the XMR1 book.
+/// Signed by the account key. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_hl_class_transfer(
+    w: *mut Wallet,
+    index: u32,
+    amount_usdc: *const c_char,
+    to_perp: bool,
+) -> *mut c_char {
+    let Some(amount) = from_cstr(amount_usdc) else {
+        set_error("null args");
+        return ptr::null_mut();
+    };
+    block_json(w, |w| RUNTIME.block_on(w.hl_class_transfer(index, &amount, to_perp)))
+}
+
 /// What redeeming `amount_xmr1` of XMR1 for real Monero would cost: fee, minimum, and net payout.
 /// Caller frees the string.
 #[no_mangle]
@@ -1793,6 +1823,92 @@ pub extern "C" fn aero_wallet_scan_funded_multi(
 #[no_mangle]
 pub extern "C" fn aero_wallet_scan_progress() -> u64 {
     crate::wallet::SCAN_CHECKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read-only funded-address discovery for ONE chain (see `Wallet::scan_one_chain_paths`).
+/// `config_json` is a single `{chain_id, endpoints, socks}` object. Returns a JSON array of
+/// `[scheme, index, path]` triples (the funded derivation paths), for `aero_wallet_register_scanned`
+/// to commit. This half takes only a SHARED borrow, so the caller can hold a read lock (and release
+/// it between chains), keeping account mutations like add-account responsive during the scan. Caller
+/// frees.
+#[no_mangle]
+pub extern "C" fn aero_wallet_scan_chain_paths(
+    w: *mut Wallet,
+    config_json: *const c_char,
+    gap_limit: u32,
+) -> *mut c_char {
+    clear_error();
+    let Some(w) = (unsafe { w.as_ref() }) else {
+        set_error("null wallet");
+        return ptr::null_mut();
+    };
+    let Some(js) = from_cstr(config_json) else {
+        set_error("null config");
+        return ptr::null_mut();
+    };
+    #[derive(serde::Deserialize)]
+    struct ScanChain {
+        chain_id: u64,
+        endpoints: Vec<String>,
+        #[serde(default)]
+        socks: String,
+    }
+    let Ok(c) = serde_json::from_str::<ScanChain>(&js) else {
+        set_error("bad config json");
+        return ptr::null_mut();
+    };
+    let socks = c.socks.trim().to_string();
+    let direct = socks.is_empty();
+    let config = ProviderConfig {
+        chain_id: c.chain_id,
+        endpoints: c.endpoints,
+        socks_proxy: if direct { None } else { Some(socks) },
+        allow_clearnet: direct,
+        timeout_secs: 30,
+    };
+    match RUNTIME.block_on(crate::provider::background(
+        w.scan_one_chain_paths(config, gap_limit),
+    )) {
+        Ok(v) => match serde_json::to_string(&v) {
+            Ok(s) => to_cstr(&s),
+            Err(e) => {
+                set_error(e.to_string());
+                ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Commit funded paths discovered by `aero_wallet_scan_chain_paths` (a JSON array of `[scheme, index,
+/// path]` triples). Mutating half of the scan; takes an exclusive borrow but does no network I/O.
+/// Returns a JSON array of the unified account indices registered. Caller frees.
+#[no_mangle]
+pub extern "C" fn aero_wallet_register_scanned(
+    w: *mut Wallet,
+    found_json: *const c_char,
+) -> *mut c_char {
+    clear_error();
+    let Some(w) = (unsafe { w.as_mut() }) else {
+        set_error("null wallet");
+        return ptr::null_mut();
+    };
+    let Some(js) = from_cstr(found_json) else {
+        set_error("null found");
+        return ptr::null_mut();
+    };
+    let found: Vec<(usize, u32, String)> = serde_json::from_str(&js).unwrap_or_default();
+    let indices = w.register_scanned(&found);
+    match serde_json::to_string(&indices) {
+        Ok(s) => to_cstr(&s),
+        Err(e) => {
+            set_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
 }
 
 /// Live progress of an in-flight funded scan: number of funded addresses found so far. Lock-free.

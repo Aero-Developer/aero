@@ -69,7 +69,11 @@ QVariant AddressModel::data(const QModelIndex &index, int role) const {
         case Column_Address:
             return m_wallet->address(acct);
         case Column_Label:
-            return m_labels.value(acct);
+            // A user-set label always wins; otherwise imported accounts fall back to a default name
+            // ("Imported #n") for display, but stay empty for editing so the field starts blank.
+            if (const QString custom = m_labels.value(acct); !custom.isEmpty())
+                return custom;
+            return role == Qt::DisplayRole ? m_importedNames.value(acct) : QString();
         case Column_Balance:
             return m_balances.value(acct); // empty until the balance arrives
         default:
@@ -143,6 +147,14 @@ void AddressModel::setLabel(quint32 index, const QString &label) {
         const QModelIndex cell = this->index(row, Column_Label);
         emit dataChanged(cell, cell, {Qt::DisplayRole, Qt::EditRole});
     }
+}
+
+void AddressModel::setImportedNames(const QHash<quint32, QString> &names) {
+    m_importedNames = names;
+    if (!m_visible.isEmpty())
+        emit dataChanged(index(0, Column_Label),
+                         index(static_cast<int>(m_visible.size()) - 1, Column_Label),
+                         {Qt::DisplayRole});
 }
 
 void AddressModel::setUsed(quint32 index, bool used) {

@@ -44,6 +44,14 @@ constexpr double kMarketSlippage = 0.02; // 2%
 // order is answered in the ticket instead of after a round trip to the exchange.
 constexpr double kMinOrderUsdc = 10.0;
 
+// The fraction of the USDC balance a Max buy commits. It cannot be the whole balance: the exchange
+// charges a taker fee (well under 0.1% on spot) that the order still has to leave room for, or it is
+// rejected for insufficient balance. A tenth of a percent covers that fee with a little to spare,
+// where the old half-percent quietly left thirty dollars of a six-thousand-dollar balance unspent -
+// which is exactly the "Max isn't the max" this is. Selling is exact and takes no haircut: the
+// balance itself is what moves, and any fee comes out of the USDC received.
+constexpr double kMaxBuyCommit = 0.999;
+
 // How far a limit price may sit through the book before the confirmation treats it as a mistake
 // rather than an intention. A limit order priced past the touch does not rest, it trades - so a
 // price typed with a digit too many is not an order that can be cancelled, it is a trade that has
@@ -229,6 +237,7 @@ void XmrTradeTab::setWallet(Wallet *wallet, quint32 account, const QString &addr
     connect(m_wallet, &Wallet::hlOrderPlaced, this, &XmrTradeTab::onOrderPlaced);
     connect(m_wallet, &Wallet::hlOrderCancelled, this, &XmrTradeTab::onOrderCancelled);
     connect(m_wallet, &Wallet::hlWithdrawn, this, &XmrTradeTab::onWithdrawn);
+    connect(m_wallet, &Wallet::hlClassTransferred, this, &XmrTradeTab::onClassTransferred);
     connect(m_wallet, &Wallet::hlDeposited, this, &XmrTradeTab::onDeposited);
     connect(m_wallet, &Wallet::xmrRedeemed, this, &XmrTradeTab::onRedeemed);
     connect(m_wallet, &Wallet::xmrRedeemStatusReady, this, &XmrTradeTab::onRedeemStatus);
@@ -442,6 +451,35 @@ void XmrTradeTab::buildUi() {
     m_balances->setWordWrap(true);
     t->addWidget(m_balances);
 
+    // The on-chain USDC this wallet holds on Arbitrum One - what a deposit would move onto the
+    // exchange. Kept next to the balances so "how much can I deposit" is answered before the button
+    // is pressed, not inside the dialog after it.
+    m_walletUsdc = new QLabel(ticket);
+    m_walletUsdc->setTextFormat(Qt::RichText);
+    m_walletUsdc->setWordWrap(true);
+    m_walletUsdc->setOpenExternalLinks(false);
+    connect(m_walletUsdc, &QLabel::linkActivated, this,
+            [this](const QString &) { emit switchToArbitrumRequested(); });
+    t->addWidget(m_walletUsdc);
+    m_walletUsdc->hide();
+
+    // Shown only when USDC has landed in the perp wallet but is not yet in spot - a fresh deposit,
+    // most often. Without this the money is simply invisible on the trading screen, which is exactly
+    // what "it says it credited but I have 0.00" looks like.
+    auto *perpRow = new QHBoxLayout();
+    perpRow->setContentsMargins(0, 0, 0, 0);
+    m_perpNote = new QLabel(ticket);
+    m_perpNote->setTextFormat(Qt::RichText);
+    m_perpNote->setWordWrap(true);
+    m_toSpotBtn = new QPushButton(tr("Move to spot"), ticket);
+    m_toSpotBtn->setCursor(Qt::PointingHandCursor);
+    perpRow->addWidget(m_perpNote, 1);
+    perpRow->addWidget(m_toSpotBtn, 0, Qt::AlignTop);
+    t->addLayout(perpRow);
+    m_perpNote->hide();
+    m_toSpotBtn->hide();
+    connect(m_toSpotBtn, &QPushButton::clicked, this, &XmrTradeTab::moveToSpot);
+
     auto *form = new QFormLayout();
     form->setVerticalSpacing(4);
     form->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -650,7 +688,7 @@ void XmrTradeTab::buildUi() {
             // price would overstate what it buys, because a size past the first level is filled at
             // worse prices than the first level quotes. The haircut leaves room for the taker fee
             // and for the book moving between here and the fill.
-            double budget = avail * 0.995;
+            double budget = avail * kMaxBuyCommit;
             double bought = 0.0;
             for (const Level &lvl : m_rawAsks) {
                 if (budget <= 0.0)
@@ -665,7 +703,7 @@ void XmrTradeTab::buildUi() {
             // haircut for the fee.
             const double px = m_price->text().toDouble();
             if (px > 0.0)
-                m_size->setText(truncNum(avail / px * 0.995, m_szDecimals));
+                m_size->setText(truncNum(avail / px * kMaxBuyCommit, m_szDecimals));
         } else {
             // Selling: the balance is the thing being sold, so it is exact - but it must be rounded
             // down to a tick, since rounding up would ask for more XMR1 than the account holds.
@@ -748,6 +786,11 @@ void XmrTradeTab::setBusy(bool busy) {
     // account that has never enabled trading - someone who only wants their XMR out should not have
     // to authorise trading first.
     m_redeemBtn->setEnabled(!busy && m_xmr1 > 0.0);
+    if (m_toSpotBtn)
+        m_toSpotBtn->setEnabled(!busy);
+    // The perp row carries its own move button, so it has to follow the busy state too: hidden while
+    // a transfer is in flight, back once it settles.
+    updatePerpNote();
 }
 
 double XmrTradeTab::available(bool isBuy) const {
@@ -824,17 +867,109 @@ void XmrTradeTab::onOverview(quint32 account, const QString &json, const QString
              - xmr1.value(QStringLiteral("hold")).toString().toDouble();
     m_usdc = usdc.value(QStringLiteral("total")).toString().toDouble()
              - usdc.value(QStringLiteral("hold")).toString().toDouble();
+    // USDC still in the perp wallet - a deposit that has credited but is not yet tradable.
+    m_usdcPerp = data.value(QStringLiteral("usdc_perp")).toString().toDouble();
+    // On-chain USDC on Arbitrum - what a deposit would move onto the exchange. Empty (and
+    // m_onArbitrum false) when the wallet is on another chain, where there is nothing to deposit.
+    m_onArbitrum = data.value(QStringLiteral("on_arbitrum")).toBool();
+    m_usdcArb = data.value(QStringLiteral("usdc_arb")).toString().toDouble();
 
     m_balances->setText(tr("<b>%1</b> XMR1 &nbsp;&nbsp; <b>%2</b> USDC "
-                           "<span style='color:%3'>available on the exchange</span>")
+                           "<span style='color:%3'>available to trade</span>")
                             .arg(money(m_xmr1, 4), money(m_usdc, 2),
                                  QString::fromLatin1(kMuted)));
+
+    updatePerpNote();
+    updateWalletUsdc();
+    maybeSweepDeposit();
 
     fillBook(data);
     fillOrders(data);
     fillFills(data);
     updateTotals();
     setBusy(m_inFlight); // the balance just moved, and redeeming depends on it
+}
+
+void XmrTradeTab::updatePerpNote() {
+    if (!m_perpNote || !m_toSpotBtn)
+        return;
+    // A little dust can linger in perp from rounding; below a cent there is nothing worth moving and
+    // the row would just nag. The exchange also will not transfer a zero.
+    if (m_usdcPerp < 0.01 || m_inFlight) {
+        m_perpNote->hide();
+        m_toSpotBtn->hide();
+        return;
+    }
+    m_perpNote->setText(tr("<span style='color:%1'><b>%2</b> USDC arrived in your perps balance. "
+                           "Move it to spot to trade or withdraw it.</span>")
+                            .arg(QString::fromLatin1(kDown), money(m_usdcPerp, 2)));
+    m_perpNote->show();
+    m_toSpotBtn->show();
+}
+
+void XmrTradeTab::updateWalletUsdc() {
+    if (!m_walletUsdc)
+        return;
+    // Off Arbitrum there is nothing here to deposit from, so rather than show a misleading zero the
+    // row says what has to change and offers to change it. The link fires switchToArbitrumRequested,
+    // which the main window turns into a chain switch.
+    if (!m_onArbitrum) {
+        m_walletUsdc->setText(tr("<span style='color:%1'>To deposit USDC, "
+                                 "<a href='#'>switch this wallet to Arbitrum One</a>.</span>")
+                                  .arg(QString::fromLatin1(kMuted)));
+        m_walletUsdc->show();
+        return;
+    }
+    // On Arbitrum: show the wallet's USDC, which is exactly what the deposit button can move onto the
+    // exchange. Shown even at zero so "nothing to deposit" is explicit rather than a blank.
+    m_walletUsdc->setText(tr("<span style='color:%1'><b>%2</b> USDC in your wallet on Arbitrum, "
+                             "available to deposit.</span>")
+                              .arg(QString::fromLatin1(kMuted), money(m_usdcArb, 2)));
+    m_walletUsdc->show();
+}
+
+void XmrTradeTab::maybeSweepDeposit() {
+    if (!m_awaitingDepositCredit || m_inFlight)
+        return;
+    // Give up waiting after a few minutes: the credit either never came (a deposit below the
+    // bridge's minimum, say) or the user has already moved it by hand. The perp row still offers the
+    // move, so nothing is stranded - this only stops the automatic sweep from firing forever.
+    if (m_depositCreditDeadline.isValid()
+        && QDateTime::currentDateTime() > m_depositCreditDeadline) {
+        m_awaitingDepositCredit = false;
+        return;
+    }
+    // The deposit has landed once perp USDC climbs past where it was when the deposit was sent. Sweep
+    // the whole perp balance into spot in one move - in this wallet USDC only ever belongs in spot,
+    // where XMR1 trades.
+    if (m_usdcPerp > m_perpBeforeDeposit + 0.01) {
+        m_awaitingDepositCredit = false;
+        m_status->setText(tr("Deposit credited. Moving it to your spot balance to trade…"));
+        setBusy(true);
+        m_wallet->hlClassTransfer(m_account, truncNum(m_usdcPerp, 6), false);
+    }
+}
+
+void XmrTradeTab::moveToSpot() {
+    if (!m_wallet || m_usdcPerp < 0.01)
+        return;
+    m_awaitingDepositCredit = false; // a manual move settles what the sweep was waiting for
+    setBusy(true);
+    m_status->setText(tr("Moving %1 USDC to your spot balance…").arg(money(m_usdcPerp, 2)));
+    m_wallet->hlClassTransfer(m_account, truncNum(m_usdcPerp, 6), false);
+}
+
+void XmrTradeTab::onClassTransferred(const QString &error) {
+    setBusy(false);
+    if (!error.isEmpty()) {
+        m_status->setText(QStringLiteral("<span style='color:%1'>%2</span>")
+                              .arg(QString::fromLatin1(kDown), error.toHtmlEscaped()));
+    } else {
+        m_status->setText(QStringLiteral("<span style='color:%1'>%2</span>")
+                              .arg(QString::fromLatin1(kUp),
+                                   tr("USDC moved to spot. You can trade it now.")));
+    }
+    refresh(true);
 }
 
 double XmrTradeTab::groupStep() const {
@@ -1487,15 +1622,41 @@ void XmrTradeTab::onOrderCancelled(const QString &error) {
 void XmrTradeTab::deposit() {
     if (!m_wallet)
         return;
+    // The bridge only accepts USDC on Arbitrum One, so a deposit from any other chain cannot work.
+    // Offer to switch rather than let the user type an amount that the core will only then reject.
+    if (!m_onArbitrum) {
+        if (QMessageBox::question(
+                this, tr("Deposit USDC"),
+                tr("Depositing USDC uses Hyperliquid's bridge on Arbitrum One, but this wallet is on "
+                   "another network.\n\nSwitch to Arbitrum One now?"),
+                QMessageBox::Ok | QMessageBox::Cancel, QMessageBox::Ok)
+            == QMessageBox::Ok)
+            emit switchToArbitrumRequested();
+        return;
+    }
     bool ok = false;
     const QString amount = QInputDialog::getText(
         this, tr("Deposit USDC"),
         tr("How much USDC to move from Arbitrum One onto the exchange?\n\n"
            "It is sent from this wallet to Hyperliquid's bridge and credits to the same "
-           "address a minute or so later. The minimum is 5 USDC; anything less is lost."),
+           "address a minute or so later. Aero then moves it into your spot balance so it can "
+           "buy XMR1. The minimum is 5 USDC; anything less is lost.\n\n"
+           "Available: %1 USDC")
+            .arg(money(m_usdcArb, 2)),
         QLineEdit::Normal, QString(), &ok);
     if (!ok || amount.trimmed().isEmpty())
         return;
+    // Answer an obvious over-spend here instead of after a round trip that estimates gas and fails.
+    const double want = amount.trimmed().toDouble();
+    if (want <= 0.0) {
+        m_status->setText(tr("Enter how much USDC to deposit."));
+        return;
+    }
+    if (want > m_usdcArb + 1e-9 && m_usdcArb > 0.0) {
+        m_status->setText(tr("That is %1 USDC and your wallet holds %2 on Arbitrum.")
+                              .arg(money(want, 2), money(m_usdcArb, 2)));
+        return;
+    }
     if (QMessageBox::question(
             this, tr("Deposit USDC"),
             tr("Send %1 USDC to Hyperliquid's bridge on Arbitrum One?\n\n"
@@ -1520,20 +1681,34 @@ void XmrTradeTab::onDeposited(const QString &txHash, const QString &error) {
                               .arg(QString::fromLatin1(kDown), error.toHtmlEscaped()));
         return;
     }
-    m_status->setText(tr("Deposit sent (%1). It credits in about a minute.")
+    // The bridge credits the perp wallet, not spot, so once it lands the balance has to be moved
+    // before it can buy XMR1. Remember where perp stood so the next rise is recognised as this
+    // deposit arriving, and sweep it into spot automatically when it does.
+    m_awaitingDepositCredit = true;
+    m_perpBeforeDeposit = m_usdcPerp;
+    m_depositCreditDeadline = QDateTime::currentDateTime().addSecs(5 * 60);
+    m_status->setText(tr("Deposit sent (%1). It credits in about a minute, then Aero moves it to "
+                         "your spot balance so you can trade.")
                           .arg(txHash.left(10) + QStringLiteral("…")));
+    // The regular five-second poll will catch the credit, but nudge it sooner so the wait feels
+    // like the "about a minute" it is rather than being rounded up by the poll interval.
+    QTimer::singleShot(20000, this, [this]() { refresh(true); });
+    QTimer::singleShot(45000, this, [this]() { refresh(true); });
 }
 
 void XmrTradeTab::withdraw() {
     if (!m_wallet)
         return;
+    // A withdrawal is paid out of the perp wallet, and the core moves spot USDC across as needed, so
+    // everything on the exchange is available - not just what happens to be in spot right now.
+    const double onExchange = m_usdc + m_usdcPerp;
     bool ok = false;
     const QString amount = QInputDialog::getText(
         this, tr("Withdraw USDC"),
         tr("How much USDC to send back to Arbitrum One?\n\n"
            "It arrives at this same address, minus the exchange's 1 USDC fee, after a few minutes.\n\n"
            "Available: %1 USDC")
-            .arg(money(m_usdc, 2)),
+            .arg(money(onExchange, 2)),
         QLineEdit::Normal, QString(), &ok);
     if (!ok || amount.trimmed().isEmpty())
         return;
@@ -1545,9 +1720,9 @@ void XmrTradeTab::withdraw() {
         m_status->setText(tr("Enter how much USDC to withdraw."));
         return;
     }
-    if (want > m_usdc) {
+    if (want > onExchange) {
         m_status->setText(tr("That is %1 USDC and this account has %2 available.")
-                              .arg(money(want, 2), money(m_usdc, 2)));
+                              .arg(money(want, 2), money(onExchange, 2)));
         return;
     }
     if (QMessageBox::question(

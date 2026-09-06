@@ -237,6 +237,30 @@ pub async fn balances(provider: &RpcProvider, user: &str) -> Result<Vec<Balance>
     Ok(out)
 }
 
+/// USDC sitting in the perp (margin) wallet, free of anything held as margin.
+///
+/// This is the balance that matters to funding, and it trips people up: a bridge deposit credits
+/// *here*, not into spot, and a withdrawal is paid out from *here* too. But the XMR1 book trades in
+/// spot (see [`balances`]), so USDC has to be moved across before it can buy anything. The two
+/// wallets are separate ledgers under one address, and [`class_transfer_action`] is the only thing
+/// that moves value between them.
+///
+/// An account that has never funded the perp wallet returns zero, not an error.
+pub async fn perp_usdc(provider: &RpcProvider, user: &str) -> Result<f64> {
+    let v = info(
+        provider,
+        &serde_json::json!({ "type": "clearinghouseState", "user": user.to_lowercase() }),
+    )
+    .await?;
+    // `withdrawable` is the free USDC in the perp wallet. Its absence is the exchange failing to
+    // answer, not a zero balance - read as zero it would hide a deposit that has really landed and
+    // leave the trading screen stuck at 0.00 while the money sits one wallet over.
+    let Some(w) = v.get("withdrawable").and_then(|x| x.as_str()) else {
+        return Err(CoreError::rpc(format!("hyperliquid perp state: unexpected reply {v}")));
+    };
+    Ok(w.parse::<f64>().unwrap_or(0.0))
+}
+
 /// A resting order.
 #[derive(Clone, Debug, Serialize)]
 pub struct OpenOrder {
@@ -539,6 +563,42 @@ pub fn approve_agent_action(agent: Address, name: &str) -> Unsigned {
     }
 }
 
+/// Move USDC between the perp (margin) wallet and the spot wallet under this account.
+///
+/// This is the action that resolves the whole spot/perp split: a bridge deposit lands in the perp
+/// wallet, but the XMR1 book trades out of spot, so a fresh deposit shows as 0 to trade until it is
+/// moved across - and a withdrawal pays out of perp, so proceeds from selling XMR1 have to move back
+/// before they can leave. `to_perp` is `false` for perp -> spot (making a deposit spendable) and
+/// `true` for the reverse. Signed by the account key, never the trading agent: it moves money, and
+/// an agent may only place and cancel orders.
+pub fn class_transfer_action(amount: &str, to_perp: bool) -> Unsigned {
+    let nonce = now_ms();
+    let action = serde_json::json!({
+        "type": "usdClassTransfer",
+        "signatureChainId": "0x66eee",
+        "hyperliquidChain": "Mainnet",
+        "amount": amount,
+        "toPerp": to_perp,
+        "nonce": nonce,
+    });
+    let (domain_separator, struct_hash) = user_signed_parts(
+        "HyperliquidTransaction:UsdClassTransfer",
+        &[
+            ("hyperliquidChain", Field::Str("Mainnet".into())),
+            ("amount", Field::Str(amount.to_string())),
+            ("toPerp", Field::Bool(to_perp)),
+            ("nonce", Field::Uint(nonce)),
+        ],
+    );
+    Unsigned {
+        action,
+        nonce,
+        digest: digest(domain_separator, struct_hash),
+        domain_separator,
+        struct_hash,
+    }
+}
+
 /// Withdraw USDC from the exchange to `destination` on Arbitrum.
 ///
 /// The exchange takes a flat fee (see [`WITHDRAW_FEE_USDC`]) out of the amount, and the funds arrive
@@ -710,6 +770,7 @@ enum Field {
     Str(String),
     Address(Address),
     Uint(u64),
+    Bool(bool),
 }
 
 impl Field {
@@ -718,6 +779,7 @@ impl Field {
             Field::Str(_) => "string",
             Field::Address(_) => "address",
             Field::Uint(_) => "uint64",
+            Field::Bool(_) => "bool",
         }
     }
 
@@ -727,6 +789,8 @@ impl Field {
             Field::Str(s) => word.copy_from_slice(keccak256(s.as_bytes()).as_slice()),
             Field::Address(a) => word[12..].copy_from_slice(a.as_slice()),
             Field::Uint(n) => word[24..].copy_from_slice(&n.to_be_bytes()),
+            // A bool is an abi-encoded uint: zero everywhere but the last byte, 1 for true.
+            Field::Bool(b) => word[31] = u8::from(*b),
         }
         word
     }
@@ -1072,5 +1136,47 @@ mod tests {
         )
         .unwrap();
         assert_ne!(u.digest, order.digest);
+    }
+
+    #[test]
+    fn a_bool_field_encodes_like_an_abi_uint() {
+        // toPerp is the one bool in any action here, and a wrong encoding sends the transfer the
+        // opposite way - spot to perp when the user meant perp to spot, or vice versa.
+        assert_eq!(Field::Bool(true).encode()[31], 1);
+        assert_eq!(Field::Bool(false).encode()[31], 0);
+        assert!(Field::Bool(true).encode()[..31].iter().all(|b| *b == 0));
+        assert_eq!(Field::Bool(true).type_name(), "bool");
+    }
+
+    #[test]
+    fn a_class_transfer_signs_the_documented_fields() {
+        // Hyperliquid's SDK publishes no signing vector for usdClassTransfer, so the two things a
+        // wrong signature would come from are pinned directly: the request body, and the encoded
+        // type string that keccak-hashes into what gets signed. The signing *mechanism* underneath
+        // (user_signed_parts) is the same one the withdraw and usd-transfer vectors above already
+        // prove, so agreement on the type string is agreement with the exchange.
+        let u = class_transfer_action("25", false);
+        assert_eq!(u.action["type"], "usdClassTransfer");
+        assert_eq!(u.action["signatureChainId"], "0x66eee");
+        assert_eq!(u.action["hyperliquidChain"], "Mainnet");
+        assert_eq!(u.action["amount"], "25");
+        assert_eq!(u.action["toPerp"], false);
+        assert_eq!(u.action["nonce"], u.nonce);
+
+        let (_domain, want) = user_signed_parts(
+            "HyperliquidTransaction:UsdClassTransfer",
+            &[
+                ("hyperliquidChain", Field::Str("Mainnet".into())),
+                ("amount", Field::Str("25".into())),
+                ("toPerp", Field::Bool(false)),
+                ("nonce", Field::Uint(u.nonce)),
+            ],
+        );
+        assert_eq!(u.struct_hash, want);
+
+        // The direction is part of the signature, not just the body: the two ways round must not
+        // produce the same struct hash, or a perp->spot move could be replayed as spot->perp.
+        let to_perp = class_transfer_action("25", true);
+        assert_ne!(u.struct_hash, to_perp.struct_hash);
     }
 }

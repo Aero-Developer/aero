@@ -164,6 +164,10 @@ private:
     void showTransactionDialog(const HistoryItem &tx); // Feather-style tx details (txid + copy)
     void refreshHistoryView();             // full (re)load: clear + fetch viewed + funded accounts
     void ensureAccountHistory(quint32 index, bool force = false); // targeted fetch (lazy/on-demand)
+    // Ensure history is loaded for every funded account AND every account the user has labelled, so a
+    // named account that isn't funded (e.g. one that only ever held a token) still shows in the
+    // All-accounts view. Deduped via m_histFetched, so cached/already-loaded accounts aren't refetched.
+    void ensureFundedAndLabeledHistory();
     void refreshDirtyHistory();            // refetch only accounts whose balance changed (per block)
     void onAccountHistoryReady(quint32 index, const QVector<HistoryItem> &items,
                                quint64 chainId); // append targeted
@@ -256,6 +260,11 @@ private:
     QString accountLabelWith(quint32 index, const QString &balanceStr) const; // label w/ a given balance
     void refreshAccountCombosText(); // re-label the Send/Swap "From" combos (native or USD per toggle)
     void updateReceive();
+    // Fetch the CURRENT account's curated-token balances (e.g. Arbitrum USDC) on demand. The batched
+    // refresh skips curated tokens on large wallets to stay under the RPC budget, which left the
+    // selected account's USDC missing from Receive; this tops it up for one account only, so it is
+    // cheap enough to run on connect and on account change.
+    void fetchCuratedForCurrentAccount();
     void ensureMinAddresses(quint32 count);
     void selectAddressRow(quint32 index);
     void applyReceiveSearch(); // re-hide Receive rows per the search box (survives model resets)

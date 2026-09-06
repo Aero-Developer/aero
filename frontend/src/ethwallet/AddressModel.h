@@ -41,6 +41,9 @@ public:
     QString labelAt(quint32 index) const { return m_labels.value(index); }
     // Set a label programmatically (e.g. when loading persisted labels).
     void setLabel(quint32 index, const QString &label);
+    // Default display names for imported accounts (e.g. "Imported #1"), shown in the Label column
+    // when the user hasn't set their own label - so an imported key doesn't read as a seed account.
+    void setImportedNames(const QHash<quint32, QString> &names);
 
     // Show only funded addresses (indices in `funded`) when `on`; otherwise show all derived
     // addresses. If `on` but nothing is funded yet, all addresses are shown as a fallback.
@@ -63,6 +66,7 @@ private:
 
     Wallet *m_wallet = nullptr;
     QHash<quint32, QString> m_labels;   // keyed by account index (stable across filtering)
+    QHash<quint32, QString> m_importedNames; // default names for imported accounts (no custom label)
     QHash<quint32, QString> m_balances; // keyed by account index
     QSet<quint32> m_used;               // account indices marked "used"
     QList<quint32> m_visible;           // row -> account index
