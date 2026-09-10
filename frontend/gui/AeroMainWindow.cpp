@@ -2565,7 +2565,9 @@ bool AeroMainWindow::isKnownToken(const QString &addr) const {
 
 QString AeroMainWindow::spendingApprovalDialog(const QString &tokenSymbol, const QString &tokenAddr,
                                                const QString &spenderName, const QString &spenderAddr,
-                                               const QString &exactHuman, const QString &exactWei) {
+                                               const QString &exactHuman, const QString &exactWei,
+                                               const QString &description,
+                                               const QString &exactLabel) {
     QDialog dlg(this);
     dlg.setWindowTitle(tr("Approve spending cap"));
     dlg.setMinimumWidth(460);
@@ -2580,10 +2582,12 @@ QString AeroMainWindow::spendingApprovalDialog(const QString &tokenSymbol, const
     header->setWordWrap(true);
     root->addWidget(header);
 
-    auto *desc = new QLabel(tr("The router settles swaps by pulling the token you sell from your "
-                               "wallet, so it needs a one-time on-chain approval (costs gas). Approve "
-                               "only what this swap needs - a smaller cap limits what could ever be "
-                               "moved."),
+    auto *desc = new QLabel(description.isEmpty()
+                                ? tr("The router settles swaps by pulling the token you sell from "
+                                     "your wallet, so it needs a one-time on-chain approval (costs "
+                                     "gas). Approve only what this swap needs - a smaller cap limits "
+                                     "what could ever be moved.")
+                                : description,
                             &dlg);
     desc->setWordWrap(true);
     desc->setStyleSheet(QStringLiteral("color:#8a8a8a;"));
@@ -2593,7 +2597,9 @@ QString AeroMainWindow::spendingApprovalDialog(const QString &tokenSymbol, const
     auto *capBox = new QGroupBox(tr("Spending cap"), &dlg);
     auto *cv = new QVBoxLayout(capBox);
     auto *rbExact = new QRadioButton(
-        tr("This swap only - %1 %2  (recommended)").arg(exactHuman, tokenSymbol), capBox);
+        (exactLabel.isEmpty() ? tr("This swap only - %1 %2  (recommended)")
+                              : exactLabel).arg(exactHuman, tokenSymbol),
+        capBox);
     auto *rbMax = new QRadioButton(tr("Unlimited - don't ask again for %1").arg(tokenSymbol), capBox);
     // Default to unlimited so a token is approved ONCE per spender: an exact cap is consumed by each
     // swap and forces a fresh approval (extra tx + gas) every single time. The exact option remains
@@ -3158,6 +3164,10 @@ void AeroMainWindow::showBridgeDialog() {
         enum { NoApproval = 0, AwaitingReset = 1, AwaitingApproval = 2 };
         int approveStage = NoApproval;
         int approvePolls = 0;
+        // The cap the user chose in the approval dialog ("max", or an exact wei amount). Held here
+        // so the two-transaction USDT path approves what was actually agreed after the reset,
+        // rather than silently falling back to this deposit's exact amount.
+        QString approveCap;
         // Across bakes a quote timestamp and an output amount into the deposit calldata, and the
         // SpokePool rejects a quote older than its buffer while relayers ignore one whose output no
         // longer reflects the fee. Approving a token takes one transaction, or two for USDT, so by
@@ -3418,12 +3428,44 @@ void AeroMainWindow::showBridgeDialog() {
         }
         st->outputAmount = o.value(QStringLiteral("output_amount")).toString(); // compared at confirm
         const quint64 dst = static_cast<quint64>(o.value(QStringLiteral("dest_chain")).toDouble());
-        status->setText(tr("<b>Send:</b> %1 %2<br><b>Receive on %3:</b> ~%4 %2<br>"
-                           "<b>Bridge fee:</b> ~%5 %2<br><b>ETA:</b> ~%6s")
-                            .arg(trimZeros(QString::number(inAmt, 'f', 8)), sym,
+
+        // Across fills anything under `maxDepositInstant` straight from relayer inventory, and waits
+        // for the origin chain to finalise above it rather than front a large deposit that could
+        // still be reorged. That is why the estimate steps from seconds to minutes at one amount with
+        // no other change. Naming the threshold turns an unexplained wait into a choice: split the
+        // transfer under it and each leg fills in seconds.
+        const double instantCap =
+            o.value(QStringLiteral("max_deposit_instant")).toString().toDouble()
+            / std::pow(10.0, dec);
+        // Seconds are how Across reports it, but "900s" is a worse way to say "15 minutes".
+        QString eta;
+        if (etaSec <= 0)
+            eta = tr("unknown");
+        else if (etaSec < 90)
+            eta = tr("~%1 sec").arg(etaSec);
+        else
+            eta = tr("~%1 min").arg((etaSec + 30) / 60);
+        QString note;
+        if (instantCap > 0.0 && inAmt > instantCap)
+            note = tr("<br><span style=\"color:#c8922a;\">Over Across's instant-fill limit of ~%1 %2 "
+                      "for this route, so relayers wait for %3 to finalise first. Bridging ~%1 %2 or "
+                      "less per transfer fills in seconds. The limit moves with relayer inventory.</span>")
+                       .arg(trimZeros(QString::number(instantCap, 'f', 2)), sym,
+                            chainDefFor(origin).name);
+        // Which rail Across chose. CCTP burns and mints through Circle, so it is flat-rate and
+        // quick at any size; the intent path is relayer-funded and cheaper on small transfers.
+        const QString provider = o.value(QStringLiteral("provider")).toString();
+        QString routeLine;
+        if (!provider.isEmpty())
+            routeLine = tr("<b>Route:</b> %1<br>")
+                            .arg(provider.compare(QLatin1String("cctp"), Qt::CaseInsensitive) == 0
+                                     ? tr("CCTP (Circle)")
+                                     : tr("Across relayers"));
+        status->setText(tr("%1<b>Send:</b> %2 %3<br><b>Receive on %4:</b> ~%5 %3<br>"
+                           "<b>Bridge fee:</b> ~%6 %3<br><b>ETA:</b> %7%8")
+                            .arg(routeLine, trimZeros(QString::number(inAmt, 'f', 8)), sym,
                                  chainDefFor(dst).name, trimZeros(QString::number(outAmt, 'f', 8)),
-                                 trimZeros(QString::number(fee, 'f', 8)))
-                            .arg(etaSec));
+                                 trimZeros(QString::number(fee, 'f', 8)), eta, note));
         bridgeBtn->setEnabled(true);
     });
 
@@ -3640,15 +3682,16 @@ void AeroMainWindow::showBridgeDialog() {
                     }
                 };
                 if (st->approveStage == BridgeState::AwaitingReset) {
-                    // The old allowance is cleared - now approve the amount we actually need.
+                    // The old allowance is cleared - now approve the cap the user agreed to.
                     poll(tr("Waiting for the allowance reset to confirm… (%1)").arg(st->approvePolls + 1),
                          [=]() {
                              st->approveStage = BridgeState::AwaitingApproval;
                              status->setText(tr("Approving %1 for the bridge…").arg(st->symbol));
                              m_pendingBridge.approving = true;
                              beginSendProgress(tr("Broadcasting approval…"));
-                             m_wallet->bridgeApprove(st->account, st->inputToken, st->spender,
-                                                     st->amountWei);
+                             m_wallet->bridgeApprove(
+                                 st->account, st->inputToken, st->spender,
+                                 st->approveCap.isEmpty() ? st->amountWei : st->approveCap);
                          },
                          isZero);
                     return;
@@ -3677,6 +3720,35 @@ void AeroMainWindow::showBridgeDialog() {
                     return;
                 }
                 m_pendingBridge.approving = true;
+                // Ask for the cap once, before either path: the USDT reset needs two transactions
+                // and the second one must approve what the user agreed to here, not this deposit's
+                // exact amount.
+                //
+                // Approving only this deposit means the SpokePool's allowance is fully consumed by
+                // it, so the very next bridge of the same token needs another approval transaction
+                // (and its gas). That is why this defaults to unlimited, as the swap path does: a
+                // token is then approved once per spender and later bridges go straight to the
+                // deposit.
+                const QString bsym = st->display.isEmpty() ? st->symbol : st->display;
+                const QString bhuman =
+                    trimZeros(QString::number(st->amountWei.toDouble() / std::pow(10.0, st->decimals),
+                                              'f', 8));
+                const QString cap = spendingApprovalDialog(
+                    bsym, st->inputToken, tr("Across SpokePool"), st->spender, bhuman, st->amountWei,
+                    tr("Across moves the token out of your wallet through its SpokePool contract, "
+                       "so it needs a one-time on-chain approval (costs gas). An unlimited cap is "
+                       "approved once; an exact one is used up by this bridge and asks again next "
+                       "time."),
+                    tr("This bridge only - %1 %2"));
+                if (cap.isEmpty()) {
+                    st->bridging = false;
+                    m_pendingBridge.approving = false;
+                    st->approveStage = BridgeState::NoApproval;
+                    bridgeBtn->setEnabled(true);
+                    status->setText(tr("Approval cancelled."));
+                    return;
+                }
+                st->approveCap = cap;
                 if (!isZero) {
                     // A leftover, too-small allowance: tokens such as USDT revert an approve that
                     // moves a non-zero allowance straight to another non-zero value, so clear it
@@ -3684,15 +3756,17 @@ void AeroMainWindow::showBridgeDialog() {
                     st->approveStage = BridgeState::AwaitingReset;
                     status->setText(tr("Clearing the previous %1 approval first (some tokens require "
                                        "it) - this needs two transactions.")
-                                        .arg(st->symbol));
+                                        .arg(bsym));
                     beginSendProgress(tr("Broadcasting approval reset…"));
                     m_wallet->bridgeApprove(st->account, st->inputToken, st->spender,
                                             QStringLiteral("0"));
                 } else {
                     st->approveStage = BridgeState::AwaitingApproval;
-                    status->setText(tr("Approving %1 for the bridge…").arg(st->symbol));
+                    status->setText(cap == QLatin1String("max")
+                                        ? tr("Approving unlimited %1 for the bridge…").arg(bsym)
+                                        : tr("Approving %1 %2 for the bridge…").arg(bhuman, bsym));
                     beginSendProgress(tr("Broadcasting approval…"));
-                    m_wallet->bridgeApprove(st->account, st->inputToken, st->spender, st->amountWei);
+                    m_wallet->bridgeApprove(st->account, st->inputToken, st->spender, cap);
                 }
             });
 
@@ -4750,9 +4824,17 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     }
     connect(m_wallet, &Wallet::balanceUpdated, this, &AeroMainWindow::onBalanceUpdated);
     connect(m_wallet, &Wallet::historyRefreshed, this,
-            [this](const QVector<HistoryItem> &items, quint64 chainId) {
+            [this](const QVector<HistoryItem> &items, quint64 chainId, bool ok) {
         if (chainId != m_chainId)
             return; // a previous chain's fetch that landed after a network switch - ignore it
+        if (!ok) {
+            // The explorer could not be read. This path REPLACES the view's rows, so applying the
+            // empty result would erase a filtered account's history and call it up to date.
+            noteHistoryUnavailable();
+            if (m_historyFilter >= 0)
+                scheduleHistoryRetry(static_cast<quint32>(m_historyFilter));
+            return;
+        }
         // Single-account / one-shot path.
         m_historyModel->setKnownTokens(verifiedTokenAddresses());
         updateHistoryOwnAddresses();
@@ -4860,7 +4942,9 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     connect(m_wallet, &Wallet::routerSwapSent, this, &AeroMainWindow::onRouterSwapSent);
     // Event-driven history: after a batched balance refresh, only re-pull the (heavy) history if a
     // balance actually changed. This keeps steady-state bandwidth to the cheap balance batch.
-    connect(m_wallet, &Wallet::allBalancesRefreshed, this, [this]() {
+    connect(m_wallet, &Wallet::allBalancesRefreshed, this, [this](quint64 chainId) {
+        if (chainId != m_chainId)
+            return; // the previous chain's batch finishing after a switch - it must not be persisted
         // The whole batch has arrived - do the (single) authoritative total + used-flag recompute.
         scheduleHomeRecompute();
         m_balancesFromCache = false; // first live refresh done; grown balances are real from now on
@@ -5004,10 +5088,20 @@ void AeroMainWindow::onBlockNumber(quint64 block) {
     // account. On a large HD wallet, re-fetching all N accounts' balances every ~12s is a perpetual
     // RPC request storm that trips rate limits and starves the initial load so it never finishes.
     // The one-time full sweep happens on connect; per-block we just keep the viewed account live.
-    if (m_wallet->numAccounts() <= 8)
+    if (m_wallet->numAccounts() <= 8) {
         refreshAllBalances();
-    else
+    } else {
         m_wallet->refreshAccountBalance(m_account);
+        // The light path above reads the native coin only, so on a large wallet a TOKEN balance was
+        // refreshed just once on connect: receive or spend USDC and the figure stayed as it was for
+        // as long as the window remained open. The full read is one batched multicall rather than a
+        // per-account fan-out, so it is affordable every few blocks.
+        if (++m_blocksSinceFullSweep >= 5) {
+            m_blocksSinceFullSweep = 0;
+            refreshAllBalances();
+            fetchCuratedForCurrentAccount();
+        }
+    }
     if (ui.tabWidget->currentWidget() == ui.tabSend)
         m_wallet->refreshFees();
 }
@@ -5198,8 +5292,22 @@ void AeroMainWindow::switchChain(quint64 chainId) {
     }
     // History is per-chain: forget what we fetched so the new chain reloads lazily (see onProviderConnected).
     m_histFetched.clear();
+    m_histInFlight.clear(); // requests still out belong to the old chain; their replies are dropped
+    m_histRetry.clear();
     m_dirtyHistory.clear();
     m_historyLoadedChain = ~Q_UINT64_C(0);
+    // Block heights are per-chain and nowhere near each other - Arbitrum is past 490 million while
+    // Ethereum is around 23 million. The new-block check is "higher than the last one seen", so
+    // switching from an L2 back to mainnet left every subsequent block looking old, and the per-block
+    // balance refresh simply never ran again: balances froze at whatever the connect had loaded.
+    m_lastBlock = 0;
+    m_blocksSinceFullSweep = 0;
+    m_connHealthFails = 0; // failures counted against the chain we just left aren't evidence here
+    // We are no longer connected to anything until the new chain answers. Leaving this at "connected"
+    // let the focus and per-block refreshes keep firing at a provider that is being swapped out.
+    m_connMode = 0;
+    m_connText.clear();
+    m_availAmount.clear(); // the Send "Available" figure was the old chain's
     // The spam/known-token allow-list is chain-specific (curated top tokens differ per chain), so
     // recompute it for the new chain - otherwise legit tokens get hidden as spam / wrong ones trusted.
     // The liquidity verdicts feeding that list are per-chain too, so reload them first.
@@ -5265,7 +5373,13 @@ void AeroMainWindow::relabelNative() {
     if (m_addressModel) showCachedBalance(m_account);
 }
 
-void AeroMainWindow::onProviderConnected(int mode, const QString &message) {
+void AeroMainWindow::onProviderConnected(int mode, const QString &message, quint64 chainId) {
+    // A connect attempt for a chain the user has since switched away from. Its outcome says nothing
+    // about the chain now on screen, and acting on it would kick off a full balance and history load
+    // labelled with the wrong network - and, when it reported failure, would show "Offline" over a
+    // connection that is fine.
+    if (chainId != m_chainId)
+        return;
     // Clear the self-heal guard on any outcome so a failed attempt can be retried; only a genuine
     // success resets the failed-poll counter.
     m_reconnecting = false;
@@ -5429,14 +5543,18 @@ void AeroMainWindow::refreshAllBalances() {
     // ONE batched request fetches native + tracked-token balances for every account, instead of
     // firing numAccounts × (1 + numTokens) independent Tor calls. Results arrive via per-account signals.
     //
-    // The curated top-tokens are added as EXTRAS only for SMALL wallets. Each extra token adds one
-    // eth_call PER ACCOUNT, so bundling ~24 curated tokens across a big HD wallet (e.g. 167 accounts)
-    // meant ~24×167 mostly-zero token reads - which blew the per-request budget down to one account
-    // per batch, instantly tripped the public RPC's rate limit, and (with retries) thrashed forever so
-    // balances never finished loading. For a large wallet we fetch native + the user's TRACKED tokens
-    // only; the current account's curated-token balances are loaded on demand elsewhere (Send/Swap).
+    // The curated top-tokens for THIS chain are added as EXTRAS, because without them an L2 balance
+    // is simply never read: the wallet's tracked-token list is chain-agnostic and seeded with
+    // Ethereum contracts, so on Arbitrum it asks about mainnet DAI (which answers nothing there) and
+    // never about Arbitrum DAI. That is why an L2 token balance "would not update".
+    //
+    // They are not free - every extra token is one more sub-call per account - so the read is sized
+    // rather than switched off. The core batches sub-calls through Multicall3 at 400 per eth_call, so
+    // the budget below is in whole round-trips, not requests. Ethereum's curated list is the longest
+    // (~24), which is what once made this unaffordable for a wallet with hundreds of accounts; a
+    // wallet that big still falls back to tracked-only plus fetchCuratedForCurrentAccount().
     QJsonArray extra;
-    if (m_wallet->numAccounts() <= 8) {
+    if (batchIncludesCuratedTokens()) {
         for (const TokenInfo &t : curatedTopTokens(m_chainId)) {
             QJsonObject o;
             o[QStringLiteral("address")] = t.address;
@@ -5447,6 +5565,16 @@ void AeroMainWindow::refreshAllBalances() {
     }
     const QString extraJson = QString::fromUtf8(QJsonDocument(extra).toJson(QJsonDocument::Compact));
     m_wallet->refreshAllBalances(m_wallet->numAccounts(), extraJson);
+}
+
+bool AeroMainWindow::batchIncludesCuratedTokens() const {
+    if (!m_wallet)
+        return false;
+    const qint64 accounts = qMax(1, static_cast<int>(m_wallet->numAccounts()));
+    const qint64 perAccount =
+        1 + m_wallet->tokens().size() + curatedTopTokens(m_chainId).size();
+    constexpr qint64 kSubcallBudget = 1200; // ~3 Multicall3 round-trips at 400 sub-calls each
+    return accounts * perAccount <= kSubcallBudget;
 }
 
 void AeroMainWindow::loadLabels() {
@@ -5538,6 +5666,13 @@ void AeroMainWindow::loadBalanceCache() {
         // (mixed-case) still matches today's lowercase lookups.
         const QString idx = it.key().section(QLatin1Char('|'), 0, 0);
         const QString addr = it.key().section(QLatin1Char('|'), 1).toLower();
+        // Drop a balance for a contract that belongs to a different network. Balance results were
+        // not labelled with the chain they were read on until now, so a read in flight across a
+        // network switch was filed - and saved - under the chain being switched TO. This is what put
+        // an Ethereum DAI balance on Arbitrum, and because it was persisted it survived restarts.
+        // Caches written by those builds are still out there, so clean them on the way in.
+        if (tokenIsForeignToChain(addr))
+            continue;
         m_tokenRawByKey.insert(QStringLiteral("%1|%2").arg(idx, addr), it.value().toDouble());
     }
     const double usd = snap.value(QStringLiteral("usd")).toDouble();
@@ -5717,7 +5852,12 @@ void AeroMainWindow::loadHistoryCache() {
         m_histStatus.insert(idx, it.value().toDouble());
         m_histFetched.insert(idx);
     }
-    m_historyLoadedChain = m_chainId; // we already have this chain's history; connect just status-gates
+    // Only claim this chain's history is loaded if the snapshot actually carried some. A chain whose
+    // first visit failed leaves an empty-but-present snapshot behind, and treating that as "already
+    // have it" is what made History stay blank on every later switch to that chain: connect took the
+    // status-gate path and nothing ever asked for the rows.
+    if (!items.isEmpty() && !m_histFetched.isEmpty())
+        m_historyLoadedChain = m_chainId;
     // A swap that was still open when the app closed comes back from the cache saying "pending", and
     // nothing was left running to ever ask again. The poll starts itself only when an order is
     // placed, so without this the row keeps that status for good - it was true once, and looked true
@@ -6025,7 +6165,13 @@ void AeroMainWindow::updateAvailable() {
 }
 
 void AeroMainWindow::onAvailableBalance(quint32 index, const QString &token,
-                                         const QString &formatted, const QString &symbol) {
+                                         const QString &formatted, const QString &symbol,
+                                         quint64 chainId) {
+    // A balance read on a chain we are no longer on. The cache it would land in is keyed by account
+    // and token address only, so this would be stored - and later persisted - as a balance of the
+    // current chain. On Arbitrum that showed up as an Ethereum DAI holding that never went away.
+    if (chainId != m_chainId)
+        return;
     // Accumulate per-account token balances for the combined Home total (token != "" == ERC20).
     // An empty `formatted` means the read FAILED (a genuine zero comes through as "0"); ignore it so
     // a transient Tor/RPC hiccup can't flicker the cached balance to 0 and fire a spurious
@@ -6281,6 +6427,7 @@ void AeroMainWindow::refreshHistoryView() {
     if (m_historyModel)
         m_historyModel->beginFullRefresh(); // clear + reset dedup once
     m_histFetched.clear();
+    m_histRetry.clear();  // a full reload supersedes any queued retry
     m_dirtyHistory.clear();
     ensureAccountHistory(m_account);        // the account on screen, first
     ensureFundedAndLabeledHistory();        // then every funded OR labelled account
@@ -6305,15 +6452,66 @@ void AeroMainWindow::ensureFundedAndLabeledHistory() {
         ensureAccountHistory(i);
 }
 
-// Fetch one account's history on demand (lazy). Marks it fetched up front so overlapping triggers
-// (connect + selection + a balance change) never queue duplicate requests for the same account.
+// Fetch one account's history on demand (lazy).
+//
+// Overlapping triggers (connect + selection + a balance change) are deduped against the set of
+// requests still in flight, NOT by pretending the account is already loaded. Marking it fetched at
+// request time was the quiet way History stayed empty: if the explorer was unreachable, or the reply
+// was dropped as belonging to the previous chain, the account was never asked about again for the
+// rest of the session, and the view simply showed nothing.
 void AeroMainWindow::ensureAccountHistory(quint32 index, bool force) {
     if (!m_wallet)
         return;
     if (!force && m_histFetched.contains(index))
         return;
-    m_histFetched.insert(index);
+    if (m_histInFlight.contains(index)) {
+        // A forced refresh (a balance moved) that arrives while a request is already out would be
+        // answered with data read before the change, so keep it dirty and ask again next cycle.
+        if (force)
+            m_dirtyHistory.insert(index);
+        return;
+    }
+    m_histInFlight.insert(index);
     m_wallet->refreshAccountHistory(index);
+}
+
+// Retry accounts whose history could not be read. Deliberately unhurried: the usual cause is a
+// rate-limited public explorer, and the core already parks a base that stops answering, so retrying
+// hard would only extend the park.
+void AeroMainWindow::scheduleHistoryRetry(quint32 index) {
+    m_histRetry.insert(index);
+    if (!m_histRetryTimer) {
+        m_histRetryTimer = new QTimer(this);
+        m_histRetryTimer->setSingleShot(true);
+        m_histRetryTimer->setInterval(20000);
+        connect(m_histRetryTimer, &QTimer::timeout, this, [this]() {
+            if (m_connMode <= 0) {
+                if (!m_histRetry.isEmpty())
+                    m_histRetryTimer->start(); // offline: hold the queue, try again later
+                return;
+            }
+            const QSet<quint32> again = m_histRetry;
+            m_histRetry.clear();
+            for (quint32 i : again)
+                ensureAccountHistory(i, /*force*/ true);
+        });
+    }
+    if (!m_histRetryTimer->isActive())
+        m_histRetryTimer->start();
+}
+
+// One quiet line in the status bar, restored afterwards. An empty History table and an unreachable
+// explorer look identical, and the wallet should not let the user read one as the other.
+void AeroMainWindow::noteHistoryUnavailable() {
+    if (m_connMode <= 0)
+        return; // "Offline" already says it
+    if (m_scanProgressTimer && m_scanProgressTimer->isActive())
+        return; // the funded scan owns the status line
+    setConnectionState(m_connMode, tr("History source unavailable - retrying…"));
+    QTimer::singleShot(6000, this, [this]() {
+        if (m_connMode > 0 && !(m_scanProgressTimer && m_scanProgressTimer->isActive()))
+            setConnectionState(m_connMode, m_connText.isEmpty() ? tr("Connected") : m_connText);
+    });
 }
 
 // Per-block refresh: refetch ONLY the accounts whose balance changed since last time (the ETH analog
@@ -6337,9 +6535,16 @@ void AeroMainWindow::refreshDirtyHistory() {
 
 // A targeted single-account history batch arrived: merge it into the (deduped) all-accounts model.
 void AeroMainWindow::onAccountHistoryReady(quint32 index, const QVector<HistoryItem> &items,
-                                           quint64 chainId) {
+                                           quint64 chainId, bool ok) {
     if (chainId != m_chainId)
-        return; // a previous chain's targeted fetch that landed after a network switch - drop it
+        return; // a previous chain's fetch, landing after a switch that already cleared its bookkeeping
+    m_histInFlight.remove(index);
+    if (!ok) {
+        scheduleHistoryRetry(index);
+        noteHistoryUnavailable();
+        return; // never record a failed read as this account's history
+    }
+    m_histFetched.insert(index);
     if (m_historyFilter >= 0)
         return; // a single-account filter view is driven by refreshHistory()/onHistoryRefreshed()
     if (!m_historyModel)
@@ -6353,7 +6558,10 @@ void AeroMainWindow::onAccountHistoryReady(quint32 index, const QVector<HistoryI
     scheduleHistorySave();
 }
 
-void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, const QString &symbol) {
+void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, const QString &symbol,
+                                      quint64 chainId) {
+    if (chainId != m_chainId)
+        return; // the previous chain's native balance, landing after a switch
     if (formatted.isEmpty()) return; // offline / no balance yet - don't append an empty suffix
     const double newBal = formatted.toDouble();
     const double oldBal = m_ethRawByAccount.value(index, -1.0);
@@ -6444,6 +6652,23 @@ double AeroMainWindow::tokenBalanceOnThisChain(quint32 account, const QString &s
     return -1.0;
 }
 
+bool AeroMainWindow::tokenIsForeignToChain(const QString &addressLower) const {
+    auto knownOn = [&](quint64 id) {
+        for (const TokenInfo &t : curatedTopTokens(id))
+            if (t.address.compare(addressLower, Qt::CaseInsensitive) == 0)
+                return true;
+        const ChainDef &c = chainDefFor(id);
+        return !c.wrappedNative.isEmpty() &&
+               c.wrappedNative.compare(addressLower, Qt::CaseInsensitive) == 0;
+    };
+    if (knownOn(m_chainId))
+        return false; // this chain's own contract - several chains share addresses legitimately
+    for (const ChainDef &c : chainDefs())
+        if (c.id != m_chainId && knownOn(c.id))
+            return true;
+    return false; // unknown to every curated list: a token the user added, so leave it alone
+}
+
 // Total USD value of an account: native coin + every tracked/curated token it holds. Mirrors the
 // per-account slice of recomputeHomeTotal so a single-account update shows the full value at once.
 double AeroMainWindow::accountUsdValue(quint32 index) const {
@@ -6460,6 +6685,8 @@ double AeroMainWindow::accountUsdValue(quint32 index) const {
             if (!it.key().startsWith(prefix))
                 continue;
             const QString addr = it.key().section(QLatin1Char('|'), 1).toLower();
+            if (tokenIsForeignToChain(addr))
+                continue; // another chain's contract - not part of this account's value here
             total += it.value() * unitPriceUsd(symByAddr.value(addr));
         }
     }
@@ -6547,6 +6774,11 @@ void AeroMainWindow::updateReceive() {
             seen.insert(t.address.toLower());
         }
     for (const TokenInfo &t : shown) {
+        // A tracked token that is another chain's contract cannot hold anything here, whatever a
+        // stale cache says. The tracked list is chain-agnostic and seeded with Ethereum addresses,
+        // so without this the mainnet DAI row follows the wallet onto every L2.
+        if (tokenIsForeignToChain(t.address.toLower()))
+            continue;
         const double bal =
             m_tokenRawByKey.value(QStringLiteral("%1|%2").arg(m_account).arg(t.address.toLower()), 0.0);
         if (bal <= 0.0)
@@ -6568,10 +6800,10 @@ void AeroMainWindow::updateReceive() {
 void AeroMainWindow::fetchCuratedForCurrentAccount() {
     if (!m_wallet)
         return;
-    // Small wallets already read the curated tokens in the batched refresh (see refreshAllBalances),
-    // so only large wallets - where the batch skips them to stay under the RPC budget - need this.
-    // Scoped to the one selected account, so it is a handful of reads, not curated×accounts.
-    if (m_wallet->numAccounts() <= 8)
+    // Most wallets already read the curated tokens in the batched refresh (see refreshAllBalances),
+    // so only wallets too large for that budget need this. Scoped to the one selected account, so it
+    // is a handful of reads, not curated×accounts.
+    if (batchIncludesCuratedTokens())
         return;
     for (const TokenInfo &t : curatedTopTokens(m_chainId))
         m_wallet->fetchAvailable(m_account, t.address);
@@ -6623,8 +6855,8 @@ void AeroMainWindow::showCachedBalance(quint32 index) {
         QSet<QString> counted;
         auto add = [&](const TokenInfo &t) {
             const QString addr = t.address.toLower();
-            if (counted.contains(addr))
-                return;
+            if (counted.contains(addr) || tokenIsForeignToChain(addr))
+                return; // another chain's contract holds nothing here, whatever a stale cache says
             counted.insert(addr);
             totalUsd += m_tokenRawByKey.value(QStringLiteral("%1|%2").arg(index).arg(addr), 0.0) *
                         unitPriceUsd(t.symbol);
@@ -8160,6 +8392,8 @@ void AeroMainWindow::recomputeHomeTotal() {
     for (auto it = m_tokenRawByKey.constBegin(); it != m_tokenRawByKey.constEnd(); ++it) {
         const quint32 idx = it.key().section(QLatin1Char('|'), 0, 0).toUInt();
         const QString tokenAddr = it.key().section(QLatin1Char('|'), 1).toLower();
+        if (tokenIsForeignToChain(tokenAddr))
+            continue; // another chain's contract can't contribute to this chain's total
         const double v = it.value() * unitPriceUsd(symByAddr.value(tokenAddr));
         perAcct[idx] += v;
         total += v;
@@ -8223,7 +8457,8 @@ void AeroMainWindow::refreshUsedFlags() {
         return;
     QSet<quint32> hasToken;
     for (auto it = m_tokenRawByKey.constBegin(); it != m_tokenRawByKey.constEnd(); ++it)
-        if (it.value() > 0.0)
+        if (it.value() > 0.0 &&
+            !tokenIsForeignToChain(it.key().section(QLatin1Char('|'), 1).toLower()))
             hasToken.insert(it.key().section(QLatin1Char('|'), 0, 0).toUInt());
     const quint32 n = m_wallet->numAccounts();
     for (quint32 i = 0; i < n; ++i) {
@@ -8319,9 +8554,14 @@ void AeroMainWindow::openTokenPicker() {
     // Only show assets the wallet has actually touched (held a balance in, or seen in history) and
     // that are verified - never the full curated list of tokens the wallet never interacted with.
     QSet<QString> touched;
-    for (auto it = m_tokenRawByKey.constBegin(); it != m_tokenRawByKey.constEnd(); ++it)
-        if (it.value() > 0.0)
-            touched.insert(it.key().section(QLatin1Char('|'), 1).toLower());
+    for (auto it = m_tokenRawByKey.constBegin(); it != m_tokenRawByKey.constEnd(); ++it) {
+        if (it.value() <= 0.0)
+            continue;
+        const QString addr = it.key().section(QLatin1Char('|'), 1).toLower();
+        if (tokenIsForeignToChain(addr))
+            continue; // don't offer another chain's contract as something to send here
+        touched.insert(addr);
+    }
     if (m_historyModel)
         for (int r = 0; r < m_historyModel->rowCount(); ++r) {
             const HistoryItem h = m_historyModel->itemAt(r);

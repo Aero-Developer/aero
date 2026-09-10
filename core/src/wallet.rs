@@ -3261,6 +3261,139 @@ impl Wallet {
         Ok(held)
     }
 
+    /// Across's Swap API (`/swap/approval`) - the endpoint Across actively maintains, and the only
+    /// one that routes USDC over CCTP. CCTP burns and mints through Circle rather than waiting on a
+    /// relayer's inventory on the destination, so a large transfer fills in ~20s at a flat rate;
+    /// `/suggested-fees` quotes the intent path only and answers 900s for the same deposit once it
+    /// exceeds `maxDepositInstant`. It also hands back ready-to-send calldata.
+    ///
+    /// Returns `None` rather than an error whenever the reply cannot be trusted, so the caller falls
+    /// back to the legacy `suggested-fees` + `depositV3` path. Two reasons that matters: the endpoint
+    /// answers unauthenticated today but is documented as requiring an API key, and it can also
+    /// *swap* assets - a reply naming any token other than the pair we asked about must never become
+    /// a transaction.
+    async fn across_swap_api(
+        &self,
+        from_index: u32,
+        route: &crate::across::Route,
+        dest_chain_id: u64,
+        amount_wei: &str,
+    ) -> Option<serde_json::Value> {
+        const ZERO: &str = "0x0000000000000000000000000000000000000000";
+        let provider = self.provider().ok()?;
+        let origin = provider.chain_id();
+
+        // The API names the gas coin by the zero address. Only use it when the destination's native
+        // coin really is this asset - otherwise "native out" means a different coin there (ETH into
+        // Polygon would be asking for POL), and the swap side of this API would happily price that.
+        let asset = crate::across::display_symbol(&route.symbol).to_ascii_uppercase();
+        let (input_token, output_token) = if route.is_native {
+            let dest_native =
+                crate::chains::chain_info(dest_chain_id).native_symbol.to_ascii_uppercase();
+            if dest_native != asset {
+                return None; // ambiguous; the legacy path already encodes this case correctly
+            }
+            (ZERO.to_string(), ZERO.to_string())
+        } else {
+            (route.origin_token.clone(), route.dest_token.clone())
+        };
+
+        let me = self.address(from_index).ok()?;
+        let url = format!(
+            "https://app.across.to/api/swap/approval?tradeType=exactInput&amount={amount_wei}\
+             &inputToken={input_token}&outputToken={output_token}&originChainId={origin}\
+             &destinationChainId={dest_chain_id}&depositor={me}&recipient={me}"
+        );
+        let r = provider.http_get_json(&url).await.ok()?;
+
+        // No calldata means this was an error body - the endpoint answers 200 with an explanation.
+        let tx = r.get("swapTx")?;
+        let to = tx.get("to").and_then(|v| v.as_str()).unwrap_or_default();
+        let data = tx.get("data").and_then(|v| v.as_str()).unwrap_or_default();
+        if to.is_empty() || data.is_empty() {
+            return None;
+        }
+
+        // The check that makes this endpoint safe to act on: it must have quoted a plain bridge of
+        // the asset we asked about, between the two chains we asked about. ETH and WETH are the same
+        // asset here, since a native deposit is quoted in its wrapped form.
+        let norm = |s: &str| {
+            let up = crate::across::display_symbol(s).to_ascii_uppercase();
+            if up == "WETH" {
+                "ETH".to_string()
+            } else {
+                up
+            }
+        };
+        let side = |key: &str| -> Option<(String, u64)> {
+            let t = r.get(key)?;
+            Some((norm(t.get("symbol")?.as_str()?), t.get("chainId")?.as_u64()?))
+        };
+        let (in_sym, in_chain) = side("inputToken")?;
+        let (out_sym, out_chain) = side("outputToken")?;
+        if in_sym != out_sym
+            || in_sym != norm(&asset)
+            || in_chain != origin
+            || out_chain != dest_chain_id
+        {
+            return None; // a swap, or the wrong chains - not what the user asked for
+        }
+        // A zero output would pass the caller's checks and deposit into nothing.
+        let out_amount =
+            r.get("expectedOutputAmount").map(json_num_str).unwrap_or_else(|| "0".into());
+        if out_amount.is_empty() || out_amount == "0" {
+            return None;
+        }
+        Some(r)
+    }
+
+    /// Shape a Swap API reply like an `across_quote` result, so the UI reads one format whichever
+    /// endpoint answered. Deposit limits come back as zero because they describe the intent path:
+    /// CCTP has no relayer-inventory ceiling, and this API rejects an out-of-range amount itself
+    /// rather than quoting one.
+    fn across_swap_quote_json(
+        r: &serde_json::Value,
+        route: &crate::across::Route,
+        symbol: &str,
+        origin: u64,
+        dest_chain_id: u64,
+        amount_wei: &str,
+    ) -> serde_json::Value {
+        let decimals = r
+            .get("inputToken")
+            .and_then(|t| t.get("decimals"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(18);
+        let fee = r
+            .get("fees")
+            .and_then(|f| f.get("total"))
+            .and_then(|t| t.get("amount"))
+            .map(json_num_str)
+            .unwrap_or_else(|| "0".into());
+        serde_json::json!({
+            "symbol": symbol,
+            "origin_chain": origin,
+            "dest_chain": dest_chain_id,
+            "input_token": route.origin_token,
+            "output_token": route.dest_token,
+            "input_is_native": route.is_native,
+            "decimals": decimals,
+            "input_amount": amount_wei,
+            "output_amount":
+                r.get("expectedOutputAmount").map(json_num_str).unwrap_or_else(|| "0".into()),
+            "total_relay_fee": fee,
+            "lp_fee": "0",
+            "est_fill_time_sec": r.get("expectedFillTime").and_then(|v| v.as_u64()).unwrap_or(0),
+            "is_amount_too_low": false,
+            "min_deposit": "0",
+            "max_deposit": "0",
+            "max_deposit_instant": "0",
+            // "cctp" or "across": which rail is actually carrying the transfer.
+            "provider": r.get("steps").and_then(|s| s.get("bridge")).and_then(|b| b.get("provider"))
+                         .and_then(|v| v.as_str()).unwrap_or_default(),
+        })
+    }
+
     /// Fetch an Across bridge fee quote for sending `amount_wei` of `symbol` from the CURRENTLY
     /// CONNECTED chain to `dest_chain_id`, to the same address. Returns a normalized JSON object with
     /// the output amount, fees, SpokePool address, and the deposit parameters (timestamps, deadlines,
@@ -3289,6 +3422,19 @@ impl Wallet {
         let input_token = route.origin_token.as_str();
         let output_token = route.dest_token.as_str();
         let me = self.address(from_index)?;
+        // Preferred path: the maintained endpoint, which picks CCTP for large USDC (~20s flat)
+        // instead of the intent path's wait on relayer inventory. Falls through on anything it
+        // cannot answer for, or answers in a shape we refuse to trust.
+        if let Some(sw) = self.across_swap_api(from_index, route, dest_chain_id, amount_wei).await {
+            return Ok(Self::across_swap_quote_json(
+                &sw,
+                route,
+                symbol,
+                origin,
+                dest_chain_id,
+                amount_wei,
+            ));
+        }
         let url = format!(
             "https://app.across.to/api/suggested-fees?inputToken={input_token}&outputToken={output_token}\
              &originChainId={origin}&destinationChainId={dest_chain_id}&amount={amount_wei}&recipient={me}"
@@ -3360,6 +3506,11 @@ impl Wallet {
             "is_amount_too_low": r.get("isAmountTooLow").and_then(|v| v.as_bool()).unwrap_or(false),
             "min_deposit": lim("minDeposit"),
             "max_deposit": lim("maxDeposit"),
+            // The boundary that makes the quoted fill time step from seconds to minutes: Across
+            // relayers front anything under this from their own inventory, and wait for the origin
+            // chain to finalise above it rather than carry reorg risk on a large deposit. Passed to
+            // the UI so a sudden 15-minute estimate can be explained (and avoided by splitting).
+            "max_deposit_instant": lim("maxDepositInstant"),
         }))
     }
 
@@ -3374,6 +3525,62 @@ impl Wallet {
         dest_chain_id: u64,
         amount_wei: &str,
     ) -> Result<serde_json::Value> {
+        // Same preference as the quote, and re-fetched here so the calldata is fresh: the Swap API
+        // returns the transaction to send, so nothing below has to encode depositV3 by hand.
+        {
+            let provider = self.provider()?;
+            let origin = provider.chain_id();
+            let table = crate::across::routes(provider).await;
+            if let Some(route) = crate::across::resolve(&table, origin, dest_chain_id, symbol) {
+                if let Some(sw) =
+                    self.across_swap_api(from_index, route, dest_chain_id, amount_wei).await
+                {
+                    let tx = sw.get("swapTx").cloned().unwrap_or_default();
+                    let gs = |v: &serde_json::Value, k: &str| {
+                        v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string()
+                    };
+                    // Approving the SpokePool is wrong here: CCTP deposits go through a different
+                    // periphery contract, so the spender comes from the quote rather than from us.
+                    let spender = sw
+                        .get("checks")
+                        .and_then(|c| c.get("allowance"))
+                        .and_then(|a| a.get("spender"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| gs(&tx, "to"));
+                    let value = tx
+                        .get("value")
+                        .map(json_num_str)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "0".into());
+                    let q = Self::across_swap_quote_json(
+                        &sw,
+                        route,
+                        symbol,
+                        origin,
+                        dest_chain_id,
+                        amount_wei,
+                    );
+                    return Ok(serde_json::json!({
+                        "to": gs(&tx, "to"),
+                        "spender": spender,
+                        "data": gs(&tx, "data"),
+                        "value": value,
+                        "native": route.is_native,
+                        "input_token": route.origin_token,
+                        "input_amount": amount_wei,
+                        "decimals": q.get("decimals").and_then(|v| v.as_u64()).unwrap_or(18),
+                        "output_amount": q.get("output_amount").cloned().unwrap_or_default(),
+                        "is_amount_too_low": false,
+                        // Not applicable on this path - see across_swap_quote_json.
+                        "min_deposit": "0",
+                        "max_deposit": "0",
+                        "provider": q.get("provider").cloned().unwrap_or_default(),
+                    }));
+                }
+            }
+        }
         let q = self.across_quote(from_index, symbol, dest_chain_id, amount_wei).await?;
         let gs = |k: &str| q.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
 

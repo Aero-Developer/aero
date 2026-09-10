@@ -94,13 +94,14 @@ private slots:
     void onTransactionCreated(const PendingEthTx &tx);
     void onTransactionCommitted(bool ok, const QString &txHash, const QString &error);
     void onBalanceUpdated(const BalanceInfo &eth, const QVector<BalanceInfo> &tokens);
-    void onAccountBalance(quint32 index, const QString &formatted, const QString &symbol);
+    void onAccountBalance(quint32 index, const QString &formatted, const QString &symbol,
+                          quint64 chainId);
     void onEthUsdPrice(double usdPerEth);
     void onMarketPrices(double xmrUsd, double xmrChangePct, double ethUsd, double ethChangePct);
     void onAmountConversion();
-    void onProviderConnected(int mode, const QString &message);
+    void onProviderConnected(int mode, const QString &message, quint64 chainId);
     void onAvailableBalance(quint32 index, const QString &token, const QString &formatted,
-                            const QString &symbol);
+                            const QString &symbol, quint64 chainId);
     void onBlockNumber(quint64 block);
     void onFeesUpdated(const QString &baseFeeWei, const QString &tipWei);
     void onFeeModeChanged();
@@ -136,6 +137,9 @@ private:
     void rebuildAccountCombos();
     void updateHistoryOwnAddresses(); // feed the wallet's own addresses to the history poisoning filter
     void refreshAllBalances();
+    // Whether the batched balance read is small enough to also carry this chain's curated tokens.
+    // When it isn't, only the selected account's curated balances are fetched separately.
+    bool batchIncludesCuratedTokens() const;
     void recomputeHomeTotal();
     void scheduleHomeRecompute();     // debounced recompute (coalesces bulk balance updates)
     void refreshUsedFlags();          // recompute all rows' red/used flags in one pass
@@ -169,8 +173,14 @@ private:
     // All-accounts view. Deduped via m_histFetched, so cached/already-loaded accounts aren't refetched.
     void ensureFundedAndLabeledHistory();
     void refreshDirtyHistory();            // refetch only accounts whose balance changed (per block)
-    void onAccountHistoryReady(quint32 index, const QVector<HistoryItem> &items,
-                               quint64 chainId); // append targeted
+    void onAccountHistoryReady(quint32 index, const QVector<HistoryItem> &items, quint64 chainId,
+                               bool ok);   // append targeted
+    // An account whose history could not be read is queued here and tried again shortly. Without it,
+    // one unreachable explorer response permanently left that account blank for the session.
+    void scheduleHistoryRetry(quint32 index);
+    // Say so in the status bar when history could not be fetched, instead of showing an empty table
+    // that is indistinguishable from an address that has never been used.
+    void noteHistoryUnavailable();
     void updatePollCadence();          // fast block poll when focused/sending, slow when idle
     void startReceiptWatch(const QString &txHash); // fast-poll the tx receipt to confirm a send
     void onTxReceiptReady(const QString &txHash, bool mined, bool success);
@@ -180,6 +190,10 @@ private:
     QString explorerTxUrl(const QString &hash) const;   // preferred explorer tx link
     QString accountName(quint32 index) const;
     double tokenBalanceOnThisChain(quint32 account, const QString &symbol) const;  // an account's label, or "Account #N"
+    // True when `addressLower` is a well-known token of some OTHER chain and not of this one - i.e. a
+    // contract that cannot hold a balance here. Used to scrub balances that leaked across a network
+    // switch before they were chain-tagged, and to keep them out of the Receive breakdown and totals.
+    bool tokenIsForeignToChain(const QString &addressLower) const;
     void pushAccountNames();                   // feed those labels to the History Account column
     // Hand a link to the system browser, which does NOT go through Tor. Asks first, because the
     // browser fetches it from the user's own address and the link usually names their transaction.
@@ -240,9 +254,13 @@ private:
     quint32 swapSlippageBps() const; // parse the Swap slippage selector
     // MetaMask-style spending-cap approval prompt with an editable cap (exact vs unlimited). Returns
     // the chosen cap as decimal-wei, "max" for unlimited, or an empty string if the user rejects.
+    // `description` and `exactLabel` default to the swap wording; the bridge passes its own so the
+    // same cap dialog reads correctly for an Across deposit.
     QString spendingApprovalDialog(const QString &tokenSymbol, const QString &tokenAddr,
                                    const QString &spenderName, const QString &spenderAddr,
-                                   const QString &exactHuman, const QString &exactWei);
+                                   const QString &exactHuman, const QString &exactWei,
+                                   const QString &description = QString(),
+                                   const QString &exactLabel = QString());
     // True if `addr` is on the local verified/known-token allow-list (used for security badges).
     bool isKnownToken(const QString &addr) const;
     void refreshNfts();                    // fetch owned NFT collections for the current account
@@ -426,10 +444,16 @@ private:
     int m_historyFilter = -1;                  // -1 = All accounts, else account index
     // Electrum/Feather-style lazy, status-gated history so we never fan out a fetch over every
     // (mostly empty) account, and never refetch everything each block.
+    // Only accounts whose history actually ARRIVED. Marking an account fetched at request time meant
+    // a dropped or failed response left it permanently "loaded" and permanently empty.
     QSet<quint32> m_histFetched;               // accounts whose history is already loaded this session
+    QSet<quint32> m_histInFlight;              // requested, not yet answered (dedup without lying)
+    QSet<quint32> m_histRetry;                 // failed reads, awaiting the retry timer
+    QTimer *m_histRetryTimer = nullptr;        // one-shot, coalesces a burst of failures
     QSet<quint32> m_dirtyHistory;              // accounts whose balance changed -> need a targeted refetch
     QHash<quint32, double> m_histStatus;       // account balance when its history was last fetched (status gate)
     quint64 m_historyLoadedChain = ~Q_UINT64_C(0); // chain the history view was (re)loaded for
+    int m_blocksSinceFullSweep = 0;            // large wallets: blocks since the last all-account read
     QTreeView *m_historyView = nullptr;        // the History table (owned by the .ui form)
     QToolButton *m_historyPrev = nullptr;      // pagination: previous 500-row page
     QToolButton *m_historyNext = nullptr;      // pagination: next 500-row page

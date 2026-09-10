@@ -452,7 +452,10 @@ signals:
     void manySent(const QString &resultJson, const QString &error);
     // `chainId` = the chain this history was fetched for, so the UI can drop a late batch that
     // arrives after a network switch (otherwise a previous chain's rows leak into the new chain).
-    void historyRefreshed(const QVector<HistoryItem> &items, quint64 chainId);
+    // `ok` distinguishes "the explorer answered and this address has no transactions" from "the
+    // explorer could not be reached". They are the same empty list, and treating a failure as an
+    // answer is how an account came to be marked loaded while showing nothing.
+    void historyRefreshed(const QVector<HistoryItem> &items, quint64 chainId, bool ok);
     // Emitted (synchronously, on the caller/UI thread) at the very start of an all-account refresh,
     // before any batch is dispatched - the UI clears the model + resets dedup here. This must NOT be
     // driven off "done==1", because with parallel per-account fetches batches complete out of order
@@ -462,7 +465,9 @@ signals:
     // arbitrary order). `done`/`total` drive the progress indicator; done==total is the end.
     void historyBatch(const QVector<HistoryItem> &items, quint32 done, quint32 total, quint64 chainId);
     // Targeted single-account history (refreshAccountHistory): appended to the model, not cleared.
-    void accountHistoryReady(quint32 accountIndex, const QVector<HistoryItem> &items, quint64 chainId);
+    // `ok` is false when the explorer could not be read - see historyRefreshed above.
+    void accountHistoryReady(quint32 accountIndex, const QVector<HistoryItem> &items, quint64 chainId,
+                             bool ok);
     void addressesWarmed(); // emitted after warmAddresses() finishes populating the address cache
     void fundedScanned(const QList<quint32> &indices);
     void accountAdded(quint32 index); // a new HD account was derived (addAccountAsync)
@@ -472,18 +477,26 @@ signals:
     void imageReady(const QString &url, const QByteArray &data);
     void tokenMetaResolved(const QString &address, const QString &symbol, quint8 decimals);
     void fiatRate(const QString &currency, double rate);
-    void accountBalanceUpdated(quint32 accountIndex, const QString &formatted, const QString &symbol);
+    // Every balance carries the chain it was read on. Balances are the one thing that is NOT shared
+    // between chains, and a read issued just before a network switch lands just after it - keyed only
+    // by account and token address, it was indistinguishable from a reading of the new chain, and got
+    // stored (and persisted) as one. That is how an Ethereum DAI balance came to sit on Arbitrum.
+    void accountBalanceUpdated(quint32 accountIndex, const QString &formatted, const QString &symbol,
+                               quint64 chainId);
     void ethUsdPriceUpdated(double usdPerEth);
     void marketPricesUpdated(double xmrUsd, double xmrChangePct, double ethUsd, double ethChangePct);
     void blockNumberUpdated(quint64 block);
     void txReceiptReady(const QString &txHash, bool mined, bool success);
     void feesUpdated(const QString &baseFeeWei, const QString &tipWei);
     void connectionStatusChanged(int status);
-    void providerConnected(int mode, const QString &message); // 2=Tor, 1=Direct, 0=Offline
+    // 2=Tor, 1=Direct, 0=Offline. `chainId` is the chain that was connected, so a connect attempt
+    // the user has already switched away from cannot report itself as the current one - which would
+    // start a full balance + history load against the wrong network.
+    void providerConnected(int mode, const QString &message, quint64 chainId);
     void availableBalance(quint32 index, const QString &token, const QString &formatted,
-                          const QString &symbol);
+                          const QString &symbol, quint64 chainId);
     // Emitted once after a batched refreshAllBalances() has dispatched all per-account signals.
-    void allBalancesRefreshed();
+    void allBalancesRefreshed(quint64 chainId);
 
     // ##### CoW swap signals #####
     void swapQuoteReady(const QString &quoteJson, const QString &error);
@@ -540,7 +553,11 @@ private:
     QString m_errorString;
     QString m_path;
     QString m_password;
-    quint64 m_chainId = 1;
+    // The chain the core's provider is currently pointed at. Written the instant set_provider
+    // succeeds (not when the connectivity probe finishes), so a fetch dispatched during a connect is
+    // tagged with the chain it will actually read from. Atomic because network tasks on several pool
+    // threads read it while the connect task writes it.
+    QAtomicInteger<quint64> m_chainId{1};
 
     // The Rust `Wallet` behind `m_core` is not internally synchronized: read methods borrow it as
     // `&self`, mutations (set_provider / add_account / import_private_key / add_token) as `&mut`.

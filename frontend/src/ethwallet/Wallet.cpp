@@ -423,7 +423,6 @@ void Wallet::setHistoryApis(quint64 chainId, const QString &csv) {
 }
 
 bool Wallet::setProvider(quint64 chainId, const QStringList &endpoints, const QString &socksProxy) {
-    m_chainId = chainId;
     QJsonArray arr;
     for (const QString &e : endpoints) arr.append(e);
     const QByteArray endpointsJson = QJsonDocument(arr).toJson(QJsonDocument::Compact);
@@ -437,6 +436,7 @@ bool Wallet::setProvider(quint64 chainId, const QStringList &endpoints, const QS
         m_errorString = takeLastError();
         return false;
     }
+    m_chainId = chainId; // only now is the core actually reading from this chain
     emit connectionStatusChanged(1);
     return true;
 }
@@ -467,6 +467,13 @@ void Wallet::connectProvider(quint64 chainId, const QStringList &endpoints, cons
                                                         false, 20);
                 if (rc != 0)
                     return false;
+                // Tag point. Everything dispatched from here on reads from `chainId`, so it must be
+                // labelled `chainId` - not the chain we were on until a moment ago. Setting this
+                // only after the probe (which can take the full RPC timeout) meant a whole
+                // connect's worth of balance and history reads were labelled with the previous
+                // chain and thrown away by the UI as stale, which is what left History empty after
+                // a switch.
+                m_chainId = chainId;
             }
             QReadLocker lock(&m_coreLock);
             char *probe = aero_wallet_eth_balance(m_core, 0); // null => RPC unreachable
@@ -496,11 +503,10 @@ void Wallet::connectProvider(quint64 chainId, const QStringList &endpoints, cons
                                                : tr("Offline - no RPC reachable over Tor");
         }
 
-        m_chainId = chainId;
         m_status = mode ? Status_Ok : Status_Error;
-        QMetaObject::invokeMethod(this, [this, mode, message]() {
+        QMetaObject::invokeMethod(this, [this, mode, message, chainId]() {
             emit connectionStatusChanged(mode);
-            emit providerConnected(mode, message);
+            emit providerConnected(mode, message, chainId);
         }, Qt::QueuedConnection);
     });
 }
@@ -509,14 +515,15 @@ void Wallet::fetchAvailable(quint32 index, const QString &token) {
     QtConcurrent::run(&m_netPool, [this, index, token]() {
         yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
+        const quint64 chain = m_chainId;
         BalanceInfo b;
         char *j = token.isEmpty()
                       ? aero_wallet_eth_balance(m_core, index)
                       : aero_wallet_erc20_balance(m_core, token.toUtf8().constData(), index);
         if (j)
             b = parseBalance(takeString(j));
-        QMetaObject::invokeMethod(this, [this, index, token, b]() {
-            emit availableBalance(index, token, b.formatted, b.symbol);
+        QMetaObject::invokeMethod(this, [this, index, token, b, chain]() {
+            emit availableBalance(index, token, b.formatted, b.symbol, chain);
         }, Qt::QueuedConnection);
     });
 }
@@ -526,13 +533,15 @@ void Wallet::refreshAllBalances(quint32 numAccounts, const QString &extraTokensJ
     QtConcurrent::run(&m_netPool, [this, numAccounts, extraTokensJson]() {
         yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QString json;
+        quint64 chain;
         {
             QReadLocker lock(&m_coreLock);
+            chain = m_chainId;
             char *j = aero_wallet_all_balances(m_core, numAccounts,
                                                extraTokensJson.toUtf8().constData());
             if (j) json = takeString(j);
         }
-        QMetaObject::invokeMethod(this, [this, json]() {
+        QMetaObject::invokeMethod(this, [this, json, chain]() {
             const QJsonObject root = QJsonDocument::fromJson(json.toUtf8()).object();
             const QJsonArray accts = root.value(QStringLiteral("accounts")).toArray();
             for (const QJsonValue &av : accts) {
@@ -546,9 +555,9 @@ void Wallet::refreshAllBalances(quint32 numAccounts, const QString &extraTokensJ
                 // back-compat with an older core.)
                 if (a.value(QStringLiteral("native_ok")).toBool(true)) {
                     // Native balance: drives Home total, AddressModel, notifications, status bar...
-                    emit accountBalanceUpdated(idx, nativeFmt, nativeSym);
+                    emit accountBalanceUpdated(idx, nativeFmt, nativeSym, chain);
                     // ...and the Send "available" label when the native asset is selected (token "").
-                    emit availableBalance(idx, QString(), nativeFmt, nativeSym);
+                    emit availableBalance(idx, QString(), nativeFmt, nativeSym, chain);
                 }
                 for (const QJsonValue &tv : a.value(QStringLiteral("tokens")).toArray()) {
                     const QJsonObject t = tv.toObject();
@@ -556,10 +565,10 @@ void Wallet::refreshAllBalances(quint32 numAccounts, const QString &extraTokensJ
                         continue; // failed token read -> keep cached value
                     emit availableBalance(idx, t.value(QStringLiteral("address")).toString(),
                                           t.value(QStringLiteral("formatted")).toString(),
-                                          t.value(QStringLiteral("symbol")).toString());
+                                          t.value(QStringLiteral("symbol")).toString(), chain);
                 }
             }
-            emit allBalancesRefreshed();
+            emit allBalancesRefreshed(chain);
         }, Qt::QueuedConnection);
     });
 }
@@ -597,12 +606,13 @@ void Wallet::refreshAccountBalance(quint32 accountIndex) {
     QtConcurrent::run(&m_netPool, [this, accountIndex]() {
         yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
         QReadLocker lock(&m_coreLock);
+        const quint64 chain = m_chainId;
         BalanceInfo eth;
         char *ethJson = aero_wallet_eth_balance(m_core, accountIndex);
         if (ethJson)
             eth = parseBalance(takeString(ethJson));
-        QMetaObject::invokeMethod(this, [this, accountIndex, eth]() {
-            emit accountBalanceUpdated(accountIndex, eth.formatted, eth.symbol);
+        QMetaObject::invokeMethod(this, [this, accountIndex, eth, chain]() {
+            emit accountBalanceUpdated(accountIndex, eth.formatted, eth.symbol, chain);
         }, Qt::QueuedConnection);
     });
 }
@@ -711,6 +721,7 @@ void Wallet::refreshHistory(quint32 accountIndex, const QString &fromBlock) {
         // Full native + token history from the block explorer (over Tor) in one call.
         QVector<HistoryItem> items;
         char *j = aero_wallet_account_history(m_core, accountIndex);
+        const bool ok = j != nullptr; // null = the explorer could not be read, NOT "no transactions"
         if (j)
             parseHistoryArray(takeString(j), items);
         // Merge CoW Protocol swaps (pending + historical) for this account: they aren't on-chain
@@ -720,8 +731,9 @@ void Wallet::refreshHistory(quint32 accountIndex, const QString &fromBlock) {
             h.account = accountIndex;
         std::sort(items.begin(), items.end(),
                   [](const HistoryItem &a, const HistoryItem &b) { return a.timestamp > b.timestamp; });
-        QMetaObject::invokeMethod(this, [this, items, chain]() { emit historyRefreshed(items, chain); },
-                                  Qt::QueuedConnection);
+        QMetaObject::invokeMethod(
+            this, [this, items, chain, ok]() { emit historyRefreshed(items, chain, ok); },
+            Qt::QueuedConnection);
     });
 }
 
@@ -825,21 +837,24 @@ void Wallet::refreshAccountHistory(quint32 accountIndex) {
     QtConcurrent::run(&m_historyPool, [this, accountIndex]() {
         QVector<HistoryItem> part;
         quint64 chain;
+        bool ok;
         {
             yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
             QReadLocker lock(&m_coreLock);
             chain = m_chainId;
             char *j = aero_wallet_account_history(m_core, accountIndex);
+            ok = j != nullptr; // null = explorer unreachable/rate-limited, NOT "no transactions"
             if (j)
                 parseHistoryArray(takeString(j), part);
             mergeCowOrders(accountIndex, part);
             for (HistoryItem &h : part)
                 h.account = accountIndex;
         }
-        QMetaObject::invokeMethod(
-            this,
-            [this, accountIndex, part, chain]() { emit accountHistoryReady(accountIndex, part, chain); },
-            Qt::QueuedConnection);
+        QMetaObject::invokeMethod(this,
+                                  [this, accountIndex, part, chain, ok]() {
+                                      emit accountHistoryReady(accountIndex, part, chain, ok);
+                                  },
+                                  Qt::QueuedConnection);
     });
 }
 
