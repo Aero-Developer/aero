@@ -3347,6 +3347,64 @@ impl Wallet {
         Some(r)
     }
 
+    /// A Swap API reply that is a CCTP transfer this wallet has checked byte by byte.
+    ///
+    /// The Swap API describes its transaction in JSON but hands over opaque calldata to send, and
+    /// the JSON is not what gets broadcast. For CCTP that calldata is Circle's own `depositForBurn`,
+    /// simple enough to read back, so it is: the amount, the destination, the recipient, the token,
+    /// the fee cap and the contract are all taken from the bytes and compared with the request. A
+    /// reply that fails any of them - or that routes over relayers, whose periphery calldata does not
+    /// read back as simply - is refused here, and the relayer path builds a depositV3 of our own
+    /// encoding instead.
+    async fn across_cctp(
+        &self,
+        from_index: u32,
+        route: &crate::across::Route,
+        dest_chain_id: u64,
+        amount_wei: &str,
+    ) -> Option<serde_json::Value> {
+        if route.is_native {
+            return None; // CCTP moves USDC only
+        }
+        let sw = self.across_swap_api(from_index, route, dest_chain_id, amount_wei).await?;
+        let rail = sw.pointer("/steps/bridge/provider").and_then(|v| v.as_str()).unwrap_or_default();
+        if !rail.eq_ignore_ascii_case("cctp") {
+            return None;
+        }
+        let tx = sw.get("swapTx")?;
+        let to = tx.get("to")?.as_str()?;
+        let data = tx.get("data")?.as_str()?;
+        // A burn carries no ether; a reply asking for some is not the transaction we think it is.
+        let value = tx.get("value").map(json_num_str).unwrap_or_default();
+        if !(value.is_empty() || value == "0") {
+            return None;
+        }
+        // The allowance has to go to the contract being called, or it grants spending to
+        // something this transfer never touches.
+        let spender =
+            sw.pointer("/checks/allowance/spender").and_then(|v| v.as_str()).unwrap_or(to);
+        if !spender.eq_ignore_ascii_case(to) {
+            return None;
+        }
+        let me = parse_address(&self.address(from_index).ok()?).ok()?;
+        let token = parse_address(&route.origin_token).ok()?;
+        let amount = U256::from_str(amount_wei).ok()?;
+        // The most Circle may keep must not exceed the fee the user is shown: the confirm dialog
+        // quotes the expected output, and a larger cap in the bytes would let the transfer cost
+        // more than it said.
+        let expected_out = sw
+            .get("expectedOutputAmount")
+            .map(json_num_str)
+            .and_then(|s| U256::from_str(&s).ok())?;
+        if expected_out > amount {
+            return None;
+        }
+        if !cctp_burn_matches(to, data, dest_chain_id, &me, &token, amount, amount - expected_out) {
+            return None;
+        }
+        Some(sw)
+    }
+
     /// Shape a Swap API reply like an `across_quote` result, so the UI reads one format whichever
     /// endpoint answered. Deposit limits come back as zero because they describe the intent path:
     /// CCTP has no relayer-inventory ceiling, and this API rejects an out-of-range amount itself
@@ -3405,6 +3463,20 @@ impl Wallet {
         dest_chain_id: u64,
         amount_wei: &str,
     ) -> Result<serde_json::Value> {
+        self.across_quote_via(from_index, symbol, dest_chain_id, amount_wei, true).await
+    }
+
+    /// `try_cctp` false skips the Swap API and quotes the relayer path directly. The depositV3
+    /// builder needs exactly that: its fallback used to call `across_quote`, which prefers the Swap
+    /// API and so could hand back a quote shape with no SpokePool in it.
+    async fn across_quote_via(
+        &self,
+        from_index: u32,
+        symbol: &str,
+        dest_chain_id: u64,
+        amount_wei: &str,
+        try_cctp: bool,
+    ) -> Result<serde_json::Value> {
         let provider = self.provider()?;
         let origin = provider.chain_id();
         if dest_chain_id == origin {
@@ -3422,18 +3494,21 @@ impl Wallet {
         let input_token = route.origin_token.as_str();
         let output_token = route.dest_token.as_str();
         let me = self.address(from_index)?;
-        // Preferred path: the maintained endpoint, which picks CCTP for large USDC (~20s flat)
-        // instead of the intent path's wait on relayer inventory. Falls through on anything it
-        // cannot answer for, or answers in a shape we refuse to trust.
-        if let Some(sw) = self.across_swap_api(from_index, route, dest_chain_id, amount_wei).await {
-            return Ok(Self::across_swap_quote_json(
-                &sw,
-                route,
-                symbol,
-                origin,
-                dest_chain_id,
-                amount_wei,
-            ));
+        // Preferred path: a CCTP transfer through the maintained endpoint (~20s flat for large USDC,
+        // instead of the intent path's wait on relayer inventory) - but only one whose calldata
+        // verifies, the same test the builder applies, so a quote and the transaction built from it
+        // always come from the same rail. Everything else is quoted on the relayer path below.
+        if try_cctp {
+            if let Some(sw) = self.across_cctp(from_index, route, dest_chain_id, amount_wei).await {
+                return Ok(Self::across_swap_quote_json(
+                    &sw,
+                    route,
+                    symbol,
+                    origin,
+                    dest_chain_id,
+                    amount_wei,
+                ));
+            }
         }
         let url = format!(
             "https://app.across.to/api/suggested-fees?inputToken={input_token}&outputToken={output_token}\
@@ -3525,35 +3600,19 @@ impl Wallet {
         dest_chain_id: u64,
         amount_wei: &str,
     ) -> Result<serde_json::Value> {
-        // Same preference as the quote, and re-fetched here so the calldata is fresh: the Swap API
-        // returns the transaction to send, so nothing below has to encode depositV3 by hand.
+        // A CCTP transfer from the Swap API when one verifies (see across_cctp), re-fetched here so
+        // the calldata is fresh. Anything else - relayer-routed, native, or a reply whose bytes do
+        // not say what we asked for - is built below as a depositV3 this wallet encodes itself.
         {
             let provider = self.provider()?;
             let origin = provider.chain_id();
             let table = crate::across::routes(provider).await;
             if let Some(route) = crate::across::resolve(&table, origin, dest_chain_id, symbol) {
-                if let Some(sw) =
-                    self.across_swap_api(from_index, route, dest_chain_id, amount_wei).await
-                {
+                if let Some(sw) = self.across_cctp(from_index, route, dest_chain_id, amount_wei).await {
                     let tx = sw.get("swapTx").cloned().unwrap_or_default();
                     let gs = |v: &serde_json::Value, k: &str| {
                         v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string()
                     };
-                    // Approving the SpokePool is wrong here: CCTP deposits go through a different
-                    // periphery contract, so the spender comes from the quote rather than from us.
-                    let spender = sw
-                        .get("checks")
-                        .and_then(|c| c.get("allowance"))
-                        .and_then(|a| a.get("spender"))
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| gs(&tx, "to"));
-                    let value = tx
-                        .get("value")
-                        .map(json_num_str)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| "0".into());
                     let q = Self::across_swap_quote_json(
                         &sw,
                         route,
@@ -3562,12 +3621,21 @@ impl Wallet {
                         dest_chain_id,
                         amount_wei,
                     );
+                    // across_cctp has read the destination domain out of the calldata itself and
+                    // matched it to this chain, so this is what the broadcast bytes deliver to - not
+                    // just what the reply claims. Echoed so the caller can refuse to send a deposit
+                    // whose destination is not the one the user confirmed: the check that would
+                    // have stopped a bridge meant for Arbitrum landing on Optimism.
                     return Ok(serde_json::json!({
                         "to": gs(&tx, "to"),
-                        "spender": spender,
+                        // depositForBurn pulls the tokens itself, so the contract being called is
+                        // the only spender that makes sense - and across_cctp requires the reply to
+                        // agree.
+                        "spender": gs(&tx, "to"),
                         "data": gs(&tx, "data"),
-                        "value": value,
-                        "native": route.is_native,
+                        "value": "0",
+                        "native": false,
+                        "dest_chain": dest_chain_id,
                         "input_token": route.origin_token,
                         "input_amount": amount_wei,
                         "decimals": q.get("decimals").and_then(|v| v.as_u64()).unwrap_or(18),
@@ -3581,7 +3649,9 @@ impl Wallet {
                 }
             }
         }
-        let q = self.across_quote(from_index, symbol, dest_chain_id, amount_wei).await?;
+        // The relayer path, quoted directly: this builder needs the SpokePool and deposit deadlines
+        // that only a suggested-fees quote carries.
+        let q = self.across_quote_via(from_index, symbol, dest_chain_id, amount_wei, false).await?;
         let gs = |k: &str| q.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
 
         // The quote is re-fetched here, so re-check the route limits against THIS quote - the caller's
@@ -3675,6 +3745,8 @@ impl Wallet {
             "data": format!("0x{}", hex::encode(calldata)),
             "value": if native { input_amount.to_string() } else { "0".to_string() },
             "native": native,
+            // Exactly what was encoded as destinationChainId above - see the Swap API branch.
+            "dest_chain": dest_chain_id,
             "input_token": gs("input_token"),
             "input_amount": amount_wei,
             "decimals": q.get("decimals").and_then(|v| v.as_u64()).unwrap_or(18),
@@ -5066,6 +5138,65 @@ fn topic_to_address(topic: &str) -> String {
     }
 }
 
+/// Circle's TokenMessengerV2, deployed at the same address on every EVM chain CCTP v2 runs on.
+const CCTP_TOKEN_MESSENGER_V2: &str = "0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d";
+
+/// Circle's CCTP domain for a chain Aero bridges between, or `None` where CCTP does not run. These
+/// are Circle's numbering, not chain ids - Optimism is domain 2, Arbitrum domain 3 - and a burn
+/// names its destination by domain.
+fn cctp_domain(chain_id: u64) -> Option<u32> {
+    match chain_id {
+        1 => Some(0),
+        43114 => Some(1),
+        10 => Some(2),
+        42161 => Some(3),
+        8453 => Some(6),
+        137 => Some(7),
+        _ => None,
+    }
+}
+
+/// Whether `data`, sent to `to`, is a CCTP v2 burn of exactly `amount` of `token` toward
+/// `dest_chain_id`, minting to `recipient`, keeping at most `max_fee`:
+///
+/// `depositForBurn(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient,
+///                 address burnToken, bytes32 destinationCaller, uint256 maxFee,
+///                 uint32 minFinalityThreshold)`
+///
+/// Across appends a short integrator tag after the arguments, which the contract ignores; only the
+/// seven argument words are read.
+fn cctp_burn_matches(
+    to: &str,
+    data: &str,
+    dest_chain_id: u64,
+    recipient: &Address,
+    token: &Address,
+    amount: U256,
+    max_fee: U256,
+) -> bool {
+    const SELECTOR: [u8; 4] = [0x8e, 0x02, 0x50, 0xee];
+    if !to.eq_ignore_ascii_case(CCTP_TOKEN_MESSENGER_V2) {
+        return false;
+    }
+    let Some(domain) = cctp_domain(dest_chain_id) else {
+        return false;
+    };
+    let Ok(bytes) = hex::decode(data.trim_start_matches("0x")) else {
+        return false;
+    };
+    if bytes.len() < 4 + 32 * 7 || bytes[..4] != SELECTOR {
+        return false;
+    }
+    let word = |i: usize| &bytes[4 + 32 * i..4 + 32 * (i + 1)];
+    let address_in =
+        |w: &[u8]| w[..12].iter().all(|b| *b == 0).then(|| Address::from_slice(&w[12..]));
+    U256::from_be_slice(word(0)) == amount
+        && U256::from_be_slice(word(1)) == U256::from(domain)
+        && address_in(word(2)) == Some(*recipient)
+        && address_in(word(3)) == Some(*token)
+        && U256::from_be_slice(word(5)) <= max_fee
+}
+
 fn hex_bytes(v: &serde_json::Value) -> Result<Vec<u8>> {
     let s = v
         .as_str()
@@ -5275,6 +5406,69 @@ pub fn parse_units(amount: &str, decimals: u8) -> Result<U256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CCTP v2 burn laid out exactly as the Across Swap API returns it for 120,000 USDC from
+    /// Ethereum, integrator tag included. Only the recipient is made up.
+    fn cctp_burn(domain: u8, recipient: &str, max_fee: u64) -> String {
+        let word = |hex: &str| format!("{:0>64}", hex.trim_start_matches("0x").to_lowercase());
+        [
+            "0x8e0250ee".to_string(),
+            word("1bf08eb000"),                                 // amount: 120,000 USDC
+            word(&format!("{domain:x}")),                       // destination domain
+            word(recipient),                                    // mint recipient
+            word("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),   // burn token: Ethereum USDC
+            word("708704d33ace3dafbed28f150a56ce9d124b1ef8"),   // destination caller
+            word(&format!("{max_fee:x}")),                      // max fee
+            word("3e8"),                                        // min finality threshold
+            "73c0de".to_string(),                               // Across integrator tag
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn a_cctp_burn_is_accepted_only_for_the_chain_it_actually_delivers_to() {
+        let me = parse_address("0x1111111111111111111111111111111111111111").unwrap();
+        let usdc = parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap();
+        let amount = U256::from(120_000_000_000u64);
+        let fee = U256::from(12_000_000u64);
+        let to_arbitrum = cctp_burn(3, "0x1111111111111111111111111111111111111111", 12_000_000);
+
+        assert!(cctp_burn_matches(CCTP_TOKEN_MESSENGER_V2, &to_arbitrum, 42161, &me, &usdc, amount, fee));
+        // The exact failure this exists to stop: bytes that burn toward Arbitrum must never pass as
+        // a bridge to Optimism, and the reverse.
+        assert!(!cctp_burn_matches(CCTP_TOKEN_MESSENGER_V2, &to_arbitrum, 10, &me, &usdc, amount, fee));
+        let to_optimism = cctp_burn(2, "0x1111111111111111111111111111111111111111", 12_000_000);
+        assert!(!cctp_burn_matches(CCTP_TOKEN_MESSENGER_V2, &to_optimism, 42161, &me, &usdc, amount, fee));
+        assert!(cctp_burn_matches(CCTP_TOKEN_MESSENGER_V2, &to_optimism, 10, &me, &usdc, amount, fee));
+    }
+
+    #[test]
+    fn a_cctp_burn_must_pay_us_the_amount_we_chose_through_circle() {
+        let me = parse_address("0x1111111111111111111111111111111111111111").unwrap();
+        let usdc = parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap();
+        let amount = U256::from(120_000_000_000u64);
+        let fee = U256::from(12_000_000u64);
+        let ok = cctp_burn(3, "0x1111111111111111111111111111111111111111", 12_000_000);
+
+        let someone_else = cctp_burn(3, "0x2222222222222222222222222222222222222222", 12_000_000);
+        assert!(!cctp_burn_matches(CCTP_TOKEN_MESSENGER_V2, &someone_else, 42161, &me, &usdc, amount, fee),
+                "minted to an address that is not ours");
+        assert!(!cctp_burn_matches(CCTP_TOKEN_MESSENGER_V2, &ok, 42161, &me, &usdc, U256::from(1u64), fee),
+                "burns a different amount than was confirmed");
+        let greedy = cctp_burn(3, "0x1111111111111111111111111111111111111111", 12_000_001);
+        assert!(!cctp_burn_matches(CCTP_TOKEN_MESSENGER_V2, &greedy, 42161, &me, &usdc, amount, fee),
+                "may keep more than the quoted fee");
+        let other_token = parse_address("0xdAC17F958D2ee523a2206206994597C13D831ec7").unwrap();
+        assert!(!cctp_burn_matches(CCTP_TOKEN_MESSENGER_V2, &ok, 42161, &me, &other_token, amount, fee),
+                "burns a token other than the one being bridged");
+        assert!(!cctp_burn_matches("0x3333333333333333333333333333333333333333", &ok, 42161, &me, &usdc,
+                                   amount, fee),
+                "sent to a contract that is not Circle's TokenMessenger");
+        assert!(!cctp_burn_matches(CCTP_TOKEN_MESSENGER_V2, &ok, 56, &me, &usdc, amount, fee),
+                "a chain CCTP does not serve");
+        assert!(!cctp_burn_matches(CCTP_TOKEN_MESSENGER_V2, &ok[..100], 42161, &me, &usdc, amount, fee),
+                "truncated calldata");
+    }
 
     /// A loopback explorer that answers every request with `body`, for exercising the failover
     /// without waiting for a real one to break.

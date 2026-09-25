@@ -136,12 +136,15 @@ private:
     void relabelNative();              // update native-coin labels (Home ticker, status) after switch
     void rebuildAccountCombos();
     void updateHistoryOwnAddresses(); // feed the wallet's own addresses to the history poisoning filter
-    void refreshAllBalances();
+    // Start a batched balance sweep. Returns false when one is already in flight and this call was
+    // therefore dropped rather than queued behind it.
+    bool refreshAllBalances();
     // Whether the batched balance read is small enough to also carry this chain's curated tokens.
     // When it isn't, only the selected account's curated balances are fetched separately.
     bool batchIncludesCuratedTokens() const;
     void recomputeHomeTotal();
     void scheduleHomeRecompute();     // debounced recompute (coalesces bulk balance updates)
+    void scheduleReceiveRefresh();    // debounced status balance + Receive panel redraw (QR encode)
     void refreshUsedFlags();          // recompute all rows' red/used flags in one pass
     void startScanProgress();         // poll live funded-scan progress into the status bar
     void notify(const QString &title, const QString &body);
@@ -154,6 +157,9 @@ private:
     void saveHistoryCache();          // persist the current chain's fetched history (debounced)
     void foldHistoryCacheIntoMeta();  // build history snapshot into m_meta without saving (close path)
     void loadHistoryCache();          // restore the current chain's history instantly (0 requests)
+    // Keep `items` as this chain's converted history, evicting the least recently used chain. See
+    // m_histItemsByChain.
+    void rememberHistoryItems(quint64 chainId, const QVector<HistoryItem> &items);
     void loadHistoricalPrices();      // restore cached per-date prices (immutable) - no re-fetch ever
     void scheduleHistorySave();       // debounce persisting history after targeted batches arrive
     void primeZeroBalances();         // show 0 immediately for accounts with no known balance yet
@@ -205,6 +211,7 @@ private:
     QSet<QString> verifiedTokenAddresses() const; // trusted-token allow-list (lower-case) for spam
     void applyVerifiedTokens();            // push the allow-list into the History model
     void checkUntrackedTokenLiquidity();   // query DexScreener for unknown tokens seen in history
+    void scheduleUntrackedTokenScan();     // ...debounced, so a per-account history load runs it once
     void loadLiquidityCache();             // restore persisted liquidity decisions
     void setupNftTab();                    // build the NFTs tab (hidden unless enabled)
     void setNftTabEnabled(bool on);        // show/hide the NFTs tab (Settings toggle)
@@ -393,6 +400,11 @@ private:
     QLabel *m_homeEthPct = nullptr;
     QHash<quint32, double> m_ethRawByAccount;  // raw ETH balance per account (for combined total)
     QHash<QString, double> m_tokenRawByKey;    // "account|tokenAddr" -> raw token balance
+    // Each account's full USD value, published by the last recomputeHomeTotal (which already works
+    // it out for every account in one pass). Read by accountLabel, which the account selectors call
+    // once per row: without this, relabelling three several-hundred-row combos re-scanned the entire
+    // token-balance map once per row, which is quadratic and froze the window.
+    QHash<quint32, double> m_acctUsdCache;
     // Details of the tx being committed, captured at confirm time so the post-send UI (optimistic
     // balance drop, history row, notification) uses the ACTUAL token amount - not the raw Amount
     // field, which may be entered in USD. m_committedIsReplacement suppresses the optimistic drop +
@@ -432,6 +444,13 @@ private:
     bool m_balancesFromCache = false;          // suppress "payment received" on the 1st refresh after
                                                // loading stale cached balances (not a live change)
     QTimer *m_homeTotalTimer = nullptr;        // debounces home-total + used-flag recompute
+    QTimer *m_receiveRefreshTimer = nullptr;   // debounces the status balance + Receive QR redraw
+    QTimer *m_liquiditySaveTimer = nullptr;    // coalesces a burst of token-liquidity verdicts
+    QTimer *m_notesSaveTimer = nullptr;        // debounces re-serialising metadata while typing notes
+    QTimer *m_recvSearchTimer = nullptr;       // debounces the Receive address filter
+    QTimer *m_untrackedScanTimer = nullptr;    // debounces the untracked-token scan over all history
+    QTimer *m_sendProgressTimeout = nullptr;   // frees the modal send spinner if nothing ever resolves
+    double m_dustUsd = 0.005;                  // cached history/dustUsd (read on every Receive redraw)
     QTimer *m_scanProgressTimer = nullptr;     // polls live funded-scan progress into the status bar
     QTimer *m_cowPollTimer = nullptr;          // re-checks CoW/swap status while any swap is pending
     quint64 m_lastBlock = 0;                   // last seen block height
@@ -453,7 +472,17 @@ private:
     QSet<quint32> m_dirtyHistory;              // accounts whose balance changed -> need a targeted refetch
     QHash<quint32, double> m_histStatus;       // account balance when its history was last fetched (status gate)
     quint64 m_historyLoadedChain = ~Q_UINT64_C(0); // chain the history view was (re)loaded for
+    // Per-chain history, already converted out of JSON. Restoring a chain's rows on a switch, and
+    // carrying forward the accounts a save didn't cover, both walked up to 30,000 stored rows
+    // through QJsonObject on the UI thread - the switch deserialized them, and every periodic save
+    // deserialized them again only to serialize them straight back. Holding the converted form for
+    // the few chains in play makes switching back free and removes half the cost of each save. The
+    // JSON in m_meta stays authoritative, so dropping an entry only costs speed.
+    QHash<quint64, QVector<HistoryItem>> m_histItemsByChain;
+    QList<quint64> m_histChainOrder;           // most recently used first
     int m_blocksSinceFullSweep = 0;            // large wallets: blocks since the last all-account read
+    bool m_balanceSweepInFlight = false;       // a batched balance read is out; don't stack another
+    qint64 m_balanceSweepStartedMs = 0;        // when, so a lost sweep can't block sweeps for good
     QTreeView *m_historyView = nullptr;        // the History table (owned by the .ui form)
     QToolButton *m_historyPrev = nullptr;      // pagination: previous 500-row page
     QToolButton *m_historyNext = nullptr;      // pagination: next 500-row page

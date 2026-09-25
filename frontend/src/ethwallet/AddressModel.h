@@ -63,6 +63,7 @@ public slots:
 
 private:
     void rebuildVisible(); // recompute the visible row -> account-index mapping
+    void reindexVisible(); // and the reverse lookup that rowForAccount uses
 
     Wallet *m_wallet = nullptr;
     QHash<quint32, QString> m_labels;   // keyed by account index (stable across filtering)
@@ -70,6 +71,7 @@ private:
     QHash<quint32, QString> m_balances; // keyed by account index
     QSet<quint32> m_used;               // account indices marked "used"
     QList<quint32> m_visible;           // row -> account index
+    QHash<quint32, int> m_rowOf;        // account index -> row (the reverse of m_visible)
     QSet<quint32> m_funded;             // account indices with a balance
     bool m_fundedOnly = false;
 };

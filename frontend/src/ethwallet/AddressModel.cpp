@@ -17,19 +17,34 @@ void AddressModel::setWallet(Wallet *wallet) {
 
 void AddressModel::rebuildVisible() {
     m_visible.clear();
-    if (!m_wallet)
+    if (!m_wallet) {
+        reindexVisible();
         return;
+    }
     const quint32 n = m_wallet->numAccounts();
     if (m_fundedOnly) {
         for (quint32 i = 0; i < n; ++i)
             if (m_funded.contains(i))
                 m_visible.append(i);
-        if (!m_visible.isEmpty())
+        if (!m_visible.isEmpty()) {
+            reindexVisible();
             return;
+        }
         // Fallback: nothing funded yet - show all so there's always an address to receive to.
     }
     for (quint32 i = 0; i < n; ++i)
         m_visible.append(i);
+    reindexVisible();
+}
+
+// Account -> row, so rowForAccount is a lookup rather than a scan. A bulk balance update calls
+// setBalance once per account, and each of those called rowForAccount, so the cost of refreshing
+// balances grew with the square of the number of addresses.
+void AddressModel::reindexVisible() {
+    m_rowOf.clear();
+    m_rowOf.reserve(m_visible.size());
+    for (int r = 0; r < m_visible.size(); ++r)
+        m_rowOf.insert(m_visible.at(r), r);
 }
 
 quint32 AddressModel::accountAt(int row) const {
@@ -40,7 +55,7 @@ quint32 AddressModel::accountAt(int row) const {
 }
 
 int AddressModel::rowForAccount(quint32 index) const {
-    return static_cast<int>(m_visible.indexOf(index));
+    return m_rowOf.value(index, -1);
 }
 
 void AddressModel::setFundedFilter(bool on, const QSet<quint32> &funded) {
@@ -82,10 +97,15 @@ QVariant AddressModel::data(const QModelIndex &index, int role) const {
     }
 
     if (role == Qt::FontRole && index.column() == Column_Address) {
-        QFont f;
-        f.setFamily(QStringLiteral("monospace"));
-        f.setStyleHint(QFont::TypeWriter);
-        return f;
+        // Built once. The view asks for this role for every visible row on every repaint, and a
+        // QFont carries a font-database lookup behind it.
+        static const QFont mono = []() {
+            QFont f;
+            f.setFamily(QStringLiteral("monospace"));
+            f.setStyleHint(QFont::TypeWriter);
+            return f;
+        }();
+        return mono;
     }
 
     if (role == Qt::TextAlignmentRole && index.column() == Column_Index)

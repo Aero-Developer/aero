@@ -617,6 +617,10 @@ private:
     mutable int m_numAccountsLast = 1;           // last successfully read count; non-blocking fallback
     mutable QVector<TokenInfo> m_tokensCache;
     mutable bool m_tokensCacheValid = false;
+    // index -> imported-key ordinal (-1 when seed-derived). Asked once per account every time the
+    // account selectors or the History Account column are rebuilt, and it was an uncached, blocking
+    // core read each time. Cleared by invalidateMetaCache() when the account set changes.
+    mutable QHash<quint32, int> m_importedOrdinalCache;
     mutable int m_watchOnlyCache = -1;           // -1 = unknown (immutable once computed)
     mutable int m_hardwareCache = -1;            // -1 = unknown (immutable once computed)
     mutable QString m_hwKindCache;               // immutable once computed

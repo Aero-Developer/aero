@@ -109,6 +109,13 @@ static QString addrSignature(const QString &addrLower) {
 // genuine, non-spam transfers of value). A transfer whose counterparty matches one of these
 // signatures but ISN'T one of the real addresses is a vanity look-alike (poisoning). Recomputed per
 // rebuild; O(N) over history.
+void HistoryModel::ensurePoisonRefs() {
+    if (!m_poisonDirty)
+        return;
+    m_poisonDirty = false;
+    rebuildPoisonRefs();
+}
+
 void HistoryModel::rebuildPoisonRefs() {
     m_poisonRefAddrs.clear();
     m_poisonRefSigs.clear();
@@ -174,31 +181,44 @@ bool HistoryModel::isSuspicious(int row) const {
     return m_items.at(row).failed;
 }
 
-// True if `text` (search box) matches this row on any visible column. m_search is pre-lowercased.
-bool HistoryModel::matchesSearch(const HistoryItem &h) const {
-    if (m_search.isEmpty())
-        return true;
-    if (h.counterparty.toLower().contains(m_search)) return true;
-    if (h.txHash.toLower().contains(m_search)) return true;
-    // So typing an account's name narrows history to that account without touching the filter combo.
-    if (accountName(h).toLower().contains(m_search)) return true;
-    if (h.symbol.toLower().contains(m_search)) return true;
-    if (h.buySymbol.toLower().contains(m_search)) return true;
-    if (h.formatted.contains(m_search)) return true;
-    if (h.buyFormatted.contains(m_search)) return true;
+// Everything the search box can match on one row, lower-cased and joined by a separator that cannot
+// occur in any of the fields - so a match can never straddle two of them. Built once per row when
+// the rows (or the account names) change, rather than per keystroke.
+QString HistoryModel::searchBlob(const HistoryItem &h) const {
     // Direction words as shown in the table.
-    const QString dir = (h.kind == QLatin1String("swap"))
-                            ? QStringLiteral("swap")
-                            : (h.failed ? QStringLiteral("failed")
-                                        : (h.direction == QLatin1String("in") ? QStringLiteral("received")
-                                                                              : QStringLiteral("sent")));
-    if (dir.contains(m_search)) return true;
+    const QLatin1String dir = (h.kind == QLatin1String("swap"))
+                                  ? QLatin1String("swap")
+                                  : (h.failed ? QLatin1String("failed")
+                                              : (h.direction == QLatin1String("in")
+                                                     ? QLatin1String("received")
+                                                     : QLatin1String("sent")));
+    QString blob;
+    blob.reserve(160);
+    const QChar sep(u'\n');
+    // So typing an account's name narrows history to that account without touching the filter combo.
+    blob += h.counterparty; blob += sep;
+    blob += h.txHash;       blob += sep;
+    blob += accountName(h); blob += sep;
+    blob += h.symbol;       blob += sep;
+    blob += h.buySymbol;    blob += sep;
+    blob += h.formatted;    blob += sep;
+    blob += h.buyFormatted; blob += sep;
+    blob += dir;
     if (h.timestamp) {
-        const QString d = QDateTime::fromSecsSinceEpoch(static_cast<qint64>(h.timestamp))
-                              .toString(QStringLiteral("yyyy-MM-dd HH:mm"));
-        if (d.contains(m_search)) return true;
+        blob += sep;
+        blob += QDateTime::fromSecsSinceEpoch(static_cast<qint64>(h.timestamp))
+                    .toString(QStringLiteral("yyyy-MM-dd HH:mm"));
     }
-    return false;
+    return blob.toLower();
+}
+
+void HistoryModel::ensureSearchBlobs() {
+    if (!m_blobsDirty)
+        return;
+    m_blobsDirty = false;
+    m_searchBlobs.resize(m_allItems.size());
+    for (int i = 0; i < m_allItems.size(); ++i)
+        m_searchBlobs[i] = searchBlob(m_allItems.at(i));
 }
 
 // Order comparison for the current sort column (ascending sense; sortFiltered flips for descending).
@@ -255,7 +275,8 @@ void HistoryModel::sortFiltered() {
 
 // Recompute the full filtered + sorted result set, then show only the current page.
 void HistoryModel::rebuildVisible() {
-    rebuildPoisonRefs(); // refresh the legit-address index before filtering (look-alike detection)
+    ensurePoisonRefs();  // the legit-address index, refreshed only if its inputs moved
+    ensureSearchBlobs(); // and the per-row search haystacks, likewise
     // Transactions that are the on-chain half of a swap we placed ourselves. The explorer reports
     // the leg that left the wallet as an ordinary transfer, and only later - once it has indexed the
     // internal transfer coming back - folds both legs into one swap. In between, showing our swap
@@ -267,13 +288,14 @@ void HistoryModel::rebuildVisible() {
             swapLegs.insert(l.txHash.toLower());
     m_filtered.clear();
     m_filtered.reserve(m_allItems.size());
-    for (const HistoryItem &h : m_allItems) {
+    for (int i = 0; i < m_allItems.size(); ++i) {
+        const HistoryItem &h = m_allItems.at(i);
         if (h.kind != QLatin1String("swap") && !h.txHash.isEmpty() &&
             swapLegs.contains(h.txHash.toLower()))
             continue;
         if (m_hideSpam && isHiddenSpam(h))
             continue;
-        if (!matchesSearch(h))
+        if (!m_search.isEmpty() && !m_searchBlobs.at(i).contains(m_search))
             continue;
         m_filtered.append(h);
     }
@@ -311,7 +333,10 @@ void HistoryModel::setSearchText(const QString &text) {
         return;
     m_search = t;
     m_page = 0; // a new filter always starts at the first page
-    rebuildVisible();
+    // Debounced: a filter pass walks the whole history, and running one per keystroke is what made
+    // typing in the search box stutter on a wallet with a lot of it. The coalesce window still
+    // refreshes while the user keeps typing, so results appear to keep up.
+    scheduleRebuild();
 }
 
 void HistoryModel::sort(int column, Qt::SortOrder order) {
@@ -358,8 +383,11 @@ void HistoryModel::setPrices(const QHash<QString, double> &pricesBySymbol) {
     m_prices = pricesBySymbol;
     if (!m_items.isEmpty()) // refresh the Value column
         emit dataChanged(index(0, Column_Value), index(m_items.size() - 1, Column_Value));
-    if (m_dustUsd > 0.0) // prices also affect the dust filter
-        rebuildVisible();
+    // Prices also decide what the dust filter hides, so the rows have to be re-tested. Coalesced:
+    // this arrives on a timer while prices refresh, and the dust filter is on by default, so a
+    // synchronous full re-filter here was a periodic hitch that grew with the history.
+    if (m_dustUsd > 0.0)
+        scheduleRebuild();
 }
 
 void HistoryModel::setFiat(double rate, const QString &symbol) {
@@ -374,6 +402,18 @@ void HistoryModel::setHistoricalUnitPrice(const QString &key, double usd) {
         return;
     m_histUnitPrice.insert(key, usd);
     if (!m_items.isEmpty())
+        emit dataChanged(index(0, Column_Value), index(m_items.size() - 1, Column_Value));
+}
+
+void HistoryModel::setHistoricalUnitPrices(const QHash<QString, double> &pricesByKey) {
+    bool any = false;
+    for (auto it = pricesByKey.constBegin(); it != pricesByKey.constEnd(); ++it) {
+        if (it.value() <= 0.0)
+            continue;
+        m_histUnitPrice.insert(it.key(), it.value());
+        any = true;
+    }
+    if (any && !m_items.isEmpty())
         emit dataChanged(index(0, Column_Value), index(m_items.size() - 1, Column_Value));
 }
 
@@ -408,11 +448,20 @@ QStringList HistoryModel::untrackedTokenAddresses() const {
 }
 
 void HistoryModel::setKnownTokens(const QSet<QString> &tokens) {
-    m_knownTokens.clear();
+    QSet<QString> lower;
+    lower.reserve(tokens.size());
     for (const QString &t : tokens)
-        m_knownTokens.insert(t.toLower());
-    // Spam classification depends on the tracked-token set, so re-filter the visible rows.
-    rebuildVisible();
+        lower.insert(t.toLower());
+    // Unchanged is the common case: this is pushed again on every history refresh, every chain
+    // switch and every liquidity verdict, and re-filtering the whole history each time - which on a
+    // long history is a full pass over tens of thousands of rows - was work for no change on screen.
+    if (lower == m_knownTokens)
+        return;
+    m_knownTokens = std::move(lower);
+    m_poisonDirty = true; // which tokens are trusted decides which counterparties seed the index
+    // Spam classification depends on the tracked-token set, so re-filter the visible rows. Coalesced
+    // because verdicts arrive in bursts (up to fifteen liquidity lookups land per refresh).
+    scheduleRebuild();
 }
 
 void HistoryModel::setOwnAddresses(const QSet<QString> &addrs) {
@@ -423,6 +472,7 @@ void HistoryModel::setOwnAddresses(const QSet<QString> &addrs) {
     if (lower == m_ownAddresses)
         return; // unchanged - avoid a needless re-filter
     m_ownAddresses = lower;
+    m_poisonDirty = true;
     rebuildVisible(); // look-alike detection references the wallet's own addresses
 }
 
@@ -443,10 +493,17 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
                                 : h.symbol.toUpper();
         if (!h.token.isEmpty() && sym == QLatin1String("ETH"))
             return {}; // ERC-20 impersonating native ETH
+        // Cached by symbol. The view asks for this role for every visible row on every repaint, and
+        // building it meant a resource-existence check and a fresh QIcon each time - decoding the
+        // same handful of PNGs over and over while the user scrolled.
+        static QHash<QString, QIcon> iconBySymbol;
+        const auto hit = iconBySymbol.constFind(sym);
+        if (hit != iconBySymbol.constEnd())
+            return hit.value().isNull() ? QVariant() : QVariant(hit.value());
         const QString path = QStringLiteral(":/assets/images/tokens/%1.png").arg(sym);
-        if (!QFileInfo::exists(path))
-            return {};
-        return QIcon(path);
+        const QIcon icon = QFileInfo::exists(path) ? QIcon(path) : QIcon();
+        iconBySymbol.insert(sym, icon); // a missing logo is cached as null, so it is looked up once
+        return icon.isNull() ? QVariant() : QVariant(icon);
     }
 
     if (role == Qt::ForegroundRole) {
@@ -566,7 +623,8 @@ void HistoryModel::setAccountNames(const QHash<quint32, QString> &names) {
         return;
     m_accountNames = names;
     // Renaming an account changes what the column says and what a search for that name matches, so
-    // the filter has to run again rather than just repainting.
+    // the filter has to run again rather than just repainting - and the per-row search text with it.
+    m_blobsDirty = true;
     rebuildVisible();
 }
 
@@ -754,6 +812,8 @@ void HistoryModel::beginFullRefresh() {
     // filled/failed (the "stuck on pending forever" bug).
     m_allItems = m_localSwaps;
     m_allItems += m_localSends; // keep optimistic pending sends visible across the refresh too
+    m_poisonDirty = true;
+    m_blobsDirty = true;
     m_page = 0;
     rebuildVisible(); // filter + sort + slice page 0 (just the pending rows at this point)
 }
@@ -936,6 +996,8 @@ void HistoryModel::rebuildAll() {
     m_allItems = m_localSwaps; // pending swaps + sends on top until their mined rows arrive
     m_allItems += m_localSends;
     m_allItems += m_fetched;
+    m_poisonDirty = true; // the rows changed, so both derived indexes are stale
+    m_blobsDirty = true;
     rebuildVisible();
 }
 

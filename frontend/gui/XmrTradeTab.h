@@ -132,6 +132,8 @@ private:
     QTimer *m_poll = nullptr;
     QTimer *m_ageTick = nullptr;      // ticks the "updated N seconds ago" text
     bool m_refreshInFlight = false;   // a book/balance request is out
+    bool m_refreshAgain = false;      // a forced refresh arrived while one was out; reissue on reply
+    bool m_bookRedrawQueued = false;  // a resize-driven book rebuild is already pending
     QDateTime m_refreshStarted;       // when, so a lost request cannot wedge polling forever
     QDateTime m_lastUpdate;           // when the screen last showed live data
     bool m_inFlight = false;   // an order/cancel/withdrawal is with the exchange

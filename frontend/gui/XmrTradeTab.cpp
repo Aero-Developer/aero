@@ -175,11 +175,18 @@ bool XmrTradeTab::eventFilter(QObject *watched, QEvent *event) {
         // Only when the number of rows that fit actually changes, and never from inside the layout
         // pass that delivered this event: redrawing the book sets its minimum height, which would
         // re-enter the layout that is still running.
-        if (fits != m_bookRows)
+        //
+        // At most one redraw can be queued at a time. Dragging a splitter delivers a resize per
+        // pixel, and `fits` changes every row-height of them, so this queued a rebuild of the whole
+        // book - clear, repopulate, regenerate every gradient - many times over for one drag.
+        if (fits != m_bookRows && !m_bookRedrawQueued) {
+            m_bookRedrawQueued = true;
             QTimer::singleShot(0, this, [this]() {
+                m_bookRedrawQueued = false;
                 if (!m_lastOverview.isEmpty())
                     fillBook(m_lastOverview);
             });
+        }
     }
     return QWidget::eventFilter(watched, event);
 }
@@ -207,6 +214,7 @@ void XmrTradeTab::setWallet(Wallet *wallet, quint32 account, const QString &addr
     m_lastOverview = QJsonObject();
     m_lastUpdate = QDateTime();  // nothing on screen is live until this account has answered
     m_refreshInFlight = false;
+    m_refreshAgain = false;
     if (!sameWallet)
         setBusy(false);
     m_book->clear();
@@ -739,15 +747,25 @@ void XmrTradeTab::buildUi() {
 void XmrTradeTab::refresh(bool force) {
     if (!m_wallet)
         return;
-    // Skip a scheduled poll while the previous one is still out. Over Tor a request can easily take
-    // longer than the poll interval, and without this the requests overlap: each one costs a circuit
-    // and the replies can arrive out of order, so an older book can land after a newer one and the
-    // screen goes backwards. The elapsed check means a request that never returns unwedges polling
-    // instead of stopping it for good.
-    if (!force && m_refreshInFlight && m_refreshStarted.isValid()
-        && m_refreshStarted.msecsTo(QDateTime::currentDateTime()) < kRequestTimeoutMs)
+    // Never let two requests be out at once. Over Tor a request can easily take longer than the poll
+    // interval, and overlapping requests cost a circuit each, arrive out of order (so an older book
+    // lands after a newer one and the screen goes backwards), and each one holds the wallet's core
+    // lock for its whole round-trip - which is what made placing an order or depositing stall the
+    // window. The elapsed check means a request that never returns unwedges polling rather than
+    // stopping it for good.
+    const bool stillWaiting =
+        m_refreshInFlight && m_refreshStarted.isValid()
+        && m_refreshStarted.msecsTo(QDateTime::currentDateTime()) < kRequestTimeoutMs;
+    if (stillWaiting) {
+        // `force` means "the screen is out of date NOW" - after an order, a cancel, a transfer. It
+        // used to mean "go around the guard", which is how a burst of those stacked several
+        // overviews on the network pool. Remember it instead and reissue the moment this one lands.
+        if (force)
+            m_refreshAgain = true;
         return;
+    }
 
+    m_refreshAgain = false;
     m_refreshInFlight = true;
     m_refreshStarted = QDateTime::currentDateTime();
     m_wallet->hlOverview(m_account);
@@ -877,6 +895,12 @@ void XmrTradeTab::onOverview(quint32 account, const QString &json, const QString
     if (account != m_account)
         return; // the previous account's request, still in flight when the account changed
     m_refreshInFlight = false;
+    // A forced refresh asked for while this one was out: serve it now, one request behind rather
+    // than one alongside. Queued so this reply finishes painting first.
+    if (m_refreshAgain) {
+        m_refreshAgain = false;
+        QTimer::singleShot(0, this, [this]() { refresh(true); });
+    }
     if (!error.isEmpty()) {
         updateFreshness(); // a failed poll ages the data on screen; say so rather than look live
         // Reported without wiping the book: a failed poll means these prices are stale, not gone,

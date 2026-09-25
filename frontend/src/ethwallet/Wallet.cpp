@@ -130,6 +130,9 @@ void Wallet::invalidateMetaCache() {
     QMutexLocker c(&m_metaCacheMutex);
     ++m_metaGen; // signals any in-flight getter not to cache the value it's about to read
     m_numAccountsCache = -1;
+    // Adding, importing or discovering an account can renumber which indices are imported, so the
+    // ordinals are re-read. (The tokens cache below is deliberately treated differently.)
+    m_importedOrdinalCache.clear();
     // NOTE: the TOKENS cache is intentionally NOT cleared here. Adding an HD account, importing a key,
     // and a funded scan all change the account COUNT but NOT the tracked-token list. Clearing the
     // tokens cache on those operations forced the next tokens() call to re-read under the core lock -
@@ -268,8 +271,34 @@ bool Wallet::isHardware() const {
 }
 
 int Wallet::accountImportedOrdinal(quint32 index) const {
-    QReadLocker lock(&m_coreLock);
-    return aero_wallet_account_imported_ordinal(m_core, index);
+    // Cached, because naming an account asks this and the UI names every account at once: the
+    // History Account column and both "From" selectors each walk the whole wallet, so a few hundred
+    // accounts meant a few hundred core-lock acquisitions per rebuild. Whenever a writer held the
+    // lock - a chain switch swapping the provider, a metadata save, a scan committing - every one of
+    // those waited, and the window stopped painting. An account's imported-or-derived nature never
+    // changes; only the set of accounts does, which is exactly what invalidateMetaCache() covers.
+    {
+        QMutexLocker c(&m_metaCacheMutex);
+        const auto hit = m_importedOrdinalCache.constFind(index);
+        if (hit != m_importedOrdinalCache.constEnd())
+            return hit.value();
+    }
+    const quint64 gen = [this] {
+        QMutexLocker c(&m_metaCacheMutex);
+        return m_metaGen;
+    }();
+    // Never block the caller, which is the UI thread: the funded scan holds the core lock
+    // exclusively for minutes, and this is asked once per account. Answer "seed-derived" if a writer
+    // has the wallet - the same answer for all but imported accounts - and leave it uncached so the
+    // real value is read on the next pass. A momentarily plain name beats a frozen window.
+    if (!m_coreLock.tryLockForRead())
+        return -1;
+    const int ord = aero_wallet_account_imported_ordinal(m_core, index);
+    m_coreLock.unlock();
+    QMutexLocker c(&m_metaCacheMutex);
+    if (gen == m_metaGen) // a mutation raced this read - don't cache what it may have invalidated
+        m_importedOrdinalCache.insert(index, ord);
+    return ord;
 }
 
 bool Wallet::isWatchOnly() const {
@@ -376,6 +405,11 @@ void Wallet::saveAsync() {
         return;
     }
     QtConcurrent::run(&m_netPool, [this]() {
+        // An encrypted save holds the core read lock for the whole Argon2id pass, and a pending
+        // mutation - switching chains swaps the provider, creating an address appends one - has to
+        // wait for every reader to leave. Yield first so the save queues behind it rather than in
+        // front of it; the wallet is written a moment later either way, but the window keeps moving.
+        yieldToWriter();
         bool ok = true;
         do {
             m_saveQueued.storeRelease(0); // clear before saving so edits during the write re-queue
@@ -1625,6 +1659,8 @@ void Wallet::routerSwap(quint32 fromIndex, const QString &to, const QString &val
 
 void Wallet::acrossAssets() {
     QtConcurrent::run(&m_netPool, [this]() {
+        // Holds the lock across a route-table fetch and a decimals read per asset, all over Tor.
+        yieldToWriter();
         QReadLocker lock(&m_coreLock);
         char *res = aero_wallet_across_assets(m_core);
         QString json, err;
@@ -1811,6 +1847,7 @@ void Wallet::xmrRedeemStatus(const QString &orderId, const QString &sessionId) {
 void Wallet::acrossQuote(quint32 fromIndex, const QString &symbol, quint64 destChainId,
                          const QString &amountWei) {
     QtConcurrent::run(&m_netPool, [this, fromIndex, symbol, destChainId, amountWei]() {
+        yieldToWriter(); // let a pending chain switch / account add in before holding the lock
         QReadLocker lock(&m_coreLock);
         char *res = aero_wallet_across_quote(m_core, fromIndex, symbol.toUtf8().constData(),
                                              destChainId, amountWei.toUtf8().constData());
@@ -1824,9 +1861,13 @@ void Wallet::acrossQuote(quint32 fromIndex, const QString &symbol, quint64 destC
     });
 }
 
+// The build, allowance, approve and send legs of a bridge run on the trade pool, like exchange
+// orders and deposits, not the shared network pool. The user has pressed a button and is watching
+// a spinner; on the shared pool these queued behind balance sweeps, history pages and image fetches,
+// and every second spent queued is a second in which the dialog sits half-way through a transfer.
 void Wallet::acrossBuild(quint32 fromIndex, const QString &symbol, quint64 destChainId,
                          const QString &amountWei) {
-    QtConcurrent::run(&m_netPool, [this, fromIndex, symbol, destChainId, amountWei]() {
+    QtConcurrent::run(&m_tradePool, [this, fromIndex, symbol, destChainId, amountWei]() {
         QReadLocker lock(&m_coreLock);
         char *res = aero_wallet_across_build(m_core, fromIndex, symbol.toUtf8().constData(),
                                              destChainId, amountWei.toUtf8().constData());
@@ -1841,7 +1882,7 @@ void Wallet::acrossBuild(quint32 fromIndex, const QString &symbol, quint64 destC
 }
 
 void Wallet::bridgeAllowance(quint32 fromIndex, const QString &token, const QString &spender) {
-    QtConcurrent::run(&m_netPool, [this, fromIndex, token, spender]() {
+    QtConcurrent::run(&m_tradePool, [this, fromIndex, token, spender]() {
         QReadLocker lock(&m_coreLock);
         char *res = aero_wallet_router_allowance(m_core, fromIndex, token.toUtf8().constData(),
                                                  spender.toUtf8().constData());
@@ -1858,7 +1899,7 @@ void Wallet::bridgeAllowance(quint32 fromIndex, const QString &token, const QStr
 
 void Wallet::bridgeApprove(quint32 fromIndex, const QString &token, const QString &spender,
                            const QString &amountWei) {
-    QtConcurrent::run(&m_netPool, [this, fromIndex, token, spender, amountWei]() {
+    QtConcurrent::run(&m_tradePool, [this, fromIndex, token, spender, amountWei]() {
         QReadLocker lock(&m_coreLock);
         char *res = aero_wallet_router_approve(m_core, fromIndex, token.toUtf8().constData(),
                                                spender.toUtf8().constData(),
@@ -1876,7 +1917,7 @@ void Wallet::bridgeApprove(quint32 fromIndex, const QString &token, const QStrin
 
 void Wallet::bridgeSend(quint32 fromIndex, const QString &to, const QString &valueWei,
                         const QString &dataHex) {
-    QtConcurrent::run(&m_netPool, [this, fromIndex, to, valueWei, dataHex]() {
+    QtConcurrent::run(&m_tradePool, [this, fromIndex, to, valueWei, dataHex]() {
         QReadLocker lock(&m_coreLock);
         char *res = aero_wallet_router_swap(m_core, fromIndex, to.toUtf8().constData(),
                                             valueWei.toUtf8().constData(),

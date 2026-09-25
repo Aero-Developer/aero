@@ -175,6 +175,10 @@ public slots:
     // transfer's asset+date it's used instead of the current price, so Value shows the fiat worth at
     // the time of the transaction.
     void setHistoricalUnitPrice(const QString &key, double usd);
+    // Bulk form, for restoring a session's worth of saved prices at open. The single-key setter
+    // repaints the whole Value column each time, so replaying hundreds of them one by one asked the
+    // view to redraw hundreds of times before the window had even finished opening.
+    void setHistoricalUnitPrices(const QHash<QString, double> &pricesByKey);
 
     // Unit price to value a transfer: the historical price for its date if known, else current.
     double unitPriceFor(const HistoryItem &h) const;
@@ -204,11 +208,16 @@ private:
     bool isSpamToken(const HistoryItem &h) const;
     bool isVanityLookalike(const HistoryItem &h) const; // look-alike address-poisoning
     void rebuildPoisonRefs();                           // recompute m_poisonRefSigs/Addrs
+    void ensurePoisonRefs();                            // ...but only when its inputs changed
+    // One lower-cased haystack per row, in m_allItems order, holding every field the search box can
+    // match. Typing re-filters the whole history on each keystroke, and doing eight toLower() calls
+    // and a date format per row per keystroke is what made the box stutter on a long history.
+    void ensureSearchBlobs();
+    QString searchBlob(const HistoryItem &h) const;
     bool isHiddenSpam(const HistoryItem &h) const; // rows removed when m_hideSpam is on
     // Emit incomingPayment() for any new, non-hidden incoming transfer in `items`, seeding (silently)
     // each account's backlog on its first delivery so startup/first-fetch never bursts notifications.
     void noteIncoming(const QVector<HistoryItem> &items);
-    bool matchesSearch(const HistoryItem &h) const;
     bool lessThan(const HistoryItem &a, const HistoryItem &b) const; // by current sort column
     void rebuildVisible();      // filter m_allItems -> m_filtered, sort, then re-slice the page
     void reslice();             // materialise only the current page window into m_items
@@ -230,6 +239,12 @@ private:
     QSet<QString> m_ownAddresses;   // wallet's own addresses (lower-case) - poisoning targets
     QSet<QString> m_poisonRefAddrs; // legit addresses (own + real counterparties), lower-case
     QSet<QString> m_poisonRefSigs;  // first4+last4 hex signatures of the above (look-alike index)
+    // The look-alike index depends on the rows, the wallet's own addresses and which tokens are
+    // trusted - and on nothing else. Rebuilding it on every filter pass meant a search keystroke
+    // walked the entire history twice instead of once.
+    bool m_poisonDirty = true;
+    QVector<QString> m_searchBlobs; // aligned with m_allItems; see ensureSearchBlobs
+    bool m_blobsDirty = true;
     QSet<QString> m_seenIncoming;      // dedup keys of incoming transfers already accounted for
     QSet<quint32> m_notifyInitialized; // accounts whose backlog has been seeded (so it stays silent)
     bool m_hideSpam = true;
