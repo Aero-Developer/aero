@@ -72,6 +72,45 @@ public:
     // trusted and aren't obvious homoglyph/ETH impersonators - candidates for a liquidity check.
     QStringList untrackedTokenAddresses() const;
 
+    // What the filter needs to know about a row, worked out once when the row arrives rather than on
+    // every pass. The filter runs on every search keystroke, price tick and settings change; at tens
+    // of thousands of rows, re-lowercasing each row's token and counterparty, upper-casing its symbol
+    // and re-parsing its amount every time was most of what that pass cost. None of these depend on
+    // anything but the row itself.
+    struct RowFacts {
+        QString tokenLower;        // for the trusted-token lookup
+        QString counterpartyLower; // for the look-alike index and search
+        QString hashLower;         // for search (shares the original when it is already lower-case)
+        QString sig;               // look-alike signature of the counterparty; empty if not an address
+        QString symbolUpper;       // for the price lookup
+        double amount = 0.0;       // `formatted`, parsed
+        bool evm = false;          // the counterparty is an 0x address
+        bool poisoning = false;    // zero-value poisoning shape
+        bool homoglyph = false;    // non-ASCII symbol
+    };
+
+    // A chain's cached history made ready to show, on a worker thread: the rows, their dedup index,
+    // their filter facts and the look-alike index. Adopting one is a swap. Loading the rows directly
+    // did all of that on the UI thread in the middle of a chain switch - most of what made switching
+    // on a large wallet stall.
+    struct Prepared {
+        // Two copies, each owned outright (not sharing storage with the cache it came from), with
+        // room to grow. Shared storage is copied on first write, and the first write is the next
+        // batch to arrive - which then duplicated the whole history on the UI thread.
+        QVector<HistoryItem> rows;    // becomes the fetched set
+        QVector<HistoryItem> allRows; // becomes the full row list
+        QHash<QString, int> fetchedAt;
+        QVector<RowFacts> facts;
+        QSet<QString> refAddrs, refSigs;
+        QSet<QString> ownAddresses, knownTokens; // what the look-alike index was built against
+    };
+    // Thread-safe: reads nothing of any model. Pass the model's current ownAddresses()/knownTokens().
+    static Prepared prepare(QVector<HistoryItem> rows, QSet<QString> own, QSet<QString> known);
+    QSet<QString> ownAddresses() const { return m_ownAddresses; }
+    QSet<QString> knownTokens() const { return m_knownTokens; }
+    // Show a prepared history. Rows fetched while it was being prepared are kept, merged on top.
+    void adoptPrepared(Prepared p);
+
 public slots:
     // Connect to Wallet::historyRefreshed (single-account / one-shot path).
     void onHistoryRefreshed(const QVector<HistoryItem> &items);
@@ -205,24 +244,54 @@ private:
     static bool samePair(const HistoryItem &a, const HistoryItem &b);
     void reindexFetched();                     // rebuild m_fetchedAt after a wholesale replacement
     int fetchedIndex(const QString &key) const; // position in m_fetched, or -1
+
+    static RowFacts factsFor(const HistoryItem &h);
+    // The spam-token rule against a given trusted set, so a worker preparing a history applies the
+    // same rule the model does.
+    static bool spamTokenIn(const HistoryItem &h, const RowFacts &f, const QSet<QString> &known);
+    // Fold one row into a look-alike index if it is a genuine transfer of value (shared by the
+    // model's incremental index and by prepare()).
+    static void addPoisonRef(const HistoryItem &h, const RowFacts &f, const QSet<QString> &known,
+                             QSet<QString> &addrs, QSet<QString> &sigs);
+    bool isSpamToken(const HistoryItem &h, const RowFacts &f) const;
     bool isSpamToken(const HistoryItem &h) const;
-    bool isVanityLookalike(const HistoryItem &h) const; // look-alike address-poisoning
-    void rebuildPoisonRefs();                           // recompute m_poisonRefSigs/Addrs
-    void ensurePoisonRefs();                            // ...but only when its inputs changed
-    // One lower-cased haystack per row, in m_allItems order, holding every field the search box can
-    // match. Typing re-filters the whole history on each keystroke, and doing eight toLower() calls
-    // and a date format per row per keystroke is what made the box stutter on a long history.
-    void ensureSearchBlobs();
-    QString searchBlob(const HistoryItem &h) const;
+    bool isHiddenSpam(const HistoryItem &h, const RowFacts &f) const;
     bool isHiddenSpam(const HistoryItem &h) const; // rows removed when m_hideSpam is on
+
+    // The derived data below describes a PREFIX of m_allItems. Appending rows leaves it valid and
+    // only the new tail is computed; anything that removes, replaces or reorders rows calls
+    // invalidateDerived() and it is rebuilt on next use. Keeping it a prefix is what makes a stale
+    // entry impossible: an earlier version indexed a search table that appends did not extend, and
+    // read past its end.
+    void invalidateDerived();
+    void ensureFacts();
+    void ensurePoisonRefs(); // the look-alike index over own addresses + genuine counterparties
+    // Whether a row matches the search box, against the fields as shown. Matched in place rather than
+    // through a pre-built per-row search text: building that text for every row cost the first
+    // keystroke of a search most of a tenth of a second on a long history, and held ~10 MB.
+    bool matchesSearch(const HistoryItem &h, const RowFacts &f) const;
+    // "yyyy-MM-dd" for a timestamp's UTC day, cached per day. unitPriceFor looks up historical prices
+    // by this key, and the value sort asks it twice per comparison - formatting a date for each was
+    // what made sorting by value take the better part of a second.
+    QString utcDayKey(quint64 ts) const;
+    QString dayText(qint64 daysSinceEpoch) const; // "yyyy-MM-dd", cached
+    // The Date column's "yyyy-MM-dd HH:mm" in local time, without a local-time conversion per row.
+    // The search text needs it for every row, and converting each timestamp to local time was most
+    // of what the first keystroke of a search cost.
+    QString localMinuteText(quint64 ts) const;
     // Emit incomingPayment() for any new, non-hidden incoming transfer in `items`, seeding (silently)
     // each account's backlog on its first delivery so startup/first-fetch never bursts notifications.
     void noteIncoming(const QVector<HistoryItem> &items);
-    bool lessThan(const HistoryItem &a, const HistoryItem &b) const; // by current sort column
+    bool lessThan(const HistoryItem &a, const HistoryItem &b) const; // cheap sort columns only
     void rebuildVisible();      // filter m_allItems -> m_filtered, sort, then re-slice the page
     void reslice();             // materialise only the current page window into m_items
     void sortFiltered();        // sort m_filtered by the current column/order
-    void scheduleRebuild();     // debounce rebuildVisible during incremental appendBatch bursts
+    void scheduleRebuild(int delayMs = 150); // debounce rebuildVisible
+    // While account batches stream in during a history load, a rebuild of the whole table after each
+    // one kept the UI thread about a seventh busy for the length of the load. During a burst the
+    // table refreshes at this slower cadence instead; a single arrival still shows at the normal one.
+    static constexpr int kBurstRebuildMs = 450;
+    qint64 m_lastBatchMs = 0; // when the previous batch arrived, to recognise a burst
     void rebuildAll();          // compose m_allItems = pending swaps + fetched
 
     QVector<HistoryItem> m_fetched;    // last fetched (on-chain + CoW) history
@@ -233,18 +302,34 @@ private:
     // one", which is the wrong question for a swap: the interesting fetch is the second one, the
     // one that says the order finally filled.
     QHash<QString, int> m_fetchedAt;
-    QVector<HistoryItem> m_filtered;   // full filtered + sorted result (all pages)
+    // The filtered + sorted result (all pages), as positions in m_allItems. Positions rather than
+    // copies: a filter pass used to copy every surviving row - fifteen strings each - and the sort
+    // then shuffled those whole rows around, which was the floor under every rebuild.
+    QVector<int> m_filtered;
     QVector<HistoryItem> m_items;    // the CURRENT PAGE slice of m_filtered (what the view renders)
     QSet<QString> m_knownTokens;
     QSet<QString> m_ownAddresses;   // wallet's own addresses (lower-case) - poisoning targets
     QSet<QString> m_poisonRefAddrs; // legit addresses (own + real counterparties), lower-case
     QSet<QString> m_poisonRefSigs;  // first4+last4 hex signatures of the above (look-alike index)
-    // The look-alike index depends on the rows, the wallet's own addresses and which tokens are
-    // trusted - and on nothing else. Rebuilding it on every filter pass meant a search keystroke
-    // walked the entire history twice instead of once.
-    bool m_poisonDirty = true;
-    QVector<QString> m_searchBlobs; // aligned with m_allItems; see ensureSearchBlobs
-    bool m_blobsDirty = true;
+    QVector<RowFacts> m_facts;      // per row of m_allItems (a prefix; see invalidateDerived)
+    // Per search: which accounts' names contain the text (a wallet has a few hundred accounts, and
+    // naming one means building a string, so each is decided once, not once per row).
+    mutable QHash<quint32, bool> m_searchAccountHit;
+    bool m_searchLooksLikeDate = false; // only digits and date punctuation: worth matching dates
+    // Bumped by every change that affects which rows pass the filter or their order, other than the
+    // search text. If it has not moved since the last pass and the user has only typed more of the
+    // same search, the next pass narrows the previous result instead of re-filtering everything.
+    quint64 m_filterInputs = 0;
+    quint64 m_filteredInputs = ~quint64(0); // m_filterInputs as of the last full pass
+    QString m_filteredSearch;               // the search that pass was for
+    // How many leading rows of m_allItems the look-alike index includes; -1 = rebuild from scratch.
+    // The index depends on the rows, the wallet's own addresses and which tokens are trusted, so a
+    // change to either set resets it too.
+    int m_poisonRows = -1;
+    mutable QHash<qint64, QString> m_dayKeys; // day number -> "yyyy-MM-dd"
+    // UTC day number -> the local UTC offset in force all that day, or INT_MIN on a day the clocks
+    // change (those rows are converted exactly).
+    mutable QHash<qint64, int> m_localOffsets;
     QSet<QString> m_seenIncoming;      // dedup keys of incoming transfers already accounted for
     QSet<quint32> m_notifyInitialized; // accounts whose backlog has been seeded (so it stays silent)
     bool m_hideSpam = true;

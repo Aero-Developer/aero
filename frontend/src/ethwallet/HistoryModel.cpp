@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "HistoryModel.h"
+#include "StallWatch.h"
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
+#include <numeric>
 
 #include <QBrush>
 #include <QColor>
@@ -33,21 +36,41 @@ static bool hasHomoglyphSymbol(const QString &symbol) {
 // (address-poisoning) that appear in history as though *you* sent funds, so we cannot trust the
 // direction OR the symbol - we trust only the official tracked contract-address allow-list. This
 // covers both unsolicited incoming airdrops and spoofed "outgoing" transactions you never signed.
-bool HistoryModel::isSpamToken(const HistoryItem &h) const {
+bool HistoryModel::spamTokenIn(const HistoryItem &h, const RowFacts &f,
+                               const QSet<QString> &known) {
     if (h.token.isEmpty())
         return false; // native transfers cannot be spoofed
-    if (hasHomoglyphSymbol(h.symbol))
+    if (f.homoglyph)
         return true; // non-ASCII symbol => homoglyph impersonation
     // The allow-list is the whole point of this function, so consult it before any rule about what
     // a symbol is allowed to be. It used to come last, which meant the "an ERC-20 calling itself
     // ETH is always fake" rule fired first - true on Ethereum, but on BNB Smart Chain the real,
     // curated, Binance-pegged ETH is an ERC-20 called ETH, so every genuine transfer of it was
     // hidden and no amount of tracking the token could bring it back.
-    if (m_knownTokens.contains(h.token.toLower()))
-        return false;
-    if (h.symbol.compare(QLatin1String("ETH"), Qt::CaseInsensitive) == 0)
-        return true; // an untracked ERC-20 calling itself "ETH" is impersonating the native coin
-    return true;
+    //
+    // Anything not on the list is spam, including an untracked ERC-20 calling itself "ETH".
+    return !known.contains(f.tokenLower);
+}
+
+bool HistoryModel::isSpamToken(const HistoryItem &h, const RowFacts &f) const {
+    return spamTokenIn(h, f, m_knownTokens);
+}
+
+void HistoryModel::addPoisonRef(const HistoryItem &h, const RowFacts &f, const QSet<QString> &known,
+                                QSet<QString> &addrs, QSet<QString> &sigs) {
+    if (h.kind == QLatin1String("swap") || !f.evm)
+        return;
+    const bool nonzero = !(h.amount.isEmpty() || h.amount == QLatin1String("0"));
+    // Only trust a counterparty as "real" if it moved value and isn't itself a spam token - so a
+    // poisoning entry can never seed its own look-alike reference.
+    if (nonzero && !spamTokenIn(h, f, known)) {
+        addrs.insert(f.counterpartyLower);
+        sigs.insert(f.sig);
+    }
+}
+
+bool HistoryModel::isSpamToken(const HistoryItem &h) const {
+    return isSpamToken(h, factsFor(h));
 }
 
 // Cap a full-precision decimal string to a readable number of places (tokens routinely report 18
@@ -105,73 +128,153 @@ static QString addrSignature(const QString &addrLower) {
     return addrLower.mid(2, 4) + addrLower.right(4);
 }
 
-// Rebuild the reference index of legitimate addresses (the wallet's own addresses + counterparties of
-// genuine, non-spam transfers of value). A transfer whose counterparty matches one of these
-// signatures but ISN'T one of the real addresses is a vanity look-alike (poisoning). Recomputed per
-// rebuild; O(N) over history.
+HistoryModel::RowFacts HistoryModel::factsFor(const HistoryItem &h) {
+    RowFacts f;
+    f.tokenLower = h.token.toLower();
+    f.counterpartyLower = h.counterparty.toLower();
+    f.hashLower = h.txHash.toLower();
+    f.evm = isEvmAddress(f.counterpartyLower);
+    if (f.evm)
+        f.sig = addrSignature(f.counterpartyLower);
+    f.symbolUpper = h.symbol.toUpper();
+    f.amount = h.formatted.toDouble();
+    f.poisoning = isPoisoning(h);
+    f.homoglyph = hasHomoglyphSymbol(h.symbol);
+    return f;
+}
+
+void HistoryModel::invalidateDerived() {
+    m_facts.clear();
+    m_poisonRows = -1;
+    ++m_filterInputs;
+}
+
+void HistoryModel::ensureFacts() {
+    const int n = m_allItems.size();
+    if (m_facts.size() > n)
+        m_facts.clear(); // cannot happen through the mutators; never index past what these describe
+    // Grown with headroom. Reserving exactly `n` reallocated - and moved every existing entry - on
+    // each batch that arrived, which at tens of thousands of rows was most of the cost of adding one.
+    if (m_facts.capacity() < n)
+        m_facts.reserve(n + n / 2);
+    for (int i = m_facts.size(); i < n; ++i)
+        m_facts.append(factsFor(m_allItems.at(i)));
+}
+
+// The reference index of legitimate addresses: the wallet's own, plus the counterparty of every
+// genuine, non-spam transfer of value. A transfer whose counterparty matches one of these signatures
+// but ISN'T one of the real addresses is a vanity look-alike (poisoning). Rows are folded in as they
+// arrive; a change to the rows' order, the own-address set or the trusted tokens starts it over.
 void HistoryModel::ensurePoisonRefs() {
-    if (!m_poisonDirty)
-        return;
-    m_poisonDirty = false;
-    rebuildPoisonRefs();
-}
-
-void HistoryModel::rebuildPoisonRefs() {
-    m_poisonRefAddrs.clear();
-    m_poisonRefSigs.clear();
-    const auto addRef = [this](const QString &addrLower) {
-        if (!isEvmAddress(addrLower))
-            return;
-        m_poisonRefAddrs.insert(addrLower);
-        const QString sig = addrSignature(addrLower);
-        if (!sig.isEmpty())
-            m_poisonRefSigs.insert(sig);
-    };
-    for (const QString &a : m_ownAddresses)
-        addRef(a.toLower());
-    for (const HistoryItem &h : m_allItems) {
-        if (h.kind == QLatin1String("swap"))
-            continue;
-        const bool nonzero = !(h.amount.isEmpty() || h.amount == QLatin1String("0"));
-        // Only trust a counterparty as "real" if it moved value and isn't itself a spam token - so a
-        // poisoning entry can never seed its own look-alike reference.
-        if (nonzero && !isSpamToken(h))
-            addRef(h.counterparty.toLower());
+    ensureFacts();
+    const int n = m_allItems.size();
+    if (m_poisonRows < 0 || m_poisonRows > n) {
+        m_poisonRefAddrs.clear();
+        m_poisonRefSigs.clear();
+        for (const QString &a : m_ownAddresses) {
+            const QString lower = a.toLower();
+            if (!isEvmAddress(lower))
+                continue;
+            m_poisonRefAddrs.insert(lower);
+            m_poisonRefSigs.insert(addrSignature(lower));
+        }
+        m_poisonRows = 0;
     }
+    for (int i = m_poisonRows; i < n; ++i)
+        addPoisonRef(m_allItems.at(i), m_facts.at(i), m_knownTokens, m_poisonRefAddrs,
+                     m_poisonRefSigs);
+    m_poisonRows = n;
 }
 
-// True if this transfer's counterparty is a vanity look-alike of a known-legit address: same
-// first4/last4 hex as a real address, but not that address. This is the defining signature of
-// address-poisoning and catches spoofs that carry a nonzero/dust value (which the zero-value and
-// unknown-token filters miss).
-bool HistoryModel::isVanityLookalike(const HistoryItem &h) const {
-    const QString a = h.counterparty.toLower();
-    if (!isEvmAddress(a) || m_poisonRefAddrs.contains(a))
-        return false; // not an address, or an exact legit address - not a look-alike
-    return m_poisonRefSigs.contains(addrSignature(a));
+HistoryModel::Prepared HistoryModel::prepare(QVector<HistoryItem> rows, QSet<QString> own,
+                                             QSet<QString> known) {
+    Prepared p;
+    p.fetchedAt.reserve(rows.size());
+    for (int i = 0; i < rows.size(); ++i)
+        p.fetchedAt.insert(dedupKey(rows.at(i)), i);
+    // Room to grow, as for the rows below: the first batch after the swap must not reallocate.
+    p.facts.reserve(rows.size() + 2048);
+    for (const HistoryItem &h : rows)
+        p.facts.append(factsFor(h));
+    for (const QString &a : own) {
+        const QString lower = a.toLower();
+        if (!isEvmAddress(lower))
+            continue;
+        p.refAddrs.insert(lower);
+        p.refSigs.insert(addrSignature(lower));
+    }
+    for (int i = 0; i < rows.size(); ++i)
+        addPoisonRef(rows.at(i), p.facts.at(i), known, p.refAddrs, p.refSigs);
+    const auto owned = [&rows]() {
+        QVector<HistoryItem> copy;
+        copy.reserve(rows.size() + 2048); // a few accounts' worth of new rows before any regrowth
+        for (const HistoryItem &h : rows)
+            copy.append(h);
+        return copy;
+    };
+    p.rows = owned();
+    p.allRows = owned();
+    p.ownAddresses = std::move(own);
+    p.knownTokens = std::move(known);
+    return p;
 }
 
-bool HistoryModel::isHiddenSpam(const HistoryItem &h) const {
+void HistoryModel::adoptPrepared(Prepared p) {
+    StallWatch::Scope stallScope("HistoryModel::adoptPrepared");
+    // Anything fetched while this was being prepared is newer than the cache; re-applied on top.
+    const QVector<HistoryItem> arrived = m_fetched;
+    m_fetched = std::move(p.rows);
+    m_fetchedAt = std::move(p.fetchedAt);
+    if (!m_localSwaps.isEmpty() || !m_localSends.isEmpty()) {
+        // An optimistic row appeared in the moment this took; compose and derive the ordinary way,
+        // which also reconciles it against what was just adopted.
+        rebuildAll();
+    } else {
+        m_allItems = std::move(p.allRows);
+        m_facts = std::move(p.facts);
+        ++m_filterInputs;
+        // The index is only valid for the sets it was built against, which may have moved since.
+        if (p.ownAddresses == m_ownAddresses && p.knownTokens == m_knownTokens) {
+            m_poisonRefAddrs = std::move(p.refAddrs);
+            m_poisonRefSigs = std::move(p.refSigs);
+            m_poisonRows = m_allItems.size();
+        } else {
+            m_poisonRows = -1;
+        }
+        rebuildVisible();
+    }
+    if (!arrived.isEmpty())
+        appendBatch(arrived);
+}
+
+bool HistoryModel::isHiddenSpam(const HistoryItem &h, const RowFacts &f) const {
     if (h.kind == QLatin1String("swap"))
         return false; // swaps are user-initiated, never spam
     // Never hide the user's own just-broadcast (pending) send - it must appear in history instantly.
     if (h.status == QLatin1String("pending") && h.direction == QLatin1String("out"))
         return false;
-    if (isPoisoning(h) || isSpamToken(h))
+    if (f.poisoning || isSpamToken(h, f))
         return true;
-    // Look-alike poisoning is an inbound attack (a spoof address sent to you). Only gate incoming
-    // transfers so a genuine outgoing send to a coincidentally-similar address is never hidden.
-    if (h.direction == QLatin1String("in") && isVanityLookalike(h))
-        return true; // spoof address mimicking a real one (poisoning), any value
+    // Look-alike poisoning is an inbound attack (a spoof address sent to you): same first4/last4 hex
+    // as a real address, but not that address. Only incoming transfers are gated, so a genuine
+    // outgoing send to a coincidentally similar address is never hidden. This catches spoofs that
+    // carry a nonzero/dust value, which the zero-value and unknown-token rules miss.
+    if (h.direction == QLatin1String("in") && f.evm &&
+        !m_poisonRefAddrs.contains(f.counterpartyLower) && m_poisonRefSigs.contains(f.sig))
+        return true;
     // Dust filter: hide incoming transfers worth less than the configured USD threshold. Only
     // applied when we actually have a positive price for the asset, so legit transfers aren't
     // hidden just because prices haven't loaded yet.
     if (m_dustUsd > 0.0 && h.direction == QLatin1String("in")) {
-        const double price = m_prices.value(h.symbol.toUpper(), -1.0);
-        if (price > 0.0 && h.formatted.toDouble() * price < m_dustUsd)
+        const double price = m_prices.value(f.symbolUpper, -1.0);
+        if (price > 0.0 && f.amount * price < m_dustUsd)
             return true;
     }
     return false;
+}
+
+bool HistoryModel::isHiddenSpam(const HistoryItem &h) const {
+    return isHiddenSpam(h, factsFor(h));
 }
 
 bool HistoryModel::isSuspicious(int row) const {
@@ -181,81 +284,89 @@ bool HistoryModel::isSuspicious(int row) const {
     return m_items.at(row).failed;
 }
 
-// Everything the search box can match on one row, lower-cased and joined by a separator that cannot
-// occur in any of the fields - so a match can never straddle two of them. Built once per row when
-// the rows (or the account names) change, rather than per keystroke.
-QString HistoryModel::searchBlob(const HistoryItem &h) const {
+// True if this row matches the search box on any visible column. m_search is pre-lowercased, and so
+// is the counterparty in the row's facts; everything else is compared case-insensitively in place,
+// so no per-row string is built.
+bool HistoryModel::matchesSearch(const HistoryItem &h, const RowFacts &f) const {
+    if (f.counterpartyLower.contains(m_search) || f.hashLower.contains(m_search))
+        return true;
+    if (h.symbol.contains(m_search, Qt::CaseInsensitive) ||
+        h.buySymbol.contains(m_search, Qt::CaseInsensitive))
+        return true;
+    if (h.formatted.contains(m_search) || h.buyFormatted.contains(m_search))
+        return true;
     // Direction words as shown in the table.
-    const QLatin1String dir = (h.kind == QLatin1String("swap"))
-                                  ? QLatin1String("swap")
-                                  : (h.failed ? QLatin1String("failed")
-                                              : (h.direction == QLatin1String("in")
-                                                     ? QLatin1String("received")
-                                                     : QLatin1String("sent")));
-    QString blob;
-    blob.reserve(160);
-    const QChar sep(u'\n');
+    const QLatin1StringView dir = (h.kind == QLatin1String("swap"))
+                                      ? QLatin1StringView("swap")
+                                      : (h.failed ? QLatin1StringView("failed")
+                                                  : (h.direction == QLatin1String("in")
+                                                         ? QLatin1StringView("received")
+                                                         : QLatin1StringView("sent")));
+    if (dir.contains(m_search))
+        return true;
     // So typing an account's name narrows history to that account without touching the filter combo.
-    blob += h.counterparty; blob += sep;
-    blob += h.txHash;       blob += sep;
-    blob += accountName(h); blob += sep;
-    blob += h.symbol;       blob += sep;
-    blob += h.buySymbol;    blob += sep;
-    blob += h.formatted;    blob += sep;
-    blob += h.buyFormatted; blob += sep;
-    blob += dir;
-    if (h.timestamp) {
-        blob += sep;
-        blob += QDateTime::fromSecsSinceEpoch(static_cast<qint64>(h.timestamp))
-                    .toString(QStringLiteral("yyyy-MM-dd HH:mm"));
+    auto hit = m_searchAccountHit.constFind(h.account);
+    if (hit == m_searchAccountHit.constEnd())
+        hit = m_searchAccountHit.insert(h.account,
+                                        accountName(h).contains(m_search, Qt::CaseInsensitive));
+    if (hit.value())
+        return true;
+    // A date can only match a query made of digits and date punctuation, so the date text - which
+    // takes building - is built only for queries like that.
+    return m_searchLooksLikeDate && h.timestamp && localMinuteText(h.timestamp).contains(m_search);
+}
+
+QString HistoryModel::dayText(qint64 daysSinceEpoch) const {
+    const auto hit = m_dayKeys.constFind(daysSinceEpoch);
+    if (hit != m_dayKeys.constEnd())
+        return hit.value();
+    const QString text = QDate(1970, 1, 1).addDays(daysSinceEpoch).toString(Qt::ISODate);
+    m_dayKeys.insert(daysSinceEpoch, text);
+    return text;
+}
+
+QString HistoryModel::utcDayKey(quint64 ts) const {
+    // Identical to formatting the UTC QDateTime as yyyy-MM-dd, without the per-call conversion.
+    return dayText(static_cast<qint64>(ts / 86400));
+}
+
+QString HistoryModel::localMinuteText(quint64 ts) const {
+    const qint64 utc = static_cast<qint64>(ts);
+    const qint64 utcDay = utc / 86400;
+    auto offset = m_localOffsets.constFind(utcDay);
+    if (offset == m_localOffsets.constEnd()) {
+        // If the offset is the same at both ends of the day, no clock change falls inside it.
+        const int atStart = QDateTime::fromSecsSinceEpoch(utcDay * 86400).offsetFromUtc();
+        const int atEnd = QDateTime::fromSecsSinceEpoch(utcDay * 86400 + 86399).offsetFromUtc();
+        offset = m_localOffsets.insert(utcDay, atStart == atEnd ? atStart : INT_MIN);
     }
-    return blob.toLower();
+    if (offset.value() == INT_MIN)
+        return QDateTime::fromSecsSinceEpoch(utc).toString(QStringLiteral("yyyy-MM-dd HH:mm"));
+    const qint64 local = utc + offset.value();
+    const qint64 localDay = local >= 0 ? local / 86400 : (local - 86399) / 86400;
+    const int secs = static_cast<int>(local - localDay * 86400);
+    const int hh = secs / 3600, mm = (secs % 3600) / 60;
+    QString out = dayText(localDay);
+    out.reserve(16);
+    out += QLatin1Char(' ');
+    out += QLatin1Char(char('0' + hh / 10));
+    out += QLatin1Char(char('0' + hh % 10));
+    out += QLatin1Char(':');
+    out += QLatin1Char(char('0' + mm / 10));
+    out += QLatin1Char(char('0' + mm % 10));
+    return out;
 }
 
-void HistoryModel::ensureSearchBlobs() {
-    if (!m_blobsDirty)
-        return;
-    m_blobsDirty = false;
-    m_searchBlobs.resize(m_allItems.size());
-    for (int i = 0; i < m_allItems.size(); ++i)
-        m_searchBlobs[i] = searchBlob(m_allItems.at(i));
-}
-
-// Order comparison for the current sort column (ascending sense; sortFiltered flips for descending).
+// Order comparison for the sort columns whose keys are plain fields (ascending sense; sortFiltered
+// flips for descending). Value, Amount and Account are keyed once per row in sortFiltered instead.
 bool HistoryModel::lessThan(const HistoryItem &a, const HistoryItem &b) const {
     switch (m_sortColumn) {
     case Column_Date:
         return (a.timestamp ? a.timestamp : a.block) < (b.timestamp ? b.timestamp : b.block);
-    case Column_Value: {
-        // Strictly by USD worth; an asset with no known price ranks as 0 so a huge-count, low-value
-        // token (e.g. an unpriced meme coin) can never sit above a genuinely high-value transfer.
-        const double ap = unitPriceFor(a), bp = unitPriceFor(b);
-        const double av = ap > 0.0 ? a.formatted.toDouble() * ap : 0.0;
-        const double bv = bp > 0.0 ? b.formatted.toDouble() * bp : 0.0;
-        return av < bv;
-    }
-    case Column_Amount: {
-        // Rank by USD worth too (so $1.5M outranks $400 of a meme coin). Unpriced assets have no
-        // comparable value and rank below all priced ones, ordered among themselves by quantity.
-        const double ap = unitPriceFor(a), bp = unitPriceFor(b);
-        const double av = ap > 0.0 ? a.formatted.toDouble() * ap : 0.0;
-        const double bv = bp > 0.0 ? b.formatted.toDouble() * bp : 0.0;
-        if (av != bv)
-            return av < bv;
-        return a.formatted.toDouble() < b.formatted.toDouble();
-    }
     case Column_Direction: {
         const int ak = a.failed ? 2 : (a.direction == QLatin1String("in") ? 0 : 1);
         const int bk = b.failed ? 2 : (b.direction == QLatin1String("in") ? 0 : 1);
         return ak < bk;
-    }
-    case Column_Account: {
-        // By the name on screen, not the account index: a user sorting this column is looking for
-        // all the rows that say "Savings" next to each other.
-        const QString an = accountName(a), bn = accountName(b);
-        if (an != bn)
-            return an.localeAwareCompare(bn) < 0;
-        return a.account < b.account;
     }
     case Column_Counterparty:
         return a.counterparty < b.counterparty;
@@ -266,17 +377,115 @@ bool HistoryModel::lessThan(const HistoryItem &a, const HistoryItem &b) const {
     }
 }
 
+// Sort m_filtered by the current column. The columns whose key takes work to produce - a USD value
+// needs a price lookup, an account needs its name and a locale-aware comparison - are keyed ONCE per
+// row and the keys sorted, rather than re-deriving both sides of every comparison: a stable sort of
+// thirty thousand rows makes over four hundred thousand comparisons.
 void HistoryModel::sortFiltered() {
-    std::stable_sort(m_filtered.begin(), m_filtered.end(),
-                     [this](const HistoryItem &a, const HistoryItem &b) {
-                         return m_sortOrder == Qt::AscendingOrder ? lessThan(a, b) : lessThan(b, a);
-                     });
+    const bool asc = m_sortOrder == Qt::AscendingOrder;
+    const int n = m_filtered.size();
+    const auto row = [this](int k) -> const HistoryItem & { return m_allItems.at(m_filtered.at(k)); };
+    // Sort by keys computed once per row: `less` compares positions k in m_filtered through
+    // arrays filled before the sort, so no comparison touches a row itself.
+    const auto sortBy = [&](const auto &less) {
+        QVector<int> order(n);
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(),
+                         [&](int a, int b) { return asc ? less(a, b) : less(b, a); });
+        QVector<int> sorted(n);
+        for (int k = 0; k < n; ++k)
+            sorted[k] = m_filtered.at(order.at(k));
+        m_filtered.swap(sorted);
+    };
+
+    switch (m_sortColumn) {
+    case Column_Date: {
+        // The default order, so this runs on every rebuild.
+        QVector<quint64> when(n);
+        for (int k = 0; k < n; ++k) {
+            const HistoryItem &h = row(k);
+            when[k] = h.timestamp ? h.timestamp : h.block;
+        }
+        sortBy([&](int a, int b) { return when[a] < when[b]; });
+        return;
+    }
+    case Column_Value:
+    case Column_Amount: {
+        // Both rank by USD worth, so $1.5M of anything outranks $400 of a meme coin, and an asset
+        // with no known price ranks as 0 - a huge-count, low-value token can never sit above a
+        // genuinely valuable transfer. Amount then orders the unpriced ones by quantity.
+        QVector<double> usd(n), qty(n);
+        for (int k = 0; k < n; ++k) {
+            const HistoryItem &h = row(k);
+            qty[k] = h.formatted.toDouble();
+            const double price = unitPriceFor(h);
+            usd[k] = price > 0.0 ? qty[k] * price : 0.0;
+        }
+        const bool byQuantityToo = m_sortColumn == Column_Amount;
+        sortBy([&](int a, int b) {
+            if (usd[a] != usd[b])
+                return usd[a] < usd[b];
+            return byQuantityToo && qty[a] < qty[b];
+        });
+        return;
+    }
+    case Column_Account: {
+        // By the name on screen, not the account index: a user sorting this column is looking for
+        // all the rows that say "Savings" next to each other. A wallet has at most a few hundred
+        // distinct names, so they are ranked once and the rows sorted by rank.
+        QVector<QString> names(n);
+        QSet<QString> distinctSet;
+        for (int k = 0; k < n; ++k) {
+            names[k] = accountName(row(k));
+            distinctSet.insert(names[k]);
+        }
+        QStringList distinct(distinctSet.begin(), distinctSet.end());
+        std::sort(distinct.begin(), distinct.end(),
+                  [](const QString &x, const QString &y) { return x.localeAwareCompare(y) < 0; });
+        QHash<QString, int> rankOf;
+        for (int r = 0; r < distinct.size(); ++r)
+            rankOf.insert(distinct.at(r), r);
+        QVector<int> rank(n);
+        QVector<quint32> account(n);
+        for (int k = 0; k < n; ++k) {
+            rank[k] = rankOf.value(names.at(k));
+            account[k] = row(k).account;
+        }
+        sortBy([&](int a, int b) {
+            if (rank[a] != rank[b])
+                return rank[a] < rank[b];
+            return account[a] < account[b];
+        });
+        return;
+    }
+    default:
+        std::stable_sort(m_filtered.begin(), m_filtered.end(), [&](int a, int b) {
+            const HistoryItem &x = m_allItems.at(a), &y = m_allItems.at(b);
+            return asc ? lessThan(x, y) : lessThan(y, x);
+        });
+    }
 }
 
 // Recompute the full filtered + sorted result set, then show only the current page.
 void HistoryModel::rebuildVisible() {
-    ensurePoisonRefs();  // the legit-address index, refreshed only if its inputs moved
-    ensureSearchBlobs(); // and the per-row search haystacks, likewise
+    StallWatch::Scope stallScope("HistoryModel::rebuildVisible");
+    // Typing more of the same search, with nothing else changed: every row that can match the longer
+    // text matched the shorter one, and those rows are already filtered and in order.
+    if (m_filteredInputs == m_filterInputs && !m_filteredSearch.isEmpty() &&
+        m_search.size() > m_filteredSearch.size() && m_search.startsWith(m_filteredSearch) &&
+        m_facts.size() == m_allItems.size()) {
+        QVector<int> kept;
+        kept.reserve(m_filtered.size());
+        for (int i : m_filtered)
+            if (i >= 0 && i < m_allItems.size() && matchesSearch(m_allItems.at(i), m_facts.at(i)))
+                kept.append(i);
+        m_filtered.swap(kept);
+        m_filteredSearch = m_search;
+        reslice();
+        return;
+    }
+    ensureFacts();
+    ensurePoisonRefs(); // the legit-address index, extended with any rows added since last time
     // Transactions that are the on-chain half of a swap we placed ourselves. The explorer reports
     // the leg that left the wallet as an ordinary transfer, and only later - once it has indexed the
     // internal transfer coming back - folds both legs into one swap. In between, showing our swap
@@ -290,16 +499,18 @@ void HistoryModel::rebuildVisible() {
     m_filtered.reserve(m_allItems.size());
     for (int i = 0; i < m_allItems.size(); ++i) {
         const HistoryItem &h = m_allItems.at(i);
-        if (h.kind != QLatin1String("swap") && !h.txHash.isEmpty() &&
-            swapLegs.contains(h.txHash.toLower()))
+        if (!swapLegs.isEmpty() && h.kind != QLatin1String("swap") && !h.txHash.isEmpty() &&
+            swapLegs.contains(m_facts.at(i).hashLower))
             continue;
-        if (m_hideSpam && isHiddenSpam(h))
+        if (m_hideSpam && isHiddenSpam(h, m_facts.at(i)))
             continue;
-        if (!m_search.isEmpty() && !m_searchBlobs.at(i).contains(m_search))
+        if (!m_search.isEmpty() && !matchesSearch(h, m_facts.at(i)))
             continue;
-        m_filtered.append(h);
+        m_filtered.append(i);
     }
     sortFiltered();
+    m_filteredInputs = m_filterInputs;
+    m_filteredSearch = m_search;
     reslice();
 }
 
@@ -314,8 +525,13 @@ void HistoryModel::reslice() {
     const int start = m_page * m_pageSize;
     const int end = qMin(total, start + m_pageSize);
     m_items.reserve(qMax(0, end - start));
-    for (int i = start; i < end; ++i)
-        m_items.append(m_filtered.at(i));
+    // Positions are checked because rows can be removed between a rebuild and a page change; a
+    // stale position must drop out of the page rather than read past the end of the rows.
+    for (int i = start; i < end; ++i) {
+        const int at = m_filtered.at(i);
+        if (at >= 0 && at < m_allItems.size())
+            m_items.append(m_allItems.at(at));
+    }
     endResetModel();
     emit pageChanged(m_page, pages, total);
 }
@@ -333,6 +549,16 @@ void HistoryModel::setSearchText(const QString &text) {
         return;
     m_search = t;
     m_page = 0; // a new filter always starts at the first page
+    m_searchAccountHit.clear();
+    // Only digits and date punctuation. Deliberately without requiring a digit: every prefix of a
+    // date-like query must itself be date-like, or typing "-" then "-1" would stop matching dates
+    // part-way through and the narrowing in rebuildVisible would drop rows it should keep.
+    m_searchLooksLikeDate = !t.isEmpty();
+    for (const QChar c : t)
+        if (!c.isDigit() && c != u'-' && c != u':' && c != u' ') {
+            m_searchLooksLikeDate = false;
+            break;
+        }
     // Debounced: a filter pass walks the whole history, and running one per keystroke is what made
     // typing in the search box stutter on a wallet with a lot of it. The coalesce window still
     // refreshes while the user keeps typing, so results appear to keep up.
@@ -347,28 +573,30 @@ void HistoryModel::sort(int column, Qt::SortOrder order) {
     m_sortColumn = column;
     m_sortOrder = order;
     m_page = 0;
+    ++m_filterInputs;
     rebuildVisible();
 }
 
 // Coalesce a burst of appendBatch() calls (one per account during an all-account load) into a single
 // filter+sort+re-slice, so we don't re-sort a growing list on every one of hundreds of batches.
-void HistoryModel::scheduleRebuild() {
+void HistoryModel::scheduleRebuild(int delayMs) {
     if (!m_coalesceTimer) {
         m_coalesceTimer = new QTimer(this);
         m_coalesceTimer->setSingleShot(true);
-        m_coalesceTimer->setInterval(150);
         connect(m_coalesceTimer, &QTimer::timeout, this, [this]() { rebuildVisible(); });
     }
-    // Start only if not already pending, so a continuous burst still refreshes ~every 150ms (page 0
-    // fills in visibly) instead of deferring the rebuild until the burst stops.
-    if (!m_coalesceTimer->isActive())
-        m_coalesceTimer->start();
+    // Start only if not already pending, so a continuous burst still refreshes periodically (page 0
+    // fills in visibly) instead of deferring the rebuild until the burst stops. A shorter request
+    // pulls a pending longer one forward: a keystroke must not wait out a history load's cadence.
+    if (!m_coalesceTimer->isActive() || m_coalesceTimer->remainingTime() > delayMs)
+        m_coalesceTimer->start(delayMs);
 }
 
 void HistoryModel::setHideSpam(bool hide) {
     if (m_hideSpam == hide)
         return;
     m_hideSpam = hide;
+    ++m_filterInputs;
     rebuildVisible();
 }
 
@@ -376,11 +604,13 @@ void HistoryModel::setDustThreshold(double usd) {
     if (m_dustUsd == usd)
         return;
     m_dustUsd = usd;
+    ++m_filterInputs;
     rebuildVisible();
 }
 
 void HistoryModel::setPrices(const QHash<QString, double> &pricesBySymbol) {
     m_prices = pricesBySymbol;
+    ++m_filterInputs; // the dust filter and the value sort both read prices
     if (!m_items.isEmpty()) // refresh the Value column
         emit dataChanged(index(0, Column_Value), index(m_items.size() - 1, Column_Value));
     // Prices also decide what the dust filter hides, so the rows have to be re-tested. Coalesced:
@@ -401,6 +631,7 @@ void HistoryModel::setHistoricalUnitPrice(const QString &key, double usd) {
     if (usd <= 0.0)
         return;
     m_histUnitPrice.insert(key, usd);
+    ++m_filterInputs; // the value sort reads it
     if (!m_items.isEmpty())
         emit dataChanged(index(0, Column_Value), index(m_items.size() - 1, Column_Value));
 }
@@ -413,20 +644,21 @@ void HistoryModel::setHistoricalUnitPrices(const QHash<QString, double> &pricesB
         m_histUnitPrice.insert(it.key(), it.value());
         any = true;
     }
+    if (any)
+        ++m_filterInputs;
     if (any && !m_items.isEmpty())
         emit dataChanged(index(0, Column_Value), index(m_items.size() - 1, Column_Value));
 }
 
 double HistoryModel::unitPriceFor(const HistoryItem &h) const {
-    if (h.timestamp > 0) {
-        const QString date =
-            QDateTime::fromSecsSinceEpoch(static_cast<qint64>(h.timestamp), Qt::UTC)
-                .toString(QStringLiteral("yyyy-MM-dd"));
-        const double hist = m_histUnitPrice.value(h.symbol.toUpper() + QLatin1Char('|') + date, 0.0);
+    const QString sym = h.symbol.toUpper();
+    if (h.timestamp > 0 && !m_histUnitPrice.isEmpty()) {
+        const double hist =
+            m_histUnitPrice.value(sym + QLatin1Char('|') + utcDayKey(h.timestamp), 0.0);
         if (hist > 0.0)
             return hist; // fiat value at the time of the transaction
     }
-    return m_prices.value(h.symbol.toUpper(), 0.0); // fall back to the current price
+    return m_prices.value(sym, 0.0); // fall back to the current price
 }
 
 QStringList HistoryModel::untrackedTokenAddresses() const {
@@ -457,8 +689,23 @@ void HistoryModel::setKnownTokens(const QSet<QString> &tokens) {
     // long history is a full pass over tens of thousands of rows - was work for no change on screen.
     if (lower == m_knownTokens)
         return;
+    // Which tokens are trusted decides which counterparties seed the look-alike index. The usual
+    // change is one token becoming trusted, which can only ADD genuine counterparties - so fold in
+    // just the rows of the newly trusted tokens rather than rebuild the index from every row.
+    // Anything else (a token no longer trusted) starts the index over.
+    const bool onlyAdded = m_poisonRows >= 0 && m_poisonRows == m_allItems.size() &&
+                           m_facts.size() == m_allItems.size() && lower.contains(m_knownTokens);
+    if (onlyAdded) {
+        const QSet<QString> added = lower - m_knownTokens;
+        for (int i = 0; i < m_allItems.size(); ++i)
+            if (added.contains(m_facts.at(i).tokenLower))
+                addPoisonRef(m_allItems.at(i), m_facts.at(i), lower, m_poisonRefAddrs,
+                             m_poisonRefSigs);
+    } else {
+        m_poisonRows = -1;
+    }
     m_knownTokens = std::move(lower);
-    m_poisonDirty = true; // which tokens are trusted decides which counterparties seed the index
+    ++m_filterInputs;
     // Spam classification depends on the tracked-token set, so re-filter the visible rows. Coalesced
     // because verdicts arrive in bursts (up to fifteen liquidity lookups land per refresh).
     scheduleRebuild();
@@ -471,8 +718,20 @@ void HistoryModel::setOwnAddresses(const QSet<QString> &addrs) {
         lower.insert(a.toLower());
     if (lower == m_ownAddresses)
         return; // unchanged - avoid a needless re-filter
+    // A new account only adds an address to the look-alike index; add it rather than rebuilding the
+    // index from every row. A removed address starts it over.
+    if (m_poisonRows >= 0 && lower.contains(m_ownAddresses)) {
+        for (const QString &a : lower - m_ownAddresses) {
+            if (!isEvmAddress(a))
+                continue;
+            m_poisonRefAddrs.insert(a);
+            m_poisonRefSigs.insert(addrSignature(a));
+        }
+    } else {
+        m_poisonRows = -1;
+    }
     m_ownAddresses = lower;
-    m_poisonDirty = true;
+    ++m_filterInputs;
     rebuildVisible(); // look-alike detection references the wallet's own addresses
 }
 
@@ -622,10 +881,18 @@ void HistoryModel::setAccountNames(const QHash<quint32, QString> &names) {
     if (m_accountNames == names)
         return;
     m_accountNames = names;
-    // Renaming an account changes what the column says and what a search for that name matches, so
-    // the filter has to run again rather than just repainting - and the per-row search text with it.
-    m_blobsDirty = true;
-    rebuildVisible();
+    m_searchAccountHit.clear(); // decided against the old names
+    ++m_filterInputs;           // a search for a name, or the Account sort, now answers differently
+    // A name only decides which rows are shown when it is being searched for, and their order only
+    // when the table is sorted by it. Otherwise the rows and their order are exactly as they were,
+    // and re-filtering the whole history - which is what this used to do for every label edit -
+    // bought nothing a repaint of the one column does not.
+    if (!m_search.isEmpty() || m_sortColumn == Column_Account) {
+        rebuildVisible();
+        return;
+    }
+    if (!m_items.isEmpty())
+        emit dataChanged(index(0, Column_Account), index(m_items.size() - 1, Column_Account));
 }
 
 void HistoryModel::setTxNotes(const QHash<QString, QString> &notes) {
@@ -739,7 +1006,19 @@ void HistoryModel::clearLocal() {
 QString HistoryModel::dedupKey(const HistoryItem &h) {
     if (h.kind == QLatin1String("swap") && !h.txHash.isEmpty())
         return h.txHash.toLower();
-    return QStringLiteral("%1|%2|%3|%4").arg(h.txHash, h.token, h.direction, h.amount);
+    // "hash|token|direction|amount", built in one allocation: every row is keyed whenever a chain's
+    // history is restored, and a format string per row showed up in that cost.
+    const QChar bar(u'|');
+    QString key;
+    key.reserve(h.txHash.size() + h.token.size() + h.direction.size() + h.amount.size() + 3);
+    key += h.txHash;
+    key += bar;
+    key += h.token;
+    key += bar;
+    key += h.direction;
+    key += bar;
+    key += h.amount;
+    return key;
 }
 
 // How settled a row is. A later fetch may carry a row forward through these, never back: an order
@@ -812,8 +1091,7 @@ void HistoryModel::beginFullRefresh() {
     // filled/failed (the "stuck on pending forever" bug).
     m_allItems = m_localSwaps;
     m_allItems += m_localSends; // keep optimistic pending sends visible across the refresh too
-    m_poisonDirty = true;
-    m_blobsDirty = true;
+    invalidateDerived();
     m_page = 0;
     rebuildVisible(); // filter + sort + slice page 0 (just the pending rows at this point)
 }
@@ -821,10 +1099,12 @@ void HistoryModel::beginFullRefresh() {
 // Append one account's rows (deduped) to the full set, then schedule a debounced filter/sort/slice.
 // Only the current 500-row page is ever materialised, so a huge multi-account history stays smooth.
 void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
+    StallWatch::Scope stallScope("HistoryModel::appendBatch");
     noteIncoming(items);
     QVector<HistoryItem> add;
     add.reserve(items.size());
     bool updated = false; // a row we already held has changed (an order filled, a tx mined)
+    bool removed = false; // an optimistic row stood aside for its real copy
     for (const HistoryItem &h : items) {
         if (h.kind == QLatin1String("swap") && !h.txHash.isEmpty()) {
             const QString uid = h.txHash.toLower();
@@ -858,7 +1138,7 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
                     }
                 }
             }
-            if (!removedLocalHash.isEmpty())
+            if (!removedLocalHash.isEmpty()) {
                 m_allItems.erase(
                     std::remove_if(m_allItems.begin(), m_allItems.end(),
                                    [&](const HistoryItem &e) {
@@ -867,6 +1147,12 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
                                                e.txHash.toLower() == removedLocalHash);
                                    }),
                     m_allItems.end());
+                // Rows moved up to close the gap, so the per-row tables no longer line up with
+                // them. Left as they were, the filter matched each row against its neighbour's
+                // search text, and read past the end of the table.
+                invalidateDerived();
+                removed = true;
+            }
             // We may already hold this swap from an earlier poll. That is the normal case, not a
             // duplicate to throw away: an order is fetched again and again precisely because its
             // outcome is still being decided, and the reply that matters is the one saying it
@@ -913,7 +1199,7 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
                     wasLocal = true;
                     break;
                 }
-            if (wasLocal)
+            if (wasLocal) {
                 m_allItems.erase(std::remove_if(m_allItems.begin(), m_allItems.end(),
                                                 [&](const HistoryItem &e) {
                                                     return e.block == 0 &&
@@ -921,9 +1207,11 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
                                                            e.txHash.toLower() == hx;
                                                 }),
                                  m_allItems.end());
+                invalidateDerived(); // see the matching removal above
+                removed = true;
+            }
         }
-        const QString key = QStringLiteral("%1|%2|%3|%4")
-                                .arg(h.txHash, h.token, h.direction, h.amount);
+        const QString key = dedupKey(h); // not a swap here, so the transfer form of the key
         const int at = fetchedIndex(key);
         if (at >= 0) {
             // A transfer keeps its key when it mines, so this is where a row picks up its block,
@@ -946,15 +1234,25 @@ void HistoryModel::appendBatch(const QVector<HistoryItem> &items) {
         rebuildAll();
         return;
     }
-    if (add.isEmpty())
+    if (add.isEmpty()) {
+        // A removal with nothing to add still changed what is on screen; returning here left the
+        // page showing rows that no longer existed until something unrelated rebuilt it.
+        if (removed)
+            scheduleRebuild();
         return;
+    }
     m_allItems += add;
-    scheduleRebuild();
+    ++m_filterInputs; // new rows the previous result never saw
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const bool burst = now - m_lastBatchMs < 1000;
+    m_lastBatchMs = now;
+    scheduleRebuild(burst ? kBurstRebuildMs : 150);
 }
 
 // Compose the unfiltered list as [optimistic pending swaps] + [fetched history], dropping any
 // pending swap that has since appeared in fetched data (matched by tx hash / CoW order uid).
 void HistoryModel::rebuildAll() {
+    StallWatch::Scope stallScope("HistoryModel::rebuildAll");
     if (!m_localSwaps.isEmpty() || !m_localSends.isEmpty()) {
         QSet<QString> fetchedIds, fetchedSwapIds;
         for (const HistoryItem &h : m_fetched)
@@ -996,8 +1294,7 @@ void HistoryModel::rebuildAll() {
     m_allItems = m_localSwaps; // pending swaps + sends on top until their mined rows arrive
     m_allItems += m_localSends;
     m_allItems += m_fetched;
-    m_poisonDirty = true; // the rows changed, so both derived indexes are stale
-    m_blobsDirty = true;
+    invalidateDerived(); // recomposed from scratch, so nothing derived from the old order holds
     rebuildVisible();
 }
 

@@ -12,6 +12,7 @@
 #include <QPointer>
 #include <QSet>
 #include <QList>
+#include <QThreadPool>
 
 #include <functional>
 
@@ -47,6 +48,8 @@ class QTreeView;
 class QScrollArea;
 class XmrTradeTab;
 class Updater;
+struct HistoryFoldInput;
+struct HistoryFoldOutput;
 
 class AeroMainWindow : public QMainWindow
 {
@@ -155,7 +158,10 @@ private:
     void saveBalanceCache();          // stash the current chain's balances in metadata (for instant reopen)
     void loadBalanceCache();          // show last-known balances instantly, before the Tor refresh
     void saveHistoryCache();          // persist the current chain's fetched history (debounced)
-    void foldHistoryCacheIntoMeta();  // build history snapshot into m_meta without saving (close path)
+    HistoryFoldInput historyFoldInput() const;         // shared copies of what a fold reads
+    void applyHistoryFold(const HistoryFoldOutput &out); // put a finished fold into m_meta
+    // Serialise m_meta and hand it to the wallet, on the persistence thread. See saveMetadata.
+    void serializeMetadataAsync();
     void loadHistoryCache();          // restore the current chain's history instantly (0 requests)
     // Keep `items` as this chain's converted history, evicting the least recently used chain. See
     // m_histItemsByChain.
@@ -480,6 +486,19 @@ private:
     // JSON in m_meta stays authoritative, so dropping an entry only costs speed.
     QHash<quint64, QVector<HistoryItem>> m_histItemsByChain;
     QList<quint64> m_histChainOrder;           // most recently used first
+    // One thread for turning the wallet's metadata into JSON and folding history into it. That work
+    // was all on the UI thread, and at the size of a large wallet - a 7.8 MB blob, thirty thousand
+    // history rows - each save froze the window for most of a second, every twenty to thirty seconds.
+    // One thread, not several, so saves stay in the order they were asked for.
+    QThreadPool m_persistPool;
+    // Restoring a chain's history on a switch - separate from the persistence thread so a save in
+    // progress can never make a chain switch wait behind it.
+    QThreadPool m_loadPool;
+    quint64 m_histFoldSeq = 0;       // the latest history fold dispatched; older results are dropped
+    quint64 m_histLoadSeq = 0;       // the latest history restore dispatched (chain switch / open)
+    quint64 m_metaSerializeSeq = 0;  // likewise for metadata serialisation
+    QTimer *m_metaSerializeTimer = nullptr; // coalesces saveMetadata() calls within one event turn
+    bool m_closing = false;          // closeEvent has taken over saving; late async results are void
     int m_blocksSinceFullSweep = 0;            // large wallets: blocks since the last all-account read
     bool m_balanceSweepInFlight = false;       // a batched balance read is out; don't stack another
     qint64 m_balanceSweepStartedMs = 0;        // when, so a lost sweep can't block sweeps for good

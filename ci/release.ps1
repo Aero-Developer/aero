@@ -73,6 +73,7 @@ $excluded = @(
     "config",          # QSettings: nodes, pins, privacy choices
     "thp-pairing.txt", # Trezor pairing credential
     "netlog.txt",
+    "perflog.txt",     # the UI stall log (StallWatch) - timings from the developer's own runs
     ".aero-update",    # staged/backed-up files from a previous in-place update
     "obs1_open.png",
     "aero.exe")

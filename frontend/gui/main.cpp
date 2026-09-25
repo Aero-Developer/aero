@@ -21,6 +21,7 @@
 #include <QThread>
 
 #include "AeroMainWindow.h"
+#include "StallWatch.h"
 #include "Updater.h"
 #include "WalletWizard.h"
 #include "components.h"
@@ -111,6 +112,10 @@ int main(int argc, char *argv[]) {
 
     aeroApplyTheme();
 
+    // Record any UI-thread stall over 100 ms (operation names and durations only) beside the other
+    // local state, so a freeze on a real wallet can be found from evidence instead of guessed at.
+    StallWatch::start(QDir(aeroDataRoot()).filePath(QStringLiteral("perflog.txt")), 100);
+
     // 2025+ Trezor models (Safe 5/7) must be paired before they will talk to us, and the credential
     // that records the pairing lives alongside the wallets so portable installs stay self-contained.
     // It is deliberately app-level rather than per-wallet: the pairing identifies this copy of Aero
@@ -148,6 +153,7 @@ int main(int argc, char *argv[]) {
 
     // An update was installed and the user asked to restart into it. Everything this process held -
     // the wallet file, the Tor data directory, the SOCKS port - is released by now.
+    StallWatch::stop();
     Updater::launchInstalledVersion();
     return rc;
 }

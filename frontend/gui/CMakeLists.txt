@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.18)
 # The version here is the one stamped into the .exe. Keep it equal to the release tag being cut:
 # a binary whose declared version matches a published, hashed release is one an antivirus reputation
 # service can actually look up, and one a user can report a bug against.
-project(aero_gui VERSION 0.1.39 LANGUAGES CXX C) # C is for the vendored quirc QR decoder
+project(aero_gui VERSION 0.1.40 LANGUAGES CXX C) # C is for the vendored quirc QR decoder
 
 # Compile the Windows resource (.rc) that gives the executable its icon.
 if(WIN32)
@@ -55,6 +55,8 @@ add_executable(aero_gui WIN32 MACOSX_BUNDLE
     XmrTradeTab.h
     Updater.cpp
     Updater.h
+    StallWatch.cpp
+    ${ETHWALLET_DIR}/StallWatch.h
     qrcodegen.cpp
     qrcodegen.hpp
     # Vendored quirc QR decoder (image-based Scan). MIT.
@@ -202,6 +204,21 @@ if(AERO_BUILD_HISTORY_CHECK)
         ${ETHWALLET_DIR}
     )
     target_link_libraries(history_check PRIVATE Qt6::Core Qt6::Gui)
+
+    # Times the UI-thread work at the size of a large wallet (see PerfCheck.cpp).
+    add_executable(perf_check
+        PerfCheck.cpp
+        StallWatch.cpp
+        ${ETHWALLET_DIR}/StallWatch.h
+        ${ETHWALLET_DIR}/HistoryModel.cpp
+        ${ETHWALLET_DIR}/HistoryModel.h
+    )
+    target_include_directories(perf_check PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        ${ETHWALLET_DIR}
+    )
+    target_link_libraries(perf_check PRIVATE Qt6::Core Qt6::Gui)
 endif()
 
 # Opens the XMR1 trading window on its own against a watch-only wallet, for looking at it while

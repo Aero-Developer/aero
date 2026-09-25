@@ -1,5 +1,6 @@
 ﻿// SPDX-License-Identifier: BSD-3-Clause
 #include "AeroMainWindow.h"
+#include "StallWatch.h"
 #include "Updater.h"
 #include "XmrTradeTab.h"
 
@@ -633,7 +634,27 @@ QString formatBalance(const QString &raw) {
 }
 }
 
+// Everything the history-cache fold needs, copied off the window so the fold can run on another
+// thread. The containers are implicitly shared, so taking these copies costs reference counts, not
+// row copies.
+struct HistoryFoldInput {
+    quint64 chain = 0;
+    QVector<HistoryItem> fetched;  // what the model holds now - authoritative for its accounts
+    QVector<HistoryItem> kept;     // this chain's rows as last written, already converted
+    bool haveKept = false;
+    QJsonArray previous;           // ...or, when not held converted, as stored in the metadata
+    QHash<quint32, double> status; // account -> balance when its history was last fetched
+};
+struct HistoryFoldOutput {
+    quint64 chain = 0;
+    QVector<HistoryItem> merged; // the rows the snapshot now holds
+    QJsonObject snap;            // {"items": [...], "status": {...}} for histcache[chain]
+};
+static HistoryFoldOutput foldHistory(const HistoryFoldInput &in); // with the history cache, below
+
 AeroMainWindow::AeroMainWindow(QWidget *parent) : QMainWindow(parent) {
+    m_persistPool.setMaxThreadCount(1); // saves stay in the order they were asked for
+    m_loadPool.setMaxThreadCount(1);    // a newer restore supersedes an older one anyway
     // One-time migration (must run before the Receive options menu is built): earlier builds
     // defaulted the "show only funded addresses" filter ON and persisted it, hiding most accounts
     // after importing a seed. Flip it OFF once so the full 0..last-used address list is shown.
@@ -658,6 +679,9 @@ AeroMainWindow::AeroMainWindow(QWidget *parent) : QMainWindow(parent) {
 }
 
 AeroMainWindow::~AeroMainWindow() {
+    m_closing = true;
+    m_persistPool.waitForDone(); // their tasks post back to this window
+    m_loadPool.waitForDone();
     delete m_wallet;
 }
 
@@ -668,19 +692,26 @@ void AeroMainWindow::closeEvent(QCloseEvent *event) {
     // the window appears to hang on the X until the in-flight scan/history finishes. The loops poll
     // this flag between requests (and wake early from backoff sleeps), so they bail within ~1s.
     Wallet::requestShutdown();
+    // From here the final save below is the only one. Anything still being folded or serialised on
+    // the persistence thread describes an older state, and must not be queued behind it.
+    m_closing = true;
     // Stop the debounced timers so they can't race the authoritative final save.
     if (m_histSaveTimer)
         m_histSaveTimer->stop();
     if (m_saveTimer)
         m_saveTimer->stop();
+    if (m_metaSerializeTimer)
+        m_metaSerializeTimer->stop();
+    m_persistPool.waitForDone(5000); // at most one fold/serialisation; its result is discarded
 
     if (m_wallet && !m_wallet->walletPath().isEmpty()) {
-        // Assemble the FINAL metadata snapshot on the UI thread (cheap: just building JSON in memory -
-        // history cache + labels/contacts/notes/balance cache). No core lock is taken here.
-        if (m_historyModel)
-            foldHistoryCacheIntoMeta();
-        const QString metaJson =
-            QString::fromUtf8(QJsonDocument(m_meta).toJson(QJsonDocument::Compact));
+        // Take the FINAL state here (shared copies - no work on this thread) and do the fold, the
+        // JSON encoding and the write on the worker below. Folding and encoding a large wallet's
+        // history on the UI thread froze the window for most of a second before the "Saving…"
+        // dialog could even appear.
+        const bool haveHistory = m_historyModel != nullptr;
+        const HistoryFoldInput foldIn = haveHistory ? historyFoldInput() : HistoryFoldInput{};
+        const QJsonObject metaNow = m_meta;
 
         // Then do the one blocking encrypt+write (apply metadata + save) on a WORKER thread, pumping
         // a local event loop so the window keeps repainting and NEVER freezes. Previously this ran on
@@ -700,7 +731,16 @@ void AeroMainWindow::closeEvent(QCloseEvent *event) {
         QFutureWatcher<void> watcher;
         QEventLoop loop;
         connect(&watcher, &QFutureWatcher<void>::finished, &loop, &QEventLoop::quit);
-        watcher.setFuture(QtConcurrent::run([this, metaJson, saved]() {
+        watcher.setFuture(QtConcurrent::run([this, haveHistory, foldIn, metaNow, saved]() {
+            QJsonObject meta = metaNow;
+            if (haveHistory) {
+                const HistoryFoldOutput out = foldHistory(foldIn);
+                QJsonObject cache = meta.value(QStringLiteral("histcache")).toObject();
+                cache[QString::number(out.chain)] = out.snap;
+                meta[QStringLiteral("histcache")] = cache;
+            }
+            const QString metaJson =
+                QString::fromUtf8(QJsonDocument(meta).toJson(QJsonDocument::Compact));
             saved->storeRelease(m_wallet->saveWithMetadata(metaJson) ? 1 : 0);
         }));
         QTimer::singleShot(12000, &loop, &QEventLoop::quit); // hard cap so close can't hang
@@ -4940,6 +4980,9 @@ void AeroMainWindow::lockWallet() {
 }
 
 bool AeroMainWindow::eventFilter(QObject *obj, QEvent *event) {
+    // Installed on the application, so this sees every event: it names a stall that happens outside
+    // any labelled operation (see StallWatch).
+    StallWatch::g_lastEvent.store(static_cast<int>(event->type()), std::memory_order_relaxed);
     switch (event->type()) {
     case QEvent::MouseMove:
     case QEvent::MouseButtonPress:
@@ -5060,6 +5103,7 @@ void AeroMainWindow::setConnectionState(int mode, const QString &tip) {
 }
 
 void AeroMainWindow::setWallet(Wallet *wallet) {
+    StallWatch::Scope stallScope("setWallet (opening the wallet)");
     m_wallet = wallet;
     // A bridge tracked against the previous wallet can never resolve now, so drop its state instead
     // of leaving the send guard (and its spinner) stuck on.
@@ -5070,6 +5114,7 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     connect(m_wallet, &Wallet::balanceUpdated, this, &AeroMainWindow::onBalanceUpdated);
     connect(m_wallet, &Wallet::historyRefreshed, this,
             [this](const QVector<HistoryItem> &items, quint64 chainId, bool ok) {
+        StallWatch::Scope stallScope("historyRefreshed");
         if (chainId != m_chainId)
             return; // a previous chain's fetch that landed after a network switch - ignore it
         if (!ok) {
@@ -5188,6 +5233,7 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
     // Event-driven history: after a batched balance refresh, only re-pull the (heavy) history if a
     // balance actually changed. This keeps steady-state bandwidth to the cheap balance batch.
     connect(m_wallet, &Wallet::allBalancesRefreshed, this, [this](quint64 chainId) {
+        StallWatch::Scope stallScope("allBalancesRefreshed");
         // Released before the chain check: a sweep for the chain we just left still occupied the
         // slot, and leaving it held would block sweeps on the new chain until the deadline expired.
         m_balanceSweepInFlight = false;
@@ -5318,6 +5364,7 @@ void AeroMainWindow::setWallet(Wallet *wallet) {
 }
 
 void AeroMainWindow::onBlockNumber(quint64 block) {
+    StallWatch::Scope stallScope("onBlockNumber");
     if (block == 0) {
         // The block poll failed. Once we've connected at least once, treat a run of failures as a
         // dropped connection and self-heal (restart Tor if it died, else re-probe). Guarded so it
@@ -5529,6 +5576,7 @@ void AeroMainWindow::scheduleUpdateCheck() {
 // identical across chains but balances are not), reconnect the RPC to the new chain, and reset the
 // Send asset to the new chain's native coin. Everything still routes over the already-running Tor.
 void AeroMainWindow::switchChain(quint64 chainId) {
+    StallWatch::Scope stallScope("switchChain");
     if (!m_wallet) return;
     const ChainDef &c = chainDefFor(chainId);
     m_chainId = chainId;
@@ -5631,6 +5679,7 @@ void AeroMainWindow::relabelNative() {
 }
 
 void AeroMainWindow::onProviderConnected(int mode, const QString &message, quint64 chainId) {
+    StallWatch::Scope stallScope("onProviderConnected");
     // A connect attempt for a chain the user has since switched away from. Its outcome says nothing
     // about the chain now on screen, and acting on it would kick off a full balance and history load
     // labelled with the wrong network - and, when it reported failure, would show "Offline" over a
@@ -5917,6 +5966,7 @@ void AeroMainWindow::saveBalanceCache() {
 // Populate the in-memory balance caches + UI from the persisted snapshot for the current chain, so
 // balances appear immediately on open/chain-switch. The live refresh over Tor overwrites them.
 void AeroMainWindow::loadBalanceCache() {
+    StallWatch::Scope stallScope("loadBalanceCache");
     if (!m_wallet) return;
     const QJsonObject snap = m_meta.value(QStringLiteral("balcache"))
                                  .toObject()
@@ -6023,6 +6073,88 @@ static HistoryItem histItemFromJson(const QJsonObject &o) {
     return h;
 }
 
+// Merge, order, cap and encode one chain's history for the wallet file. A pure function of its
+// input: it touches nothing on the window, which is what lets it run off the UI thread - where, at
+// thirty thousand rows, it was half a second of frozen window every time history was saved.
+static HistoryFoldOutput foldHistory(const HistoryFoldInput &in) {
+    HistoryFoldOutput out;
+    out.chain = in.chain;
+    QVector<HistoryItem> items = in.fetched;
+
+    // The model holds whatever the last refresh fetched, which after viewing a single account is
+    // that account alone. Writing it straight out therefore replaced the whole chain's snapshot with
+    // one account's rows: quit while filtered to "Account #3" and every other account's history was
+    // gone on reopen - and, because a restored account is marked already-fetched, it did not come
+    // back without a forced rescan. Carry forward the stored rows for accounts this refresh did not
+    // cover. An account present in `items` is authoritative, so nothing is duplicated.
+    QSet<quint32> covered;
+    for (const HistoryItem &h : items)
+        covered.insert(h.account);
+    if (in.haveKept) {
+        for (const HistoryItem &h : in.kept)
+            if (!covered.contains(h.account))
+                items.append(h);
+    } else {
+        for (const QJsonValue &v : in.previous) {
+            const HistoryItem h = histItemFromJson(v.toObject());
+            if (!covered.contains(h.account))
+                items.append(h);
+        }
+    }
+
+    // Bound the file, but generously: a wallet with many funded accounts legitimately has thousands
+    // of transactions, and the on-reopen cache is marked "already fetched" per account (status-gate),
+    // so anything dropped here is NOT re-fetched - it just vanishes from the restored view until a
+    // forced rescan. A tight cap (the old 4000) therefore truncated real history on reopen. Keep the
+    // newest 30k rows (by timestamp, then block) per chain - enough to never truncate a realistic
+    // wallet, while still bounding the encrypted file. AES over a few MB is sub-millisecond; the
+    // Argon2id cost is on the key and independent of blob size.
+    std::sort(items.begin(), items.end(), [](const HistoryItem &a, const HistoryItem &b) {
+        if (a.timestamp != b.timestamp) return a.timestamp > b.timestamp;
+        return a.block > b.block;
+    });
+    if (items.size() > 30000)
+        items.resize(30000);
+    QJsonArray arr;
+    for (const HistoryItem &h : items)
+        arr.append(histItemToJson(h));
+    QJsonObject status;
+    for (auto it = in.status.constBegin(); it != in.status.constEnd(); ++it)
+        status[QString::number(it.key())] = it.value();
+    out.snap[QStringLiteral("items")] = arr;
+    out.snap[QStringLiteral("status")] = status;
+    out.merged = std::move(items);
+    return out;
+}
+
+HistoryFoldInput AeroMainWindow::historyFoldInput() const {
+    HistoryFoldInput in;
+    in.chain = m_chainId;
+    in.fetched = m_historyModel->fetchedItems();
+    in.status = m_histStatus;
+    const auto kept = m_histItemsByChain.constFind(m_chainId);
+    in.haveKept = kept != m_histItemsByChain.constEnd();
+    if (in.haveKept)
+        in.kept = kept.value();
+    else
+        in.previous = m_meta.value(QStringLiteral("histcache"))
+                          .toObject()
+                          .value(QString::number(m_chainId))
+                          .toObject()
+                          .value(QStringLiteral("items"))
+                          .toArray();
+    return in;
+}
+
+// Put a finished fold into the metadata. Keyed by the chain it was folded for, which need not be the
+// chain on screen any more - the rows belong to that chain regardless.
+void AeroMainWindow::applyHistoryFold(const HistoryFoldOutput &out) {
+    rememberHistoryItems(out.chain, out.merged);
+    QJsonObject cache = m_meta.value(QStringLiteral("histcache")).toObject();
+    cache[QString::number(out.chain)] = out.snap;
+    m_meta[QStringLiteral("histcache")] = cache;
+}
+
 void AeroMainWindow::scheduleHistorySave() {
     if (!m_wallet) return;
     if (!m_histSaveTimer) {
@@ -6039,80 +6171,28 @@ void AeroMainWindow::scheduleHistorySave() {
         m_histSaveTimer->start();
 }
 
+// Fold this chain's history into the metadata and save, with the fold on the persistence thread.
+// Only the shared copies are taken here; the merge, the sort and the JSON encoding of up to thirty
+// thousand rows happen off the UI thread, and the result is applied when it comes back.
 void AeroMainWindow::saveHistoryCache() {
-    foldHistoryCacheIntoMeta();
-    if (m_wallet && m_historyModel)
-        saveMetadata();
-}
-
-// Build this chain's history snapshot into m_meta WITHOUT triggering a save. closeEvent uses this to
-// assemble the final metadata on the UI thread, then persists it once on a worker (so the UI-thread
-// save can't freeze the close).
-void AeroMainWindow::foldHistoryCacheIntoMeta() {
-    if (!m_wallet || !m_historyModel) return;
-    QVector<HistoryItem> items = m_historyModel->fetchedItems();
-
-    // The model holds whatever the last refresh fetched, which after viewing a single account is
-    // that account alone. Writing it straight out therefore replaced the whole chain's snapshot with
-    // one account's rows: quit while filtered to "Account #3" and every other account's history was
-    // gone on reopen - and, because a restored account is marked already-fetched, it did not come
-    // back without a forced rescan. Carry forward the stored rows for accounts this refresh did not
-    // cover. An account present in `items` is authoritative, so nothing is duplicated.
-    QSet<quint32> covered;
-    for (const HistoryItem &h : items)
-        covered.insert(h.account);
-    {
-        // Prefer the converted copy of what we last wrote. Re-reading the snapshot out of JSON here
-        // meant every periodic save deserialized up to 30,000 rows purely to decide which of them to
-        // serialize again - on the UI thread, every time.
-        const auto kept = m_histItemsByChain.constFind(m_chainId);
-        if (kept != m_histItemsByChain.constEnd()) {
-            for (const HistoryItem &h : kept.value())
-                if (!covered.contains(h.account))
-                    items.append(h);
-        } else {
-            const QJsonArray previous = m_meta.value(QStringLiteral("histcache"))
-                                            .toObject()
-                                            .value(QString::number(m_chainId))
-                                            .toObject()
-                                            .value(QStringLiteral("items"))
-                                            .toArray();
-            for (const QJsonValue &v : previous) {
-                const HistoryItem h = histItemFromJson(v.toObject());
-                if (!covered.contains(h.account))
-                    items.append(h);
-            }
-        }
-    } // `kept` must not outlive this: rememberHistoryItems below rewrites the map it points into
-
-    // Bound the file, but generously: a wallet with many funded accounts legitimately has thousands
-    // of transactions, and the on-reopen cache is marked "already fetched" per account (status-gate),
-    // so anything dropped here is NOT re-fetched - it just vanishes from the restored view until a
-    // forced rescan. A tight cap (the old 4000) therefore truncated real history on reopen. Keep the
-    // newest 30k rows (by timestamp, then block) per chain - enough to never truncate a realistic
-    // wallet, while still bounding the encrypted file. AES over a few MB is sub-millisecond; the
-    // Argon2id cost is on the key and independent of blob size.
-    std::sort(items.begin(), items.end(), [](const HistoryItem &a, const HistoryItem &b) {
-        if (a.timestamp != b.timestamp) return a.timestamp > b.timestamp;
-        return a.block > b.block;
+    StallWatch::Scope stallScope("saveHistoryCache");
+    if (!m_wallet || !m_historyModel || m_closing)
+        return;
+    const HistoryFoldInput in = historyFoldInput();
+    const quint64 seq = ++m_histFoldSeq;
+    (void)QtConcurrent::run(&m_persistPool, [this, in, seq]() {
+        const HistoryFoldOutput out = foldHistory(in);
+        QMetaObject::invokeMethod(
+            this,
+            [this, out, seq]() {
+                // A newer fold has been dispatched since; it read everything this one did and more.
+                if (m_closing || seq != m_histFoldSeq)
+                    return;
+                applyHistoryFold(out);
+                saveMetadata();
+            },
+            Qt::QueuedConnection);
     });
-    if (items.size() > 30000)
-        items.resize(30000);
-    // This is now exactly what the snapshot holds, so the next save (and a switch back to this
-    // chain) can start from it rather than from JSON.
-    rememberHistoryItems(m_chainId, items);
-    QJsonArray arr;
-    for (const HistoryItem &h : items)
-        arr.append(histItemToJson(h));
-    QJsonObject status; // account -> balance when its history was last fetched (status-gate baseline)
-    for (auto it = m_histStatus.constBegin(); it != m_histStatus.constEnd(); ++it)
-        status[QString::number(it.key())] = it.value();
-    QJsonObject snap;
-    snap[QStringLiteral("items")] = arr;
-    snap[QStringLiteral("status")] = status;
-    QJsonObject cache = m_meta.value(QStringLiteral("histcache")).toObject();
-    cache[QString::number(m_chainId)] = snap;
-    m_meta[QStringLiteral("histcache")] = cache;
 }
 
 // Hold this chain's converted history, dropping the chain used longest ago. Three is enough for the
@@ -6128,6 +6208,7 @@ void AeroMainWindow::rememberHistoryItems(quint64 chainId, const QVector<History
 }
 
 void AeroMainWindow::loadHistoryCache() {
+    StallWatch::Scope stallScope("loadHistoryCache");
     if (!m_wallet || !m_historyModel) return;
     const QJsonObject snap = m_meta.value(QStringLiteral("histcache"))
                                  .toObject()
@@ -6135,22 +6216,9 @@ void AeroMainWindow::loadHistoryCache() {
                                  .toObject();
     if (snap.isEmpty())
         return;
-    // A chain visited earlier in this session is still held in converted form, so switching back to
-    // it costs a vector copy instead of walking tens of thousands of QJsonObjects on the UI thread.
-    QVector<HistoryItem> items;
-    const auto kept = m_histItemsByChain.constFind(m_chainId);
-    if (kept != m_histItemsByChain.constEnd()) {
-        items = kept.value();
-    } else {
-        const QJsonArray arr = snap.value(QStringLiteral("items")).toArray();
-        items.reserve(arr.size());
-        for (const QJsonValue &v : arr)
-            items.append(histItemFromJson(v.toObject()));
-    }
-    rememberHistoryItems(m_chainId, items);
-    m_historyModel->loadCachedHistory(items);
     // Restore the per-account status baseline + mark those accounts as already loaded, so connect
     // only refetches accounts whose balance has since changed (usually none) - zero-request restart.
+    // Done here, synchronously, because it is small and because connect reads it.
     m_histFetched.clear();
     m_histStatus.clear();
     const QJsonObject status = snap.value(QStringLiteral("status")).toObject();
@@ -6159,17 +6227,54 @@ void AeroMainWindow::loadHistoryCache() {
         m_histStatus.insert(idx, it.value().toDouble());
         m_histFetched.insert(idx);
     }
+    // A chain visited earlier in this session is still held in converted form; otherwise the rows
+    // come out of JSON. Either way the heavy part - converting, indexing and deriving what the filter
+    // needs for every row - runs on a worker, and the model swaps the result in when it is ready.
+    const auto kept = m_histItemsByChain.constFind(m_chainId);
+    const bool haveKept = kept != m_histItemsByChain.constEnd();
+    const QVector<HistoryItem> keptRows = haveKept ? kept.value() : QVector<HistoryItem>();
+    const QJsonArray stored =
+        haveKept ? QJsonArray() : snap.value(QStringLiteral("items")).toArray();
+    const qsizetype rowCount = haveKept ? keptRows.size() : stored.size();
     // Only claim this chain's history is loaded if the snapshot actually carried some. A chain whose
     // first visit failed leaves an empty-but-present snapshot behind, and treating that as "already
     // have it" is what made History stay blank on every later switch to that chain: connect took the
     // status-gate path and nothing ever asked for the rows.
-    if (!items.isEmpty() && !m_histFetched.isEmpty())
+    if (rowCount > 0 && !m_histFetched.isEmpty())
         m_historyLoadedChain = m_chainId;
-    // A swap that was still open when the app closed comes back from the cache saying "pending", and
-    // nothing was left running to ever ask again. The poll starts itself only when an order is
-    // placed, so without this the row keeps that status for good - it was true once, and looked true
-    // forever. startCowPoll() is a no-op when nothing is pending.
-    startCowPoll();
+    if (rowCount == 0)
+        return;
+
+    const quint64 chain = m_chainId;
+    const quint64 seq = ++m_histLoadSeq;
+    const QSet<QString> own = m_historyModel->ownAddresses();
+    const QSet<QString> known = m_historyModel->knownTokens();
+    (void)QtConcurrent::run(&m_loadPool, [this, chain, seq, haveKept, keptRows, stored, own, known]() {
+        QVector<HistoryItem> rows = keptRows;
+        if (!haveKept) {
+            rows.reserve(stored.size());
+            for (const QJsonValue &v : stored)
+                rows.append(histItemFromJson(v.toObject()));
+        }
+        HistoryModel::Prepared prepared = HistoryModel::prepare(rows, own, known);
+        QMetaObject::invokeMethod(
+            this,
+            [this, chain, seq, haveKept, rows, prepared]() mutable {
+                // The user moved on to another chain (or another load started) while this ran.
+                if (m_closing || !m_historyModel || seq != m_histLoadSeq || chain != m_chainId)
+                    return;
+                if (!haveKept)
+                    rememberHistoryItems(chain, rows);
+                // Moved, so the model is the sole owner of the storage it receives.
+                m_historyModel->adoptPrepared(std::move(prepared));
+                // A swap that was still open when the app closed comes back from the cache saying
+                // "pending", and nothing was left running to ever ask again. The poll starts itself
+                // only when an order is placed, so without this the row keeps that status for good.
+                // startCowPoll() is a no-op when nothing is pending.
+                startCowPoll();
+            },
+            Qt::QueuedConnection);
+    });
 }
 
 // Show 0 immediately for any account we don't yet have a balance for, so a freshly created wallet (or
@@ -6327,12 +6432,49 @@ void AeroMainWindow::primeZeroBalances() {
 }
 
 void AeroMainWindow::saveMetadata() {
-    if (!m_wallet) return;
-    // Queue the metadata lock-free (never touches the core lock on the UI thread) and defer the
-    // encrypt+write. Applying it under the core write lock here would freeze the UI while the funded
-    // scan holds that lock - which is exactly the "double-click a label freezes" bug.
-    m_wallet->queueMetadata(QString::fromUtf8(QJsonDocument(m_meta).toJson(QJsonDocument::Compact)));
-    scheduleSave();
+    if (!m_wallet || m_closing) return;
+    // Coalesced to one serialisation per event-loop turn - a single handler often saves more than
+    // one thing - and the serialisation itself runs off the UI thread (serializeMetadataAsync).
+    if (!m_metaSerializeTimer) {
+        m_metaSerializeTimer = new QTimer(this);
+        m_metaSerializeTimer->setSingleShot(true);
+        m_metaSerializeTimer->setInterval(0);
+        connect(m_metaSerializeTimer, &QTimer::timeout, this, [this]() { serializeMetadataAsync(); });
+    }
+    if (!m_metaSerializeTimer->isActive())
+        m_metaSerializeTimer->start();
+}
+
+// Turn m_meta into JSON on the persistence thread, then queue it for the wallet's next save.
+//
+// The blob carries the history cache, the balance cache and the saved prices, so it runs to several
+// megabytes on a big wallet, and serialising it on the UI thread froze the window for a fifth of a
+// second on every save. The snapshot handed over is a shared copy: the next edit to m_meta on this
+// thread detaches its own copy, so the worker's never changes underneath it.
+//
+// Queueing stays lock-free (never touching the core lock on the UI thread), and the encrypt+write is
+// still deferred - applying it under the core write lock here would freeze the UI while the funded
+// scan holds that lock, which is exactly the "double-click a label freezes" bug.
+void AeroMainWindow::serializeMetadataAsync() {
+    StallWatch::Scope stallScope("serializeMetadataAsync");
+    if (!m_wallet || m_closing)
+        return;
+    const QJsonObject snapshot = m_meta;
+    const quint64 seq = ++m_metaSerializeSeq;
+    (void)QtConcurrent::run(&m_persistPool, [this, snapshot, seq]() {
+        const QString json =
+            QString::fromUtf8(QJsonDocument(snapshot).toJson(QJsonDocument::Compact));
+        QMetaObject::invokeMethod(
+            this,
+            [this, json, seq]() {
+                // Superseded by a later snapshot, which will arrive right behind this one.
+                if (m_closing || !m_wallet || seq != m_metaSerializeSeq)
+                    return;
+                m_wallet->queueMetadata(json);
+                scheduleSave();
+            },
+            Qt::QueuedConnection);
+    });
 }
 
 // Debounced, non-blocking save. Coalesces a burst of edits (e.g. typing a label) into a single
@@ -6351,6 +6493,7 @@ void AeroMainWindow::scheduleSave() {
 }
 
 void AeroMainWindow::loadMetadata() {
+    StallWatch::Scope stallScope("loadMetadata (opening the wallet)");
     if (!m_wallet) return;
     const QString json = m_wallet->metadata();
     m_meta = json.isEmpty() ? QJsonObject()
@@ -6478,6 +6621,7 @@ void AeroMainWindow::updateAvailable() {
 void AeroMainWindow::onAvailableBalance(quint32 index, const QString &token,
                                          const QString &formatted, const QString &symbol,
                                          quint64 chainId) {
+    StallWatch::Scope stallScope("onAvailableBalance");
     // A balance read on a chain we are no longer on. The cache it would land in is keyed by account
     // and token address only, so this would be stored - and later persisted - as a balance of the
     // current chain. On Arbitrum that showed up as an Ethereum DAI holding that never went away.
@@ -6586,6 +6730,7 @@ QString AeroMainWindow::accountName(quint32 index) const {
 // Hand the History table the name of every account, so its Account column can say "Savings" rather
 // than the index it stores.
 void AeroMainWindow::pushAccountNames() {
+    StallWatch::Scope stallScope("pushAccountNames");
     if (!m_historyModel || !m_wallet)
         return;
     QHash<quint32, QString> names;
@@ -6637,6 +6782,7 @@ void AeroMainWindow::refreshAccountCombosText() {
 }
 
 void AeroMainWindow::rebuildAccountCombos() {
+    StallWatch::Scope stallScope("rebuildAccountCombos");
     if (!m_wallet) return;
     const quint32 n = m_wallet->numAccounts();
     // GUARD AGAINST THE UI FREEZE: accountLabel() below reads m_wallet->address(i) for EVERY account.
@@ -6845,6 +6991,7 @@ void AeroMainWindow::refreshDirtyHistory() {
 // A targeted single-account history batch arrived: merge it into the (deduped) all-accounts model.
 void AeroMainWindow::onAccountHistoryReady(quint32 index, const QVector<HistoryItem> &items,
                                            quint64 chainId, bool ok) {
+    StallWatch::Scope stallScope("onAccountHistoryReady");
     if (chainId != m_chainId)
         return; // a previous chain's fetch, landing after a switch that already cleared its bookkeeping
     m_histInFlight.remove(index);
@@ -6872,6 +7019,7 @@ void AeroMainWindow::onAccountHistoryReady(quint32 index, const QVector<HistoryI
 
 void AeroMainWindow::onAccountBalance(quint32 index, const QString &formatted, const QString &symbol,
                                       quint64 chainId) {
+    StallWatch::Scope stallScope("onAccountBalance");
     if (chainId != m_chainId)
         return; // the previous chain's native balance, landing after a switch
     if (formatted.isEmpty()) return; // offline / no balance yet - don't append an empty suffix
@@ -7046,6 +7194,7 @@ void AeroMainWindow::refreshAddressBalancesDisplay() {
 }
 
 void AeroMainWindow::updateReceive() {
+    StallWatch::Scope stallScope("updateReceive");
     if (!m_wallet) return;
     const QString addr = m_wallet->address(m_account);
     const QPixmap qr = renderQr(addr);
@@ -8728,6 +8877,7 @@ void AeroMainWindow::onMarketPrices(double xmrUsd, double xmrChangePct, double e
 }
 
 void AeroMainWindow::recomputeHomeTotal() {
+    StallWatch::Scope stallScope("recomputeHomeTotal");
     if (!m_homeTotalValue) return;
     // Accumulate the grand total AND each account's own USD value in the same single pass, so the
     // Receive address list can show a full per-account value (native + tokens) without extra scans.
@@ -8831,6 +8981,7 @@ void AeroMainWindow::scheduleReceiveRefresh() {
 // Recompute every account's "used" (red) flag once, in a single O(N + tokenKeys) pass, from the
 // in-memory balances - instead of looping the tracked-token list per account per balance signal.
 void AeroMainWindow::refreshUsedFlags() {
+    StallWatch::Scope stallScope("refreshUsedFlags");
     if (!m_addressModel || !m_wallet)
         return;
     QSet<quint32> hasToken;

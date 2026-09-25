@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "XmrTradeTab.h"
+#include "StallWatch.h"
 
 #include "ethwallet/Wallet.h"
 
@@ -892,6 +893,7 @@ void XmrTradeTab::onAgentApproved(const QString &error) {
 }
 
 void XmrTradeTab::onOverview(quint32 account, const QString &json, const QString &error) {
+    StallWatch::Scope stallScope("XmrTradeTab::onOverview");
     if (account != m_account)
         return; // the previous account's request, still in flight when the account changed
     m_refreshInFlight = false;

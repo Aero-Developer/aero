@@ -25,9 +25,10 @@ static void check(bool ok, const char *what) {
         ++failures;
 }
 
-// Let the model's coalescing timer fire, the way it would between two frames in the app.
+// Let the model's coalescing timer fire, the way it would between two frames in the app. Longer than
+// the slowest coalesce (the one used while a history load is streaming in).
 static void settle() {
-    QDeadlineTimer deadline(300);
+    QDeadlineTimer deadline(600);
     while (!deadline.hasExpired())
         QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
 }
@@ -304,6 +305,78 @@ int main(int argc, char **argv) {
         m.confirmLocalSwap("0xswapr", /*failed*/ false);
         settle();
         check(statusOf(m, "0xswapr") == "done", "and settles to done on its receipt");
+    }
+
+    // Searching by date has to match exactly what the Date column shows. The search text builds the
+    // local time without a local-time conversion per row, so check it against the conversion it
+    // replaces, at a spread of times of day and year.
+    {
+        HistoryModel m;
+        m.beginFullRefresh();
+        QVector<HistoryItem> rows;
+        QStringList shown;
+        for (int i = 0; i < 40; ++i) {
+            const quint64 when = 1700000000ull + static_cast<quint64>(i) * 777777ull + 61ull * i;
+            rows.append(transferRow(QStringLiteral("0xd%1").arg(i), QStringLiteral("in"),
+                                    100 + static_cast<quint64>(i), when));
+            shown << QDateTime::fromSecsSinceEpoch(static_cast<qint64>(when))
+                         .toString(QStringLiteral("yyyy-MM-dd HH:mm"));
+        }
+        m.appendBatch(rows);
+        settle();
+        bool allFound = true;
+        for (int i = 0; i < rows.size(); ++i) {
+            m.setSearchText(shown.at(i));
+            settle();
+            bool found = false;
+            for (int r = 0; r < m.rowCount(); ++r)
+                found = found || m.itemAt(r).txHash == rows.at(i).txHash;
+            allFound = allFound && found;
+        }
+        check(allFound, "searching a row's date and time as shown finds that row");
+    }
+
+    // Search stays correct while history is still arriving. The per-row search table used to go
+    // out of step with the rows when a batch appended to them, and the filter then read past its
+    // end: a search typed during a load showed the wrong rows, or none.
+    {
+        HistoryModel m;
+        m.beginFullRefresh();
+        m.appendBatch({transferRow("0xaaa1", "in", 10, now - 500)});
+        settle();
+        m.setSearchText(QStringLiteral("0xbbb"));
+        settle();
+        check(m.rowCount() == 0, "a search with no match shows nothing");
+        m.appendBatch({transferRow("0xbbb1", "in", 11, now - 400),
+                       transferRow("0xbbb2", "out", 12, now - 300)});
+        settle();
+        check(m.rowCount() == 2, "rows arriving mid-search are searched too");
+        m.addLocalSend("0xccc1", "0x000000000000000000000000000000000000dEaD", "1", "ETH");
+        settle();
+        m.appendBatch({transferRow("0xccc1", "out", 13, now - 200)}); // replaces the pending row
+        settle();
+        m.setSearchText(QStringLiteral("0xccc1"));
+        settle();
+        check(m.rowCount() == 1, "and after a pending row is replaced, still one row, the right one");
+    }
+
+    // Sorting by value keys each row once; the order it produces must be the order it always had.
+    {
+        HistoryModel m;
+        m.setPrices({{QStringLiteral("ETH"), 2000.0}});
+        m.beginFullRefresh();
+        HistoryItem a = transferRow("0xv1", "in", 1, now - 30);
+        a.formatted = QStringLiteral("0.5"); // $1000
+        HistoryItem b = transferRow("0xv2", "in", 2, now - 20);
+        b.formatted = QStringLiteral("2");   // $4000
+        HistoryItem c = transferRow("0xv3", "in", 3, now - 10);
+        c.formatted = QStringLiteral("1");   // $2000
+        m.appendBatch({a, b, c});
+        settle();
+        m.sort(HistoryModel::Column_Value, Qt::DescendingOrder);
+        check(m.rowCount() == 3 && m.itemAt(0).txHash == "0xv2" && m.itemAt(1).txHash == "0xv3" &&
+                  m.itemAt(2).txHash == "0xv1",
+              "sorting by value puts the largest first");
     }
 
     std::printf("\n%s\n", failures == 0 ? "all good" : "SOMETHING IS WRONG");

@@ -61,6 +61,7 @@ const PROTECTED: &[&str] = &[
     "config",          // QSettings: nodes, pins, privacy choices
     "thp-pairing.txt", // Trezor pairing credential
     "netlog.txt",
+    "perflog.txt",     // the UI stall log (StallWatch)
     WORK_DIR,
 ];
 
