@@ -93,6 +93,15 @@ public:
     // their filter facts and the look-alike index. Adopting one is a swap. Loading the rows directly
     // did all of that on the UI thread in the middle of a chain switch - most of what made switching
     // on a large wallet stall.
+    // The look-alike index: addresses known to be real, and their first4+last4 hex signatures.
+    // `addrs` holds the wallet's own addresses and the counterparty of every genuine transfer of
+    // value, either way. `sentAddrs` holds only the own addresses and those the wallet has sent value
+    // to - the ones poisoning imitates, and ones an outsider cannot add, where anyone can put an
+    // address in `addrs` by sending the wallet a little of a real token.
+    struct PoisonRefs {
+        QSet<QString> addrs, sigs;
+        QSet<QString> sentAddrs, sentSigs;
+    };
     struct Prepared {
         // Two copies, each owned outright (not sharing storage with the cache it came from), with
         // room to grow. Shared storage is copied on first write, and the first write is the next
@@ -101,7 +110,7 @@ public:
         QVector<HistoryItem> allRows; // becomes the full row list
         QHash<QString, int> fetchedAt;
         QVector<RowFacts> facts;
-        QSet<QString> refAddrs, refSigs;
+        PoisonRefs refs;
         QSet<QString> ownAddresses, knownTokens; // what the look-alike index was built against
     };
     // Thread-safe: reads nothing of any model. Pass the model's current ownAddresses()/knownTokens().
@@ -124,6 +133,8 @@ public slots:
     // not a full model reset). The sorting proxy orders rows for display.
     void beginFullRefresh();
     void appendBatch(const QVector<HistoryItem> &items);
+    // Distinct fetched rows held, so a caller can tell whether a batch brought anything new.
+    int fetchedCount() const { return m_fetched.size(); }
 
     // Persisted history (per-chain wallet cache): export the fetched set, and load it back on open so
     // a restart shows history instantly with zero network requests (Electrum/Feather model).
@@ -252,7 +263,8 @@ private:
     // Fold one row into a look-alike index if it is a genuine transfer of value (shared by the
     // model's incremental index and by prepare()).
     static void addPoisonRef(const HistoryItem &h, const RowFacts &f, const QSet<QString> &known,
-                             QSet<QString> &addrs, QSet<QString> &sigs);
+                             PoisonRefs &refs);
+    static void addOwnRef(PoisonRefs &refs, const QString &addrLower);
     bool isSpamToken(const HistoryItem &h, const RowFacts &f) const;
     bool isSpamToken(const HistoryItem &h) const;
     bool isHiddenSpam(const HistoryItem &h, const RowFacts &f) const;
@@ -307,10 +319,10 @@ private:
     // then shuffled those whole rows around, which was the floor under every rebuild.
     QVector<int> m_filtered;
     QVector<HistoryItem> m_items;    // the CURRENT PAGE slice of m_filtered (what the view renders)
+    QVector<bool> m_itemSpam;        // per m_items row: shown only because spam is not being hidden
     QSet<QString> m_knownTokens;
     QSet<QString> m_ownAddresses;   // wallet's own addresses (lower-case) - poisoning targets
-    QSet<QString> m_poisonRefAddrs; // legit addresses (own + real counterparties), lower-case
-    QSet<QString> m_poisonRefSigs;  // first4+last4 hex signatures of the above (look-alike index)
+    PoisonRefs m_poisonRefs;        // the look-alike index (see PoisonRefs), lower-case
     QVector<RowFacts> m_facts;      // per row of m_allItems (a prefix; see invalidateDerived)
     // Per search: which accounts' names contain the text (a wallet has a few hundred accounts, and
     // naming one means building a string, so each is decided once, not once per row).

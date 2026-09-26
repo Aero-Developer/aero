@@ -57,15 +57,21 @@ bool HistoryModel::isSpamToken(const HistoryItem &h, const RowFacts &f) const {
 }
 
 void HistoryModel::addPoisonRef(const HistoryItem &h, const RowFacts &f, const QSet<QString> &known,
-                                QSet<QString> &addrs, QSet<QString> &sigs) {
+                                PoisonRefs &refs) {
     if (h.kind == QLatin1String("swap") || !f.evm)
         return;
     const bool nonzero = !(h.amount.isEmpty() || h.amount == QLatin1String("0"));
     // Only trust a counterparty as "real" if it moved value and isn't itself a spam token - so a
     // poisoning entry can never seed its own look-alike reference.
-    if (nonzero && !spamTokenIn(h, f, known)) {
-        addrs.insert(f.counterpartyLower);
-        sigs.insert(f.sig);
+    if (!nonzero || spamTokenIn(h, f, known))
+        return;
+    refs.addrs.insert(f.counterpartyLower);
+    refs.sigs.insert(f.sig);
+    // A send of a real token cannot be forged - moving the wallet's tokens takes its key - so this is
+    // an address the wallet chose to pay.
+    if (h.direction == QLatin1String("out")) {
+        refs.sentAddrs.insert(f.counterpartyLower);
+        refs.sentSigs.insert(f.sig);
     }
 }
 
@@ -169,25 +175,48 @@ void HistoryModel::ensurePoisonRefs() {
     ensureFacts();
     const int n = m_allItems.size();
     if (m_poisonRows < 0 || m_poisonRows > n) {
-        m_poisonRefAddrs.clear();
-        m_poisonRefSigs.clear();
-        for (const QString &a : m_ownAddresses) {
-            const QString lower = a.toLower();
-            if (!isEvmAddress(lower))
-                continue;
-            m_poisonRefAddrs.insert(lower);
-            m_poisonRefSigs.insert(addrSignature(lower));
-        }
+        m_poisonRefs = PoisonRefs{};
+        for (const QString &a : m_ownAddresses)
+            addOwnRef(m_poisonRefs, a.toLower());
         m_poisonRows = 0;
     }
     for (int i = m_poisonRows; i < n; ++i)
-        addPoisonRef(m_allItems.at(i), m_facts.at(i), m_knownTokens, m_poisonRefAddrs,
-                     m_poisonRefSigs);
+        addPoisonRef(m_allItems.at(i), m_facts.at(i), m_knownTokens, m_poisonRefs);
     m_poisonRows = n;
+}
+
+void HistoryModel::addOwnRef(PoisonRefs &refs, const QString &addrLower) {
+    if (!isEvmAddress(addrLower))
+        return;
+    const QString sig = addrSignature(addrLower);
+    refs.addrs.insert(addrLower);
+    refs.sigs.insert(sig);
+    refs.sentAddrs.insert(addrLower);
+    refs.sentSigs.insert(sig);
 }
 
 HistoryModel::Prepared HistoryModel::prepare(QVector<HistoryItem> rows, QSet<QString> own,
                                              QSet<QString> known) {
+    // A token send is one transaction, which the explorer lists twice: the call itself - zero ether
+    // to the token contract - and the transfer it made. The core now folds the first into the second;
+    // rows cached before it did still carry both, so restoring them would bring back a "Sent 0 ETH"
+    // beside every token send.
+    {
+        QSet<QString> tokenSends;
+        for (const HistoryItem &h : rows)
+            if (h.kind.isEmpty() && !h.token.isEmpty() && h.direction == QLatin1String("out") &&
+                !h.txHash.isEmpty())
+                tokenSends.insert(h.txHash.toLower());
+        if (!tokenSends.isEmpty())
+            rows.erase(std::remove_if(rows.begin(), rows.end(),
+                                      [&](const HistoryItem &h) {
+                                          return h.kind.isEmpty() && h.token.isEmpty() &&
+                                                 h.direction == QLatin1String("out") && !h.failed &&
+                                                 (h.amount.isEmpty() || h.amount == QLatin1String("0")) &&
+                                                 tokenSends.contains(h.txHash.toLower());
+                                      }),
+                       rows.end());
+    }
     Prepared p;
     p.fetchedAt.reserve(rows.size());
     for (int i = 0; i < rows.size(); ++i)
@@ -196,15 +225,10 @@ HistoryModel::Prepared HistoryModel::prepare(QVector<HistoryItem> rows, QSet<QSt
     p.facts.reserve(rows.size() + 2048);
     for (const HistoryItem &h : rows)
         p.facts.append(factsFor(h));
-    for (const QString &a : own) {
-        const QString lower = a.toLower();
-        if (!isEvmAddress(lower))
-            continue;
-        p.refAddrs.insert(lower);
-        p.refSigs.insert(addrSignature(lower));
-    }
+    for (const QString &a : own)
+        addOwnRef(p.refs, a.toLower());
     for (int i = 0; i < rows.size(); ++i)
-        addPoisonRef(rows.at(i), p.facts.at(i), known, p.refAddrs, p.refSigs);
+        addPoisonRef(rows.at(i), p.facts.at(i), known, p.refs);
     const auto owned = [&rows]() {
         QVector<HistoryItem> copy;
         copy.reserve(rows.size() + 2048); // a few accounts' worth of new rows before any regrowth
@@ -235,8 +259,7 @@ void HistoryModel::adoptPrepared(Prepared p) {
         ++m_filterInputs;
         // The index is only valid for the sets it was built against, which may have moved since.
         if (p.ownAddresses == m_ownAddresses && p.knownTokens == m_knownTokens) {
-            m_poisonRefAddrs = std::move(p.refAddrs);
-            m_poisonRefSigs = std::move(p.refSigs);
+            m_poisonRefs = std::move(p.refs);
             m_poisonRows = m_allItems.size();
         } else {
             m_poisonRows = -1;
@@ -259,9 +282,17 @@ bool HistoryModel::isHiddenSpam(const HistoryItem &h, const RowFacts &f) const {
     // as a real address, but not that address. Only incoming transfers are gated, so a genuine
     // outgoing send to a coincidentally similar address is never hidden. This catches spoofs that
     // carry a nonzero/dust value, which the zero-value and unknown-token rules miss.
-    if (h.direction == QLatin1String("in") && f.evm &&
-        !m_poisonRefAddrs.contains(f.counterpartyLower) && m_poisonRefSigs.contains(f.sig))
-        return true;
+    //
+    // Checked first against the addresses the wallet itself has paid, which only its own sends can
+    // put there. The wider set also trusts anyone who sent the wallet a real token - so a look-alike
+    // that sends a cent of real USDC vouches for itself there, and only this check still sees it.
+    if (h.direction == QLatin1String("in") && f.evm) {
+        if (!m_poisonRefs.sentAddrs.contains(f.counterpartyLower) &&
+            m_poisonRefs.sentSigs.contains(f.sig))
+            return true;
+        if (!m_poisonRefs.addrs.contains(f.counterpartyLower) && m_poisonRefs.sigs.contains(f.sig))
+            return true;
+    }
     // Dust filter: hide incoming transfers worth less than the configured USD threshold. Only
     // applied when we actually have a positive price for the asset, so legit transfers aren't
     // hidden just because prices haven't loaded yet.
@@ -280,8 +311,7 @@ bool HistoryModel::isHiddenSpam(const HistoryItem &h) const {
 bool HistoryModel::isSuspicious(int row) const {
     if (row < 0 || row >= m_items.size())
         return false;
-    // Once spam/poisoning are filtered out, the only de-emphasised rows left are failed txs.
-    return m_items.at(row).failed;
+    return m_items.at(row).failed || m_itemSpam.value(row);
 }
 
 // True if this row matches the search box on any visible column. m_search is pre-lowercased, and so
@@ -522,15 +552,23 @@ void HistoryModel::reslice() {
     m_page = qBound(0, m_page, pages - 1);
     beginResetModel();
     m_items.clear();
+    m_itemSpam.clear();
     const int start = m_page * m_pageSize;
     const int end = qMin(total, start + m_pageSize);
     m_items.reserve(qMax(0, end - start));
+    m_itemSpam.reserve(qMax(0, end - start));
     // Positions are checked because rows can be removed between a rebuild and a page change; a
     // stale position must drop out of the page rather than read past the end of the rows.
     for (int i = start; i < end; ++i) {
         const int at = m_filtered.at(i);
-        if (at >= 0 && at < m_allItems.size())
-            m_items.append(m_allItems.at(at));
+        if (at >= 0 && at < m_allItems.size()) {
+            const HistoryItem &h = m_allItems.at(at);
+            m_items.append(h);
+            // On screen only because spam is not being hidden. Such a row is marked rather than drawn
+            // like the rest: a poisoning transfer copies the amount of a real send, and the look-alike
+            // address beside it is the one the attacker wants copied.
+            m_itemSpam.append(!m_hideSpam && at < m_facts.size() && isHiddenSpam(h, m_facts.at(at)));
+        }
     }
     endResetModel();
     emit pageChanged(m_page, pages, total);
@@ -699,8 +737,7 @@ void HistoryModel::setKnownTokens(const QSet<QString> &tokens) {
         const QSet<QString> added = lower - m_knownTokens;
         for (int i = 0; i < m_allItems.size(); ++i)
             if (added.contains(m_facts.at(i).tokenLower))
-                addPoisonRef(m_allItems.at(i), m_facts.at(i), lower, m_poisonRefAddrs,
-                             m_poisonRefSigs);
+                addPoisonRef(m_allItems.at(i), m_facts.at(i), lower, m_poisonRefs);
     } else {
         m_poisonRows = -1;
     }
@@ -721,12 +758,8 @@ void HistoryModel::setOwnAddresses(const QSet<QString> &addrs) {
     // A new account only adds an address to the look-alike index; add it rather than rebuilding the
     // index from every row. A removed address starts it over.
     if (m_poisonRows >= 0 && lower.contains(m_ownAddresses)) {
-        for (const QString &a : lower - m_ownAddresses) {
-            if (!isEvmAddress(a))
-                continue;
-            m_poisonRefAddrs.insert(a);
-            m_poisonRefSigs.insert(addrSignature(a));
-        }
+        for (const QString &a : lower - m_ownAddresses)
+            addOwnRef(m_poisonRefs, a);
     } else {
         m_poisonRows = -1;
     }
@@ -766,8 +799,8 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
     }
 
     if (role == Qt::ForegroundRole) {
-        if (h.failed)
-            return QBrush(QColor(0x80, 0x80, 0x80)); // grey out failed (reverted) txs
+        if (h.failed || m_itemSpam.value(index.row()))
+            return QBrush(QColor(0x80, 0x80, 0x80)); // grey out failed (reverted) txs, and spam
         if (h.kind == QLatin1String("swap")) {
             // Pending swaps are muted; otherwise use the default text colour (no red/green).
             if (h.status == QLatin1String("pending"))
@@ -794,6 +827,9 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
                       "interact with it.");
         if (isPoisoning(h))
             return tr("Possible address-poisoning: zero-value transfer. Do not trust this address.");
+        if (m_itemSpam.value(index.row()))
+            return tr("Hidden as spam: dust, or a transfer from an address made to look like one "
+                      "you have used. Never copy an address from this row.");
         return h.txHash;
     }
 
@@ -845,6 +881,8 @@ QVariant HistoryModel::data(const QModelIndex &index, int role) const {
                 if (h.status == QLatin1String("failed") || h.failed) return tr("Swap · failed");
                 return tr("Swap");
             }
+            if (m_itemSpam.value(index.row()))
+                return tr("Spam");
             return h.failed ? tr("Failed")
                             : (h.direction == "in" ? tr("Received") : tr("Sent"));
         case Column_Amount:

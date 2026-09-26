@@ -327,6 +327,29 @@ int main(int argc, char **argv) {
     report("parse the whole metadata blob (opening the wallet, once)",
            timed([&] { (void)QJsonDocument::fromJson(blob); }));
 
+    // The balance cache, rebuilt from the window's hashes after every whole-wallet sweep: every token
+    // read for every account, zeros included - on an L2 that is the tracked tokens plus the chain's
+    // curated ones.
+    QHash<QString, double> tokenBalances;
+    for (int a = 0; a < kAccounts; ++a)
+        for (int t = 0; t < 16; ++t)
+            tokenBalances.insert(QStringLiteral("%1|0x%2").arg(a).arg(t, 40, 16, QLatin1Char('0')),
+                                 t % 4 ? 0.0 : 12.5);
+    const qint64 fromHashMs = timed([&] {
+        QJsonObject tok;
+        for (auto it = tokenBalances.constBegin(); it != tokenBalances.constEnd(); ++it)
+            tok[it.key()] = it.value();
+    });
+    std::printf("                   (%lld token balances; filled straight from the hash, as before: %lld ms)\n",
+                static_cast<long long>(tokenBalances.size()), static_cast<long long>(fromHashMs));
+    report("balance cache: token balances, keys sorted first", timed([&] {
+               QStringList keys = tokenBalances.keys();
+               std::sort(keys.begin(), keys.end());
+               QJsonObject tok;
+               for (const QString &k : keys)
+                   tok.insert(k, tokenBalances.value(k));
+           }));
+
     std::printf("\nworst single UI-thread operation: %d ms\n", worstMs);
 
     // The stall log is how a freeze on a real wallet gets found, so check that it finds one: block

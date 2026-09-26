@@ -562,6 +562,61 @@ void Wallet::fetchAvailable(quint32 index, const QString &token) {
     });
 }
 
+namespace {
+struct SweptBalance {
+    quint32 index = 0;
+    bool native = false;
+    QString token;
+    QString formatted;
+    QString symbol;
+};
+
+// Parsed on the worker, so the UI thread only walks a flat list. Only reads that actually succeeded
+// are kept: a failed RPC read is dropped so the UI keeps its cached balance instead of flickering to
+// 0 and firing a spurious "payment received" on the next good read. (A missing "ok" counts as
+// success, for an older core.)
+QVector<SweptBalance> parseBalanceSweep(const QString &json) {
+    QVector<SweptBalance> rows;
+    const QJsonObject root = QJsonDocument::fromJson(json.toUtf8()).object();
+    for (const QJsonValue &av : root.value(QStringLiteral("accounts")).toArray()) {
+        const QJsonObject a = av.toObject();
+        const quint32 idx = static_cast<quint32>(a.value(QStringLiteral("index")).toDouble());
+        if (a.value(QStringLiteral("native_ok")).toBool(true)) {
+            SweptBalance b;
+            b.index = idx;
+            b.native = true;
+            b.formatted = a.value(QStringLiteral("native_formatted")).toString();
+            b.symbol = a.value(QStringLiteral("native_symbol")).toString();
+            rows.append(std::move(b));
+        }
+        for (const QJsonValue &tv : a.value(QStringLiteral("tokens")).toArray()) {
+            const QJsonObject t = tv.toObject();
+            if (!t.value(QStringLiteral("ok")).toBool(true)) continue;
+            SweptBalance b;
+            b.index = idx;
+            b.token = t.value(QStringLiteral("address")).toString();
+            b.formatted = t.value(QStringLiteral("formatted")).toString();
+            b.symbol = t.value(QStringLiteral("symbol")).toString();
+            rows.append(std::move(b));
+        }
+    }
+    return rows;
+}
+
+void emitBalanceSweep(Wallet *w, const QVector<SweptBalance> &rows, quint64 chain) {
+    for (const SweptBalance &b : rows) {
+        if (b.native) {
+            // Native balance: drives Home total, AddressModel, notifications, status bar...
+            emit w->accountBalanceUpdated(b.index, b.formatted, b.symbol, chain);
+            // ...and the Send "available" label when the native asset is selected (token "").
+            emit w->availableBalance(b.index, QString(), b.formatted, b.symbol, chain);
+        } else {
+            emit w->availableBalance(b.index, b.token, b.formatted, b.symbol, chain);
+        }
+    }
+}
+} // namespace
+
 void Wallet::refreshAllBalances(quint32 numAccounts, const QString &extraTokensJson) {
     if (numAccounts == 0) numAccounts = 1;
     QtConcurrent::run(&m_netPool, [this, numAccounts, extraTokensJson]() {
@@ -575,34 +630,37 @@ void Wallet::refreshAllBalances(quint32 numAccounts, const QString &extraTokensJ
                                                extraTokensJson.toUtf8().constData());
             if (j) json = takeString(j);
         }
-        QMetaObject::invokeMethod(this, [this, json, chain]() {
-            const QJsonObject root = QJsonDocument::fromJson(json.toUtf8()).object();
-            const QJsonArray accts = root.value(QStringLiteral("accounts")).toArray();
-            for (const QJsonValue &av : accts) {
-                const QJsonObject a = av.toObject();
-                const quint32 idx = static_cast<quint32>(a.value(QStringLiteral("index")).toDouble());
-                const QString nativeSym = a.value(QStringLiteral("native_symbol")).toString();
-                const QString nativeFmt = a.value(QStringLiteral("native_formatted")).toString();
-                // Only propagate reads that actually succeeded. A failed RPC read (native_ok=false)
-                // is skipped so the UI keeps its cached balance instead of flickering to 0 and
-                // firing a spurious "payment received" on the next good read. (Default true keeps
-                // back-compat with an older core.)
-                if (a.value(QStringLiteral("native_ok")).toBool(true)) {
-                    // Native balance: drives Home total, AddressModel, notifications, status bar...
-                    emit accountBalanceUpdated(idx, nativeFmt, nativeSym, chain);
-                    // ...and the Send "available" label when the native asset is selected (token "").
-                    emit availableBalance(idx, QString(), nativeFmt, nativeSym, chain);
-                }
-                for (const QJsonValue &tv : a.value(QStringLiteral("tokens")).toArray()) {
-                    const QJsonObject t = tv.toObject();
-                    if (!t.value(QStringLiteral("ok")).toBool(true))
-                        continue; // failed token read -> keep cached value
-                    emit availableBalance(idx, t.value(QStringLiteral("address")).toString(),
-                                          t.value(QStringLiteral("formatted")).toString(),
-                                          t.value(QStringLiteral("symbol")).toString(), chain);
-                }
-            }
+        const QVector<SweptBalance> rows = parseBalanceSweep(json);
+        QMetaObject::invokeMethod(this, [this, rows, chain]() {
+            emitBalanceSweep(this, rows, chain);
             emit allBalancesRefreshed(chain);
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Wallet::refreshBalancesFor(const QList<quint32> &indices, const QString &extraTokensJson) {
+    if (indices.isEmpty()) return;
+    QtConcurrent::run(&m_netPool, [this, indices, extraTokensJson]() {
+        yieldToWriter();
+        QJsonArray arr;
+        for (quint32 i : indices) arr.append(static_cast<double>(i));
+        const QByteArray indicesJson = QJsonDocument(arr).toJson(QJsonDocument::Compact);
+        QString json;
+        quint64 chain;
+        bool ok;
+        {
+            QReadLocker lock(&m_coreLock);
+            chain = m_chainId;
+            char *j = aero_wallet_balances_for(m_core, indicesJson.constData(),
+                                               extraTokensJson.toUtf8().constData());
+            ok = j != nullptr;
+            if (j) json = takeString(j);
+            else (void)takeLastError();
+        }
+        const QVector<SweptBalance> rows = parseBalanceSweep(json);
+        QMetaObject::invokeMethod(this, [this, rows, chain, ok]() {
+            emitBalanceSweep(this, rows, chain);
+            emit balancesForRefreshed(chain, ok);
         }, Qt::QueuedConnection);
     });
 }
@@ -720,9 +778,21 @@ void Wallet::txReceipt(const QString &txHash) {
     });
 }
 
-// Parse a aero_wallet_account_history JSON array (already ownership-taken) into HistoryItems.
-static void parseHistoryArray(const QString &json, QVector<HistoryItem> &out) {
-    const QJsonArray arr = QJsonDocument::fromJson(json.toUtf8()).array();
+// Parse history JSON (already ownership-taken) into HistoryItems. aero_wallet_account_history answers
+// `{items, complete}`; the other history calls, and an older core, answer a bare array, which counts
+// as complete. Returns whether the explorer read every list to its end.
+static bool parseHistoryArray(const QString &json, QVector<HistoryItem> &out) {
+    const QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
+    bool complete = true;
+    QJsonArray arr;
+    if (doc.isObject()) {
+        const QJsonObject root = doc.object();
+        arr = root.value(QStringLiteral("items")).toArray();
+        complete = root.value(QStringLiteral("complete")).toBool(true);
+    } else {
+        arr = doc.array();
+    }
+    out.reserve(out.size() + arr.size());
     for (const QJsonValue &v : arr) {
         const QJsonObject o = v.toObject();
         HistoryItem h;
@@ -744,6 +814,7 @@ static void parseHistoryArray(const QString &json, QVector<HistoryItem> &out) {
         h.expiry = static_cast<quint64>(o.value("expiry").toDouble());
         out.append(h);
     }
+    return complete;
 }
 
 void Wallet::refreshHistory(quint32 accountIndex, const QString &fromBlock) {
@@ -756,8 +827,9 @@ void Wallet::refreshHistory(quint32 accountIndex, const QString &fromBlock) {
         QVector<HistoryItem> items;
         char *j = aero_wallet_account_history(m_core, accountIndex);
         const bool ok = j != nullptr; // null = the explorer could not be read, NOT "no transactions"
+        bool complete = ok;
         if (j)
-            parseHistoryArray(takeString(j), items);
+            complete = parseHistoryArray(takeString(j), items);
         // Merge CoW Protocol swaps (pending + historical) for this account: they aren't on-chain
         // transfers, so the explorer never lists them.
         mergeCowOrders(accountIndex, items);
@@ -766,7 +838,8 @@ void Wallet::refreshHistory(quint32 accountIndex, const QString &fromBlock) {
         std::sort(items.begin(), items.end(),
                   [](const HistoryItem &a, const HistoryItem &b) { return a.timestamp > b.timestamp; });
         QMetaObject::invokeMethod(
-            this, [this, items, chain, ok]() { emit historyRefreshed(items, chain, ok); },
+            this,
+            [this, items, chain, ok, complete]() { emit historyRefreshed(items, chain, ok, complete); },
             Qt::QueuedConnection);
     });
 }
@@ -872,21 +945,24 @@ void Wallet::refreshAccountHistory(quint32 accountIndex) {
         QVector<HistoryItem> part;
         quint64 chain;
         bool ok;
+        bool complete;
         {
             yieldToWriter(); // let a pending add/import account in before we hold the read lock over Tor
             QReadLocker lock(&m_coreLock);
             chain = m_chainId;
             char *j = aero_wallet_account_history(m_core, accountIndex);
             ok = j != nullptr; // null = explorer unreachable/rate-limited, NOT "no transactions"
+            complete = ok;
             if (j)
-                parseHistoryArray(takeString(j), part);
+                complete = parseHistoryArray(takeString(j), part);
             mergeCowOrders(accountIndex, part);
             for (HistoryItem &h : part)
                 h.account = accountIndex;
         }
         QMetaObject::invokeMethod(this,
-                                  [this, accountIndex, part, chain, ok]() {
-                                      emit accountHistoryReady(accountIndex, part, chain, ok);
+                                  [this, accountIndex, part, chain, ok, complete]() {
+                                      emit accountHistoryReady(accountIndex, part, chain, ok,
+                                                               complete);
                                   },
                                   Qt::QueuedConnection);
     });

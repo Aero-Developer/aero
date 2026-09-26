@@ -811,15 +811,25 @@ impl Wallet {
     /// Send/Swap pickers show balances immediately without the user having to permanently track each
     /// token. Extras are fetched, never persisted.
     pub async fn all_balances(&self, num_accounts: u32, extra_tokens_json: &str) -> Result<serde_json::Value> {
+        let indices: Vec<u32> = (0..num_accounts.max(1)).collect();
+        self.balances_for(&indices, extra_tokens_json).await
+    }
+
+    /// `all_balances` for just the given accounts, in the same shape. This is the read that keeps the
+    /// account in front of the user current: every token for one account is a handful of calls in a
+    /// single request, where a whole-wallet sweep of a large wallet is thousands.
+    pub async fn balances_for(&self, indices: &[u32], extra_tokens_json: &str) -> Result<serde_json::Value> {
         let provider = self.provider()?;
         let native_symbol = chain_info(provider.chain_id()).native_symbol.to_string();
-        let n = num_accounts.max(1);
 
         // Resolve every account address once (works for both software and hardware - the latter
         // reads its cached device addresses, no device round-trip here).
         // A single unresolvable account must not blank every balance - skip it rather than error.
-        let mut addrs: Vec<(u32, Address)> = Vec::with_capacity(n as usize);
-        for i in 0..n {
+        let mut addrs: Vec<(u32, Address)> = Vec::with_capacity(indices.len());
+        for &i in indices {
+            if addrs.iter().any(|(j, _)| *j == i) {
+                continue;
+            }
             if let Ok(a) = self.address(i).and_then(|s| parse_address(&s)) {
                 addrs.push((i, a));
             }
@@ -4052,6 +4062,14 @@ impl Wallet {
     /// (Etherscan-compatible, keyless) API over the same Tor transport. Chains without a keyless
     /// explorer (see `chains::chain_info`) return an empty history.
     pub async fn account_history(&self, index: u32) -> Result<Vec<HistoryItem>> {
+        self.account_history_checked(index).await.map(|(items, _)| items)
+    }
+
+    /// `account_history`, and whether every list was read to its end. `false` means an explorer
+    /// stopped answering partway, so the rows are real but may be missing the newest ones - and a
+    /// caller that records "this account's history is current" must not do so on that answer, or a
+    /// transfer the explorer failed to return is never asked about again.
+    pub async fn account_history_checked(&self, index: u32) -> Result<(Vec<HistoryItem>, bool)> {
         let provider = self.provider()?;
         let info = chain_info(provider.chain_id());
         let owner = self.address(index)?.to_lowercase();
@@ -4076,11 +4094,12 @@ impl Wallet {
         // Fetch the three explorer lists CONCURRENTLY (they're independent) instead of one after
         // another - cuts an account's history latency to roughly that of a single list. Bounded by
         // the global RPC semaphore so the fan-out never floods Tor.
-        let (txlist, tokentx, internal) = tokio::join!(
+        let ((txlist, txlist_done), (tokentx, tokentx_done), (internal, internal_done)) = tokio::join!(
             fetch_list(provider, &bases, "txlist", &owner),
             fetch_list(provider, &bases, "tokentx", &owner),
             fetch_list(provider, &bases, "txlistinternal", &owner),
         );
+        let complete = txlist_done && tokentx_done && internal_done;
 
         // Native ETH transactions - ALL pages, so an old wallet's early history (e.g. 2021) isn't
         // truncated to the most recent 100.
@@ -4202,9 +4221,9 @@ impl Wallet {
         // Collapse on-chain swaps into a single "Swap A -> B" row: any tx where the owner both sent
         // asset A and received asset B (a router swap). CoW settlements are skipped here - they are
         // surfaced (with richer status) via `cow_orders`.
-        let items = group_swaps(items);
+        let items = fold_token_call_rows(group_swaps(items));
 
-        Ok(items)
+        Ok((items, complete))
     }
 
     /// Symbol + decimals for a token address from the tracked list; falls back to a short address
@@ -4680,7 +4699,7 @@ async fn fetch_list(
     bases: &[String],
     action: &str,
     owner: &str,
-) -> Vec<serde_json::Value> {
+) -> (Vec<serde_json::Value>, bool) {
     let mut best: Vec<serde_json::Value> = Vec::new();
     for (i, base) in bases.iter().enumerate() {
         if crate::provider::shutting_down() {
@@ -4697,7 +4716,7 @@ async fn fetch_list(
         let (rows, complete) = fetch_all_pages(provider, &query, action, owner, retries).await;
         if complete {
             crate::explorers::mark_healthy(base);
-            return rows;
+            return (rows, true);
         }
         crate::explorers::park(base);
         // Keep whatever the fullest attempt managed, in case every base is having a bad day.
@@ -4705,7 +4724,7 @@ async fn fetch_list(
             best = rows;
         }
     }
-    best
+    (best, false)
 }
 
 async fn fetch_all_pages(
@@ -4924,6 +4943,39 @@ fn group_swaps(items: Vec<HistoryItem>) -> Vec<HistoryItem> {
     result.append(&mut swaps);
     result.sort_by(|a, b| b.block.cmp(&a.block));
     result
+}
+
+/// A token send is one transaction, but the explorer lists it twice: the transaction itself - zero
+/// ether to the token contract, carrying the gas fee - and the Transfer it emitted. Shown as they
+/// come, every USDC send read as a "Sent 0 ETH" to the USDC contract beside the real one. Fold the
+/// fee into the transfer and drop the empty call. A call with no transfer of the owner's tokens -
+/// an approval, or one that reverted - is left alone: it is the only record of that transaction.
+fn fold_token_call_rows(mut items: Vec<HistoryItem>) -> Vec<HistoryItem> {
+    use std::collections::HashMap;
+    let mut token_send: HashMap<String, usize> = HashMap::new();
+    for (i, h) in items.iter().enumerate() {
+        if h.kind.is_empty() && !h.token.is_empty() && h.direction == "out" && !h.tx_hash.is_empty() {
+            token_send.entry(h.tx_hash.to_lowercase()).or_insert(i);
+        }
+    }
+    if token_send.is_empty() {
+        return items;
+    }
+    let mut drop = vec![false; items.len()];
+    for i in 0..items.len() {
+        let h = &items[i];
+        if !(h.kind.is_empty() && h.token.is_empty() && h.direction == "out" && h.amount == "0" && !h.failed) {
+            continue;
+        }
+        let Some(&t) = token_send.get(&h.tx_hash.to_lowercase()) else {
+            continue;
+        };
+        if items[t].fee.is_empty() {
+            items[t].fee = items[i].fee.clone();
+        }
+        drop[i] = true;
+    }
+    items.into_iter().zip(drop).filter(|(_, d)| !d).map(|(h, _)| h).collect()
 }
 
 /// Read a redemption amount, rejecting anything that is not a positive finite number.
@@ -5470,6 +5522,33 @@ mod tests {
                 "truncated calldata");
     }
 
+    #[test]
+    fn a_token_send_is_one_row_not_a_zero_ether_call_beside_it() {
+        const USDC: &str = "0xaf88d065e77c8cc2239327c5edb3a432268e5831";
+        let row = |dir: &str, amount: &str, token: &str, tx: &str, fee: &str, failed: bool| HistoryItem {
+            direction: dir.into(),
+            counterparty: "0x1111111111111111111111111111111111111111".into(),
+            amount: amount.into(),
+            token: token.into(),
+            symbol: if token.is_empty() { "ETH".into() } else { "USDC".into() },
+            tx_hash: tx.into(),
+            fee: fee.into(),
+            failed,
+            ..Default::default()
+        };
+        let rows = fold_token_call_rows(vec![
+            row("out", "0", "", "0xaaa", "21000", false),         // the call carrying the send
+            row("out", "150000000000", USDC, "0xAAA", "", false), // the transfer it made
+            row("out", "0", "", "0xbbb", "5000", false),          // an approval: nothing else to show
+            row("out", "0", "", "0xccc", "7000", true),           // a send that reverted
+        ]);
+        assert_eq!(rows.len(), 3, "only the call beside its own transfer goes");
+        assert_eq!(rows[0].symbol, "USDC");
+        assert_eq!(rows[0].fee, "21000", "the transfer carries the fee its call paid");
+        assert_eq!(rows[1].tx_hash, "0xbbb");
+        assert!(rows[2].failed);
+    }
+
     /// A loopback explorer that answers every request with `body`, for exercising the failover
     /// without waiting for a real one to break.
     fn serve_explorer(body: &'static str) -> String {
@@ -5517,8 +5596,9 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let bases = crate::explorers::bases(CHAIN);
-        let rows = rt.block_on(fetch_list(&provider, &bases, "txlist", "0xdead"));
+        let (rows, complete) = rt.block_on(fetch_list(&provider, &bases, "txlist", "0xdead"));
         assert_eq!(rows.len(), 1, "should have read the list from the second explorer");
+        assert!(complete, "the second explorer read the list to its end");
 
         // And the one that refused is remembered, so the next of the wallet's accounts starts on the
         // explorer that works instead of spending its retries discovering the same thing again.

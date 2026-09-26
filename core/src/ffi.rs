@@ -802,6 +802,27 @@ pub extern "C" fn aero_wallet_all_balances(
     block_json(w, |w| RUNTIME.block_on(w.all_balances(num_accounts, &extras)))
 }
 
+/// `aero_wallet_all_balances` for just the accounts in `indices_json` (a JSON array of account
+/// indices), in the same shape. Caller frees the string.
+#[no_mangle]
+pub extern "C" fn aero_wallet_balances_for(
+    w: *mut Wallet,
+    indices_json: *const c_char,
+    extra_tokens_json: *const c_char,
+) -> *mut c_char {
+    let indices: Vec<u32> = match from_cstr(indices_json)
+        .and_then(|s| serde_json::from_str::<Vec<u32>>(&s).ok())
+    {
+        Some(v) => v,
+        None => {
+            set_error("indices must be a JSON array of account numbers");
+            return ptr::null_mut();
+        }
+    };
+    let extras = from_cstr(extra_tokens_json).unwrap_or_default();
+    block_json(w, |w| RUNTIME.block_on(w.balances_for(&indices, &extras)))
+}
+
 /// ERC20 balance as JSON `BalanceInfo`. Caller frees the string.
 #[no_mangle]
 pub extern "C" fn aero_wallet_erc20_balance(
@@ -1683,11 +1704,14 @@ pub extern "C" fn aero_wallet_erc20_history(
 }
 
 /// Full account history (native ETH + all ERC20 transfers) for `index`, fetched from a block
-/// explorer over Tor, as a JSON array of `HistoryItem`. Caller frees the string.
+/// explorer over Tor, as JSON `{ items: [HistoryItem], complete }`. `complete` is false when an
+/// explorer stopped answering partway, so the newest rows may be missing. Caller frees the string.
 #[no_mangle]
 pub extern "C" fn aero_wallet_account_history(w: *mut Wallet, index: u32) -> *mut c_char {
     block_json(w, |w| {
-        RUNTIME.block_on(crate::provider::background(w.account_history(index)))
+        RUNTIME
+            .block_on(crate::provider::background(w.account_history_checked(index)))
+            .map(|(items, complete)| serde_json::json!({ "items": items, "complete": complete }))
     })
 }
 

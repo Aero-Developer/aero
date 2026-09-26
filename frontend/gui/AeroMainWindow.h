@@ -143,7 +143,7 @@ private:
     // therefore dropped rather than queued behind it.
     bool refreshAllBalances();
     // Whether the batched balance read is small enough to also carry this chain's curated tokens.
-    // When it isn't, only the selected account's curated balances are fetched separately.
+    // When it isn't, refreshHotBalances() reads them for a slice of accounts at a time.
     bool batchIncludesCuratedTokens() const;
     void recomputeHomeTotal();
     void scheduleHomeRecompute();     // debounced recompute (coalesces bulk balance updates)
@@ -186,7 +186,20 @@ private:
     void ensureFundedAndLabeledHistory();
     void refreshDirtyHistory();            // refetch only accounts whose balance changed (per block)
     void onAccountHistoryReady(quint32 index, const QVector<HistoryItem> &items, quint64 chainId,
-                               bool ok);   // append targeted
+                               bool ok, bool complete); // append targeted
+    // What each account holds on this chain as one figure - native plus every token read for it -
+    // which is what an account's history is fetched against (see m_histStatus).
+    QHash<quint32, double> holdingsByAccount() const;
+    double holdingsOf(quint32 index) const;
+    // After a balance read: queue a history fetch for every account whose holdings differ from what
+    // they were when its history was fetched, or that holds something and has never been fetched.
+    // `live` is false for the read that replaces last session's cached figures: a difference then is
+    // old activity the explorer has long since indexed, so it needs no follow-ups.
+    void markHistoryWhereHoldingsMoved(bool live);
+    // The explorer indexes a block some time after the node serves it, so the fetch prompted by a
+    // balance change often comes back without the transfer that caused it. Ask again on a widening
+    // schedule until a fetch brings something new.
+    void scheduleHistoryFollowUp(quint32 index);
     // An account whose history could not be read is queued here and tried again shortly. Without it,
     // one unreachable explorer response permanently left that account blank for the session.
     void scheduleHistoryRetry(quint32 index);
@@ -241,10 +254,21 @@ private:
         bool active = false;   // a deposit is broadcasting
         bool approving = false; // an approval is broadcasting
         quint32 account = 0;   // the account it is sent FROM (frozen when the dialog opened)
+        quint64 origin = 0;    // chain it is broadcast on
         quint64 dest = 0;      // destination chain id
         QString symbol, amountHuman, tokenAddr, to;
     };
     PendingBridge m_pendingBridge;
+    // Where a broadcast bridge will deliver. While one is due, that account is read with the selected
+    // one on every block whenever Aero is on the destination chain, so the funds show up as they land.
+    struct BridgeDelivery {
+        quint64 chain = 0;
+        quint32 account = 0;
+        qint64 untilMs = 0;
+    };
+    QVector<BridgeDelivery> m_bridgeDeliveries;
+    void onDestinationChainReached(); // history follow-ups for deliveries due on the chain now shown
+    bool deliveryDue(quint32 account) const; // a bridge is delivering to this account on this chain
     QPointer<QDialog> m_bridgeDialog;      // only one bridge dialog at a time
     void onBridgeBroadcast(const QString &txHash, const QString &err);
     void onBridgeApproveBroadcast(const QString &txHash, const QString &err);
@@ -291,11 +315,12 @@ private:
     QString accountLabelWith(quint32 index, const QString &balanceStr) const; // label w/ a given balance
     void refreshAccountCombosText(); // re-label the Send/Swap "From" combos (native or USD per toggle)
     void updateReceive();
-    // Fetch the CURRENT account's curated-token balances (e.g. Arbitrum USDC) on demand. The batched
-    // refresh skips curated tokens on large wallets to stay under the RPC budget, which left the
-    // selected account's USDC missing from Receive; this tops it up for one account only, so it is
-    // cheap enough to run on connect and on account change.
-    void fetchCuratedForCurrentAccount();
+    // Everything the accounts that must be current right now hold - the selected account, and any
+    // account a bridge is delivering to on this chain - in one batched read with this chain's curated
+    // tokens. `withSlice` adds the next slice of the wallet's other accounts, so on a wallet too big
+    // to read curated tokens for every account at once, each account's are still read regularly.
+    void refreshHotBalances(bool withSlice = false);
+    QString curatedTokensJson() const; // this chain's curated tokens, as the balance reads' extras
     void ensureMinAddresses(quint32 count);
     void selectAddressRow(quint32 index);
     void applyReceiveSearch(); // re-hide Receive rows per the search box (survives model resets)
@@ -476,7 +501,19 @@ private:
     QSet<quint32> m_histRetry;                 // failed reads, awaiting the retry timer
     QTimer *m_histRetryTimer = nullptr;        // one-shot, coalesces a burst of failures
     QSet<quint32> m_dirtyHistory;              // accounts whose balance changed -> need a targeted refetch
-    QHash<quint32, double> m_histStatus;       // account balance when its history was last fetched (status gate)
+    QHash<quint32, double> m_histStatus;       // account holdings when its history was last fetched (status gate)
+    // Baselines restored from a cache written before they covered tokens: native balance only, so
+    // they are compared on that until the first read replaces them.
+    QSet<quint32> m_histStatusNativeOnly;
+    struct HistFollowUp {
+        qint64 dueMs = 0;
+        int step = 0;
+    };
+    QHash<quint32, HistFollowUp> m_histFollowUps;
+    QTimer *m_histFollowUpTimer = nullptr;
+    QSet<quint32> m_firstReadThisBatch; // accounts with a balance seen for the first time in this read
+    QHash<quint32, int> m_histIncomplete; // consecutive partial history reads, per account
+    bool m_histUnavailableShown = false;  // the "history unavailable" note is up
     quint64 m_historyLoadedChain = ~Q_UINT64_C(0); // chain the history view was (re)loaded for
     // Per-chain history, already converted out of JSON. Restoring a chain's rows on a switch, and
     // carrying forward the accounts a save didn't cover, both walked up to 30,000 stored rows
@@ -502,6 +539,10 @@ private:
     int m_blocksSinceFullSweep = 0;            // large wallets: blocks since the last all-account read
     bool m_balanceSweepInFlight = false;       // a batched balance read is out; don't stack another
     qint64 m_balanceSweepStartedMs = 0;        // when, so a lost sweep can't block sweeps for good
+    bool m_hotInFlight = false;                // the same, for refreshHotBalances()
+    qint64 m_hotStartedMs = 0;
+    QTimer *m_hotAccountTimer = nullptr;       // settles a run of account changes into one read
+    quint32 m_curatedSliceStart = 0;           // next account refreshHotBalances(withSlice) covers
     QTreeView *m_historyView = nullptr;        // the History table (owned by the .ui form)
     QToolButton *m_historyPrev = nullptr;      // pagination: previous 500-row page
     QToolButton *m_historyNext = nullptr;      // pagination: next 500-row page

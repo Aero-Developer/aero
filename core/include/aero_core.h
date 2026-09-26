@@ -465,6 +465,14 @@ char *aero_wallet_all_balances(AeroWallet *w,
                                const char *extra_tokens_json);
 
 /**
+ * `aero_wallet_all_balances` for just the accounts in `indices_json` (a JSON array of account
+ * indices), in the same shape. Caller frees the string.
+ */
+char *aero_wallet_balances_for(AeroWallet *w,
+                               const char *indices_json,
+                               const char *extra_tokens_json);
+
+/**
  * ERC20 balance as JSON `BalanceInfo`. Caller frees the string.
  */
 char *aero_wallet_erc20_balance(AeroWallet *w,
@@ -885,7 +893,8 @@ char *aero_wallet_erc20_history(AeroWallet *w,
 
 /**
  * Full account history (native ETH + all ERC20 transfers) for `index`, fetched from a block
- * explorer over Tor, as a JSON array of `HistoryItem`. Caller frees the string.
+ * explorer over Tor, as JSON `{ items: [HistoryItem], complete }`. `complete` is false when an
+ * explorer stopped answering partway, so the newest rows may be missing. Caller frees the string.
  */
 char *aero_wallet_account_history(AeroWallet *w,
                                   uint32_t index);

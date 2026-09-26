@@ -205,6 +205,8 @@ public:
     // `extraTokensJson` (optional) is a JSON array [{address,symbol,decimals}] of tokens to include
     // in the read (e.g. the current chain's curated tokens) so pickers show balances immediately.
     void refreshAllBalances(quint32 numAccounts, const QString &extraTokensJson = QString());
+    // Async: refreshAllBalances() for just these accounts, then balancesForRefreshed().
+    void refreshBalancesFor(const QList<quint32> &indices, const QString &extraTokensJson = QString());
 
     // Async: emits balanceUpdated() / refreshed() when done.
     void refresh(quint32 accountIndex);
@@ -455,7 +457,9 @@ signals:
     // `ok` distinguishes "the explorer answered and this address has no transactions" from "the
     // explorer could not be reached". They are the same empty list, and treating a failure as an
     // answer is how an account came to be marked loaded while showing nothing.
-    void historyRefreshed(const QVector<HistoryItem> &items, quint64 chainId, bool ok);
+    // `complete` is false when the explorer stopped answering partway: the rows are real, but the
+    // newest may be missing, so the caller should show them and ask again.
+    void historyRefreshed(const QVector<HistoryItem> &items, quint64 chainId, bool ok, bool complete);
     // Emitted (synchronously, on the caller/UI thread) at the very start of an all-account refresh,
     // before any batch is dispatched - the UI clears the model + resets dedup here. This must NOT be
     // driven off "done==1", because with parallel per-account fetches batches complete out of order
@@ -465,9 +469,9 @@ signals:
     // arbitrary order). `done`/`total` drive the progress indicator; done==total is the end.
     void historyBatch(const QVector<HistoryItem> &items, quint32 done, quint32 total, quint64 chainId);
     // Targeted single-account history (refreshAccountHistory): appended to the model, not cleared.
-    // `ok` is false when the explorer could not be read - see historyRefreshed above.
+    // `ok` and `complete` as for historyRefreshed above.
     void accountHistoryReady(quint32 accountIndex, const QVector<HistoryItem> &items, quint64 chainId,
-                             bool ok);
+                             bool ok, bool complete);
     void addressesWarmed(); // emitted after warmAddresses() finishes populating the address cache
     void fundedScanned(const QList<quint32> &indices);
     void accountAdded(quint32 index); // a new HD account was derived (addAccountAsync)
@@ -497,6 +501,8 @@ signals:
                           const QString &symbol, quint64 chainId);
     // Emitted once after a batched refreshAllBalances() has dispatched all per-account signals.
     void allBalancesRefreshed(quint64 chainId);
+    // The same, for refreshBalancesFor(). `ok` is false when the read failed outright.
+    void balancesForRefreshed(quint64 chainId, bool ok);
 
     // ##### CoW swap signals #####
     void swapQuoteReady(const QString &quoteJson, const QString &error);

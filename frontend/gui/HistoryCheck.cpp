@@ -379,6 +379,84 @@ int main(int argc, char **argv) {
               "sorting by value puts the largest first");
     }
 
+    // Address poisoning as it is aimed at wallets that deposit to a bridge: every real send is
+    // followed by a fake token "sent" from us to a look-alike of the recipient for the same amount, a
+    // zero-value transfer of the real token to it, and dust from another look-alike.
+    {
+        const QString me = QStringLiteral("0x1111111111111111111111111111111111111111");
+        const QString usdc = QStringLiteral("0xaf88d065e77c8cc2239327c5edb3a432268e5831");
+        const QString fakeUsdc = QStringLiteral("0x9999999999999999999999999999999999999999");
+        const QString relayer = QStringLiteral("0x3333333333333333333333333333333333333333");
+        const QString bridge = QStringLiteral("0xabcd000000000000000000000000000000001234");
+        const QString mirror = QStringLiteral("0xabcd111111111111111111111111111111111234");
+        const QString duster = QStringLiteral("0xabcd222222222222222222222222222222221234");
+        auto tokenRow = [&](const QString &hash, const QString &dir, const QString &who,
+                            const QString &token, const QString &symbol, const QString &amount,
+                            const QString &formatted, quint64 block) {
+            HistoryItem h;
+            h.direction = dir;
+            h.counterparty = who;
+            h.token = token;
+            h.symbol = symbol;
+            h.amount = amount;
+            h.formatted = formatted;
+            h.txHash = hash;
+            h.block = block;
+            h.timestamp = now - 1000 + block;
+            return h;
+        };
+        HistoryItem call; // the send's own transaction: zero ether to the token contract
+        call.direction = QStringLiteral("out");
+        call.counterparty = usdc;
+        call.amount = QStringLiteral("0");
+        call.formatted = QStringLiteral("0");
+        call.symbol = QStringLiteral("ETH");
+        call.txHash = QStringLiteral("0xdeposit");
+        call.block = 10;
+        call.fee = QStringLiteral("1000");
+        const QVector<HistoryItem> rows = {
+            tokenRow("0xfill", "in", relayer, usdc, "USDC", "1000000000", "1000", 5),
+            call,
+            tokenRow("0xdeposit", "out", bridge, usdc, "USDC", "900000000", "900", 10),
+            tokenRow("0xmirror", "out", mirror, fakeUsdc, QStringLiteral("\u00daSD\u0421"), "900000000",
+                     "900", 11),
+            tokenRow("0xzero", "out", mirror, usdc, "USDC", "0", "0", 12),
+            tokenRow("0xdust", "in", duster, usdc, "USDC", "1500", "0.0015", 13),
+        };
+        HistoryModel m;
+        m.setKnownTokens({usdc});
+        m.setOwnAddresses({me});
+        // No dust threshold: the dust is real USDC, and it must be caught for imitating the address
+        // the wallet paid - an attacker can always send a little more than whatever the threshold is.
+        m.setPrices({{QStringLiteral("USDC"), 1.0}});
+        m.adoptPrepared(HistoryModel::prepare(rows, m.ownAddresses(), m.knownTokens()));
+        settle();
+        QStringList shown;
+        for (int r = 0; r < m.rowCount(); ++r)
+            shown << m.itemAt(r).txHash;
+        shown.sort();
+        check(shown == QStringList({"0xdeposit", "0xfill"}),
+              "a poisoned history shows the bridge fill and the deposit, and nothing else");
+        check(m.rowCount() == 2 && m.itemAt(0).symbol == QLatin1String("USDC") &&
+                  m.itemAt(1).symbol == QLatin1String("USDC"),
+              "and the deposit is one row, not a Sent 0 ETH to the token beside it");
+
+        m.setHideSpam(false);
+        settle();
+        int marked = 0;
+        bool depositMarked = true;
+        for (int r = 0; r < m.rowCount(); ++r) {
+            const bool spam = m.data(m.index(r, HistoryModel::Column_Direction), Qt::DisplayRole)
+                                  .toString() == QLatin1String("Spam");
+            if (spam)
+                ++marked;
+            if (m.itemAt(r).txHash == QLatin1String("0xdeposit"))
+                depositMarked = spam;
+        }
+        check(marked == 3 && !depositMarked,
+              "with spam shown, every poisoning row says so and the real deposit does not");
+    }
+
     std::printf("\n%s\n", failures == 0 ? "all good" : "SOMETHING IS WRONG");
     return failures == 0 ? 0 : 1;
 }
