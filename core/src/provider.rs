@@ -548,6 +548,27 @@ impl RpcProvider {
         }
     }
 
+    /// Replace a lane's circuit now, rather than when it ages out, and return the new client. For a
+    /// host that has turned the current exit away: asking again from the same exit gets the same
+    /// answer.
+    fn renew_lane(&self, name: &'static str) -> reqwest::Client {
+        let Some(hostport) = &self.socks_hostport else {
+            return self.http.clone();
+        };
+        let mut lanes = match self.lanes.lock() {
+            Ok(l) => l,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let epoch = lanes.get(name).map(|l| l.epoch + 1).unwrap_or(0);
+        match socks_client(hostport, &self.username(name, epoch), self.timeout) {
+            Some(client) => {
+                lanes.insert(name, Lane { client: client.clone(), born_ms: now_ms(), epoch });
+                client
+            }
+            None => self.http.clone(),
+        }
+    }
+
     /// A circuit used for exactly one request and then abandoned.
     ///
     /// For broadcasting a signed transaction. Everything else the wallet asks a node is a question;
@@ -689,6 +710,39 @@ impl RpcProvider {
             interruptible_sleep(Duration::from_millis(400 << attempt)).await;
         }
         Err(last)
+    }
+
+    /// GET+parse JSON from a host whose bot checkpoint turns some Tor exits away.
+    ///
+    /// Across's API sits behind Vercel's, which answers a flagged exit with a JavaScript "verifying
+    /// your browser" page - a 403 no wallet can get past - and lets most others straight through:
+    /// from twelve fresh circuits, ten were answered. `http_get_json` retries over the shared pool, a
+    /// handful of long-lived circuits, so a flagged exit there is met again and again; here every
+    /// refusal replaces the circuit with a brand-new one. The circuit that gets through is kept, so
+    /// what follows - a quote, its build, the rebuild after an approval - starts on an exit that is
+    /// known to be let in.
+    pub async fn http_get_json_checkpointed(&self, url: &str) -> Result<Value> {
+        // Without Tor there is one address to ask from, and asking six times will not change it.
+        let attempts: u32 = if self.socks_hostport.is_some() { 6 } else { 2 };
+        let mut client = self.lane("gate", API_CIRCUIT_MS);
+        let mut refused = 0u32;
+        for attempt in 0..attempts {
+            match self.get_json_with(&client, url, &[]).await {
+                Ok(v) => return Ok(v),
+                Err(e) if !is_refusal(&e) => return Err(e),
+                Err(_) => refused += 1,
+            }
+            if shutting_down() || attempt + 1 == attempts {
+                break;
+            }
+            client = self.renew_lane("gate");
+            interruptible_sleep(Duration::from_millis(250)).await;
+        }
+        Err(CoreError::rpc(format!(
+            "{} is turning Tor connections away right now ({refused} exits tried) - try again in a \
+             minute",
+            host_of(url)
+        )))
     }
 
     /// GET and parse JSON with `client`, treating a refusal as a failure rather than as data.
@@ -1403,6 +1457,57 @@ mod tests {
             }
         });
         format!("http://127.0.0.1:{port}")
+    }
+
+    /// As `serve_status`, but answering each connection with the next of `replies`; the last repeats.
+    fn serve_sequence(replies: Vec<(&'static str, &'static str)>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for (n, stream) in listener.incoming().take(8).enumerate() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let (status, body) = replies[n.min(replies.len() - 1)];
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\n\
+                     Content-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn a_checkpoint_refusal_is_asked_again_not_taken_as_the_answer() {
+        let p = RpcProvider::new(&ProviderConfig {
+            chain_id: 1,
+            endpoints: vec!["http://127.0.0.1:1".into()],
+            socks_proxy: None,
+            allow_clearnet: true,
+            timeout_secs: 5,
+        })
+        .expect("provider");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        // Vercel's checkpoint turns one exit away with a "verifying your browser" page and lets the
+        // next through. Asked again, the API answers.
+        const CHECKPOINT: (&str, &str) = ("403 Forbidden", "<html>Vercel Security Checkpoint</html>");
+        let flaky = serve_sequence(vec![CHECKPOINT, ("200 OK", r#"{"provider":"cctp"}"#)]);
+        let v = rt
+            .block_on(p.http_get_json_checkpointed(&format!("{flaky}/api/swap/approval")))
+            .expect("asked again, it answers");
+        assert_eq!(v["provider"], "cctp");
+
+        // Turned away every time: an error that says so, never something read as an answer.
+        let blocked = serve_sequence(vec![CHECKPOINT]);
+        let err = rt
+            .block_on(p.http_get_json_checkpointed(&format!("{blocked}/api/swap/approval")))
+            .expect_err("refused throughout");
+        assert!(err.to_string().contains("turning Tor connections away"), "{err}");
     }
 
     #[test]

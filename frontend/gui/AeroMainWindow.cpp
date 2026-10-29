@@ -3370,6 +3370,9 @@ void AeroMainWindow::showBridgeDialog() {
         quint64 confirmedDest = 0;
         quint64 builtDest = 0;
         bool assetsLoaded = false; // the asset/destination menus are built; later replies are ignored
+        // The rail the quote came over ("cctp" or "across"). A build has to come over the same one:
+        // the same USDC that CCTP moves in seconds can wait a quarter of an hour on the relayers.
+        QString quotedRail;
     };
     auto *st = new BridgeState;
     st->account = m_account;
@@ -3710,6 +3713,7 @@ void AeroMainWindow::showBridgeDialog() {
             return;
         }
         st->outputAmount = o.value(QStringLiteral("output_amount")).toString(); // compared at confirm
+        st->quotedRail = o.value(QStringLiteral("provider")).toString();
 
         // Across fills anything under `maxDepositInstant` straight from relayer inventory, and waits
         // for the origin chain to finalise above it rather than front a large deposit that could
@@ -3884,6 +3888,19 @@ void AeroMainWindow::showBridgeDialog() {
                    "was built for %1, not %2. Start again.</span>")
                     .arg(builtDest ? chainDefFor(builtDest).name : tr("an unknown network"),
                          chainDefFor(expected).name));
+            return;
+        }
+        // Built over the relayers after a CCTP quote: Across's API turned the build's Tor exit away,
+        // or picked its relayers this time. Sent, it would be the slow transfer the quote said this
+        // was not - and after an approval, one approved for a different contract.
+        const QString builtRail = o.value(QStringLiteral("provider")).toString();
+        if (st->quotedRail.compare(QLatin1String("cctp"), Qt::CaseInsensitive) == 0 &&
+            builtRail.compare(QLatin1String("cctp"), Qt::CaseInsensitive) != 0) {
+            setBridging(false);
+            bridgeBtn->setEnabled(false);
+            status->setText(tr("<b>Nothing was sent.</b> Across's fast route (Circle CCTP) couldn't "
+                               "be confirmed for this transfer just now, and its relayers would be "
+                               "slower than quoted. Get a new quote."));
             return;
         }
         st->builtDest = builtDest;

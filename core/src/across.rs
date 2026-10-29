@@ -84,7 +84,7 @@ pub async fn routes(provider: &RpcProvider) -> Vec<Route> {
 }
 
 async fn fetch(provider: &RpcProvider) -> Result<Vec<Route>, crate::error::CoreError> {
-    let v = provider.http_get_json("https://app.across.to/api/available-routes").await?;
+    let v = provider.http_get_json_checkpointed("https://app.across.to/api/available-routes").await?;
     let arr = v.as_array().cloned().unwrap_or_default();
     let mut out = Vec::with_capacity(arr.len());
     for r in arr {

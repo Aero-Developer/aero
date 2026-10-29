@@ -3277,20 +3277,21 @@ impl Wallet {
     /// `/suggested-fees` quotes the intent path only and answers 900s for the same deposit once it
     /// exceeds `maxDepositInstant`. It also hands back ready-to-send calldata.
     ///
-    /// Returns `None` rather than an error whenever the reply cannot be trusted, so the caller falls
-    /// back to the legacy `suggested-fees` + `depositV3` path. Two reasons that matters: the endpoint
-    /// answers unauthenticated today but is documented as requiring an API key, and it can also
-    /// *swap* assets - a reply naming any token other than the pair we asked about must never become
-    /// a transaction.
+    /// `Ok(None)` whenever the reply cannot be trusted, so the caller falls back to the legacy
+    /// `suggested-fees` + `depositV3` path. Two reasons that matters: the endpoint answers
+    /// unauthenticated today but is documented as requiring an API key, and it can also *swap*
+    /// assets - a reply naming any token other than the pair we asked about must never become a
+    /// transaction. `Err` means there was no reply at all, which is not the same thing: Across has not
+    /// said which rail it would use, so the caller must not act as though it had chosen the relayers.
     async fn across_swap_api(
         &self,
         from_index: u32,
         route: &crate::across::Route,
         dest_chain_id: u64,
         amount_wei: &str,
-    ) -> Option<serde_json::Value> {
+    ) -> Result<Option<serde_json::Value>> {
         const ZERO: &str = "0x0000000000000000000000000000000000000000";
-        let provider = self.provider().ok()?;
+        let provider = self.provider()?;
         let origin = provider.chain_id();
 
         // The API names the gas coin by the zero address. Only use it when the destination's native
@@ -3301,21 +3302,31 @@ impl Wallet {
             let dest_native =
                 crate::chains::chain_info(dest_chain_id).native_symbol.to_ascii_uppercase();
             if dest_native != asset {
-                return None; // ambiguous; the legacy path already encodes this case correctly
+                return Ok(None); // ambiguous; the legacy path already encodes this case correctly
             }
             (ZERO.to_string(), ZERO.to_string())
         } else {
             (route.origin_token.clone(), route.dest_token.clone())
         };
 
-        let me = self.address(from_index).ok()?;
+        let me = self.address(from_index)?;
         let url = format!(
             "https://app.across.to/api/swap/approval?tradeType=exactInput&amount={amount_wei}\
              &inputToken={input_token}&outputToken={output_token}&originChainId={origin}\
              &destinationChainId={dest_chain_id}&depositor={me}&recipient={me}"
         );
-        let r = provider.http_get_json(&url).await.ok()?;
+        let r = provider.http_get_json_checkpointed(&url).await?;
+        Ok(Self::checked_swap_reply(r, &asset, origin, dest_chain_id))
+    }
 
+    /// The Swap API reply, if it is a plain bridge of `asset` from `origin` to `dest_chain_id` with
+    /// calldata to send - see `across_swap_api`.
+    fn checked_swap_reply(
+        r: serde_json::Value,
+        asset: &str,
+        origin: u64,
+        dest_chain_id: u64,
+    ) -> Option<serde_json::Value> {
         // No calldata means this was an error body - the endpoint answers 200 with an explanation.
         let tx = r.get("swapTx")?;
         let to = tx.get("to").and_then(|v| v.as_str()).unwrap_or_default();
@@ -3342,7 +3353,7 @@ impl Wallet {
         let (in_sym, in_chain) = side("inputToken")?;
         let (out_sym, out_chain) = side("outputToken")?;
         if in_sym != out_sym
-            || in_sym != norm(&asset)
+            || in_sym != norm(asset)
             || in_chain != origin
             || out_chain != dest_chain_id
         {
@@ -3364,19 +3375,32 @@ impl Wallet {
     /// simple enough to read back, so it is: the amount, the destination, the recipient, the token,
     /// the fee cap and the contract are all taken from the bytes and compared with the request. A
     /// reply that fails any of them - or that routes over relayers, whose periphery calldata does not
-    /// read back as simply - is refused here, and the relayer path builds a depositV3 of our own
-    /// encoding instead.
+    /// read back as simply - is refused here (`Ok(None)`), and the relayer path builds a depositV3 of
+    /// our own encoding instead. `Err` is no reply at all - see `across_swap_api`.
     async fn across_cctp(
         &self,
         from_index: u32,
         route: &crate::across::Route,
         dest_chain_id: u64,
         amount_wei: &str,
-    ) -> Option<serde_json::Value> {
+    ) -> Result<Option<serde_json::Value>> {
         if route.is_native {
-            return None; // CCTP moves USDC only
+            return Ok(None); // CCTP moves USDC only
         }
-        let sw = self.across_swap_api(from_index, route, dest_chain_id, amount_wei).await?;
+        let Some(sw) = self.across_swap_api(from_index, route, dest_chain_id, amount_wei).await? else {
+            return Ok(None);
+        };
+        let me = parse_address(&self.address(from_index)?)?;
+        Ok(Self::checked_cctp_reply(sw, route, dest_chain_id, &me, amount_wei))
+    }
+
+    fn checked_cctp_reply(
+        sw: serde_json::Value,
+        route: &crate::across::Route,
+        dest_chain_id: u64,
+        me: &Address,
+        amount_wei: &str,
+    ) -> Option<serde_json::Value> {
         let rail = sw.pointer("/steps/bridge/provider").and_then(|v| v.as_str()).unwrap_or_default();
         if !rail.eq_ignore_ascii_case("cctp") {
             return None;
@@ -3396,7 +3420,6 @@ impl Wallet {
         if !spender.eq_ignore_ascii_case(to) {
             return None;
         }
-        let me = parse_address(&self.address(from_index).ok()?).ok()?;
         let token = parse_address(&route.origin_token).ok()?;
         let amount = U256::from_str(amount_wei).ok()?;
         // The most Circle may keep must not exceed the fee the user is shown: the confirm dialog
@@ -3409,7 +3432,7 @@ impl Wallet {
         if expected_out > amount {
             return None;
         }
-        if !cctp_burn_matches(to, data, dest_chain_id, &me, &token, amount, amount - expected_out) {
+        if !cctp_burn_matches(to, data, dest_chain_id, me, &token, amount, amount - expected_out) {
             return None;
         }
         Some(sw)
@@ -3508,23 +3531,29 @@ impl Wallet {
         // instead of the intent path's wait on relayer inventory) - but only one whose calldata
         // verifies, the same test the builder applies, so a quote and the transaction built from it
         // always come from the same rail. Everything else is quoted on the relayer path below.
+        let mut cctp_unreached: Option<CoreError> = None;
         if try_cctp {
-            if let Some(sw) = self.across_cctp(from_index, route, dest_chain_id, amount_wei).await {
-                return Ok(Self::across_swap_quote_json(
-                    &sw,
-                    route,
-                    symbol,
-                    origin,
-                    dest_chain_id,
-                    amount_wei,
-                ));
+            match self.across_cctp(from_index, route, dest_chain_id, amount_wei).await {
+                Ok(Some(sw)) => {
+                    return Ok(Self::across_swap_quote_json(
+                        &sw,
+                        route,
+                        symbol,
+                        origin,
+                        dest_chain_id,
+                        amount_wei,
+                    ))
+                }
+                Ok(None) => {} // Across chose its relayers, or its reply did not check out
+                Err(e) if cctp_can_carry(route, origin, dest_chain_id) => cctp_unreached = Some(e),
+                Err(_) => {} // not a pair CCTP serves: the relayer quote is the whole answer
             }
         }
         let url = format!(
             "https://app.across.to/api/suggested-fees?inputToken={input_token}&outputToken={output_token}\
              &originChainId={origin}&destinationChainId={dest_chain_id}&amount={amount_wei}&recipient={me}"
         );
-        let r = provider.http_get_json(&url).await?;
+        let r = provider.http_get_json_checkpointed(&url).await?;
 
         let output_amount = r.get("outputAmount").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         if output_amount.is_empty() {
@@ -3570,6 +3599,24 @@ impl Wallet {
             r.get("exclusivityDeadline").map(str_or_num).unwrap_or_else(|| "0".into())
         };
 
+        // CCTP could have carried this and Across was not there to ask. Under the instant limit the
+        // relayers fill it in seconds anyway, so their quote stands. Over it, they wait for the origin
+        // chain to finalise - a quarter of an hour where CCTP takes under a minute - and quoting that
+        // would present a failed request as the route, which is how "900s" came to be shown.
+        let fill_secs = r.get("estimatedFillTimeSec").and_then(|v| v.as_u64()).unwrap_or(0);
+        if let Some(e) = cctp_unreached {
+            let instant = U256::from_str(&lim("maxDepositInstant")).unwrap_or(U256::ZERO);
+            let amount = U256::from_str(amount_wei).unwrap_or(U256::ZERO);
+            if instant > U256::ZERO && amount > instant {
+                return Err(CoreError::rpc(format!(
+                    "couldn't reach Across's fast USDC route (Circle CCTP, under a minute) - {e}. \
+                     Its relayers would take about {} minutes for this amount, so get the quote \
+                     again rather than settle for that.",
+                    fill_secs.div_ceil(60).max(1)
+                )));
+            }
+        }
+
         Ok(serde_json::json!({
             "symbol": symbol,
             "origin_chain": origin,
@@ -3587,7 +3634,7 @@ impl Wallet {
             "fill_deadline": r.get("fillDeadline").map(str_or_num).unwrap_or_else(|| "0".into()),
             "exclusive_relayer": exclusive_relayer,
             "exclusivity_deadline": exclusivity_deadline,
-            "est_fill_time_sec": r.get("estimatedFillTimeSec").and_then(|v| v.as_u64()).unwrap_or(0),
+            "est_fill_time_sec": fill_secs,
             "is_amount_too_low": r.get("isAmountTooLow").and_then(|v| v.as_bool()).unwrap_or(false),
             "min_deposit": lim("minDeposit"),
             "max_deposit": lim("maxDeposit"),
@@ -3596,6 +3643,7 @@ impl Wallet {
             // chain to finalise above it rather than carry reorg risk on a large deposit. Passed to
             // the UI so a sudden 15-minute estimate can be explained (and avoided by splitting).
             "max_deposit_instant": lim("maxDepositInstant"),
+            "provider": "across",
         }))
     }
 
@@ -3612,13 +3660,16 @@ impl Wallet {
     ) -> Result<serde_json::Value> {
         // A CCTP transfer from the Swap API when one verifies (see across_cctp), re-fetched here so
         // the calldata is fresh. Anything else - relayer-routed, native, or a reply whose bytes do
-        // not say what we asked for - is built below as a depositV3 this wallet encodes itself.
+        // not say what we asked for - is built below as a depositV3 this wallet encodes itself, and
+        // says so in `provider`: if the quote was CCTP, the caller must not send it.
         {
             let provider = self.provider()?;
             let origin = provider.chain_id();
             let table = crate::across::routes(provider).await;
             if let Some(route) = crate::across::resolve(&table, origin, dest_chain_id, symbol) {
-                if let Some(sw) = self.across_cctp(from_index, route, dest_chain_id, amount_wei).await {
+                if let Ok(Some(sw)) =
+                    self.across_cctp(from_index, route, dest_chain_id, amount_wei).await
+                {
                     let tx = sw.get("swapTx").cloned().unwrap_or_default();
                     let gs = |v: &serde_json::Value, k: &str| {
                         v.get(k).and_then(|x| x.as_str()).unwrap_or_default().to_string()
@@ -3765,6 +3816,7 @@ impl Wallet {
             "is_amount_too_low": q.get("is_amount_too_low").and_then(|v| v.as_bool()).unwrap_or(false),
             "min_deposit": gs("min_deposit"),
             "max_deposit": gs("max_deposit"),
+            "provider": "across",
         }))
     }
 
@@ -5208,6 +5260,15 @@ fn cctp_domain(chain_id: u64) -> Option<u32> {
     }
 }
 
+/// Whether Circle's CCTP could carry `route` between these chains: native USDC, between two chains
+/// it serves. Across's Swap API is what chooses CCTP, so this only says that it could.
+fn cctp_can_carry(route: &crate::across::Route, origin: u64, dest_chain_id: u64) -> bool {
+    !route.is_native
+        && crate::across::display_symbol(&route.symbol).eq_ignore_ascii_case("USDC")
+        && cctp_domain(origin).is_some()
+        && cctp_domain(dest_chain_id).is_some()
+}
+
 /// Whether `data`, sent to `to`, is a CCTP v2 burn of exactly `amount` of `token` toward
 /// `dest_chain_id`, minting to `recipient`, keeping at most `max_fee`:
 ///
@@ -5475,6 +5536,62 @@ mod tests {
             "73c0de".to_string(),                               // Across integrator tag
         ]
         .concat()
+    }
+
+    #[test]
+    fn a_swap_api_reply_is_taken_as_cctp_only_when_its_bytes_say_so() {
+        const ME: &str = "0x1111111111111111111111111111111111111111";
+        let me = parse_address(ME).unwrap();
+        let route = crate::across::Route {
+            origin_chain: 1,
+            origin_token: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".into(),
+            dest_chain: 42161,
+            dest_token: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831".into(),
+            symbol: "USDC".into(),
+            is_native: false,
+        };
+        // Shaped like the Swap API's reply for 120,000 USDC from Ethereum to Arbitrum.
+        let reply = |rail: &str, to_chain: u64, max_fee: u64, expected_out: u64| {
+            serde_json::json!({
+                "steps": { "bridge": { "provider": rail } },
+                "swapTx": { "to": CCTP_TOKEN_MESSENGER_V2, "data": cctp_burn(3, ME, max_fee), "value": "0" },
+                "checks": { "allowance": { "spender": CCTP_TOKEN_MESSENGER_V2 } },
+                "inputToken": { "symbol": "USDC", "chainId": 1, "decimals": 6 },
+                "outputToken": { "symbol": "USDC", "chainId": to_chain, "decimals": 6 },
+                "expectedOutputAmount": expected_out.to_string(),
+            })
+        };
+        let amount = "120000000000";
+        let cctp = |r: serde_json::Value| {
+            Wallet::checked_swap_reply(r, "USDC", 1, 42161)
+                .and_then(|r| Wallet::checked_cctp_reply(r, &route, 42161, &me, amount))
+        };
+
+        assert!(cctp(reply("cctp", 42161, 12_000_000, 119_988_000_000)).is_some());
+        assert!(cctp(reply("across", 42161, 12_000_000, 119_988_000_000)).is_none(),
+                "Across chose its relayers: the relayer path builds that one");
+        assert!(cctp(reply("cctp", 10, 12_000_000, 119_988_000_000)).is_none(),
+                "quoted for another chain");
+        assert!(cctp(reply("cctp", 42161, 12_000_000, 119_990_000_000)).is_none(),
+                "Circle may keep more than the fee the user is shown");
+        assert!(cctp(reply("cctp", 42161, 12_000_000, 0)).is_none(), "delivers nothing");
+    }
+
+    #[test]
+    fn cctp_is_only_expected_for_usdc_between_chains_circle_serves() {
+        let route = |symbol: &str, native: bool| crate::across::Route {
+            origin_chain: 1,
+            origin_token: String::new(),
+            dest_chain: 42161,
+            dest_token: String::new(),
+            symbol: symbol.into(),
+            is_native: native,
+        };
+        assert!(cctp_can_carry(&route("USDC", false), 1, 42161));
+        assert!(cctp_can_carry(&route("USDC", false), 10, 42161));
+        assert!(!cctp_can_carry(&route("USDC-BNB", false), 56, 42161), "no CCTP on BNB Chain");
+        assert!(!cctp_can_carry(&route("USDT", false), 1, 42161));
+        assert!(!cctp_can_carry(&route("ETH", true), 1, 42161));
     }
 
     #[test]
